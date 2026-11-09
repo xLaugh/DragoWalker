@@ -1,0 +1,597 @@
+//! Données du projet : fichiers ymap (placements), ytyp (types / intérieurs MLO).
+
+use crate::catalog;
+use crate::math::{v3, Quat, V3};
+use crate::mech;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+pub fn new_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+/// Après un chargement, s'assurer que les nouveaux identifiants ne se répètent pas.
+pub fn bump_ids(max: u64) {
+    NEXT_ID.fetch_max(max + 1, Ordering::Relaxed);
+}
+
+/// Données en plus pour un placement d'intérieur (CMloInstanceDef).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MloInstData {
+    pub group_id: u32,
+    pub floor_id: u32,
+    pub default_entity_sets: Vec<String>,
+    pub num_exit_portals: u32,
+    pub mlo_inst_flags: u32,
+}
+
+/// Un objet placé (CEntityDef). `rot` est l'orientation réelle dans le monde ;
+/// le fichier stocke son inverse (voir MECHANICS.md, YmapEntityDef::.ctor).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: u64,
+    pub archetype: String,
+    pub pos: V3,
+    pub rot: Quat,
+    pub scale_xy: f32,
+    pub scale_z: f32,
+    pub flags: u32,
+    pub guid: u32,
+    pub parent_index: i32,
+    pub lod_dist: f32,
+    pub child_lod_dist: f32,
+    pub lod_level: String,
+    pub num_children: u32,
+    pub priority: String,
+    pub ao_mult: i32,
+    pub art_ao: i32,
+    pub tint: u32,
+    /// Pièce de l'intérieur (pour les entités d'un MLO).
+    pub room: usize,
+    pub mlo: Option<MloInstData>,
+    /// Extensions (lumières, particules...) gardées telles quelles depuis le XML.
+    #[serde(default)]
+    pub extensions_xml: String,
+    /// position dans le ymap du jeu d'origine (copie d'un ymap du jeu), -1 sinon
+    #[serde(default = "minus_one")]
+    pub game_index: i32,
+}
+
+fn minus_one() -> i32 {
+    -1
+}
+
+impl Entity {
+    pub fn new(archetype: &str, pos: V3) -> Entity {
+        Entity {
+            id: new_id(),
+            archetype: archetype.to_string(),
+            pos,
+            rot: Quat::IDENTITY,
+            scale_xy: 1.0,
+            scale_z: 1.0,
+            flags: mech::ENTITY_FLAGS,
+            guid: 0,
+            parent_index: mech::ENTITY_PARENT_INDEX,
+            lod_dist: mech::ENTITY_LOD_DIST,
+            child_lod_dist: 0.0,
+            lod_level: mech::ENTITY_LOD_LEVEL.to_string(),
+            num_children: 0,
+            priority: mech::ENTITY_PRIORITY.to_string(),
+            ao_mult: mech::ENTITY_AO,
+            art_ao: mech::ENTITY_AO,
+            tint: 0,
+            room: 0,
+            mlo: None,
+            extensions_xml: String::new(),
+            game_index: -1,
+        }
+    }
+    pub fn scale(&self) -> V3 {
+        v3(self.scale_xy, self.scale_xy, self.scale_z)
+    }
+    /// Boîte locale (bbMin, bbMax) avant échelle.
+    pub fn local_box(&self, proj: &Project) -> (V3, V3) {
+        if let Some(a) = proj.find_mlo(&self.archetype) {
+            return (a.bb_min(), a.bb_max());
+        }
+        catalog::box_for(&self.archetype)
+    }
+    /// Les 8 coins dans le monde.
+    pub fn corners(&self, proj: &Project) -> [V3; 8] {
+        let (mn, mx) = self.local_box(proj);
+        let s = self.scale();
+        let mn = mn.mulv(s);
+        let mx = mx.mulv(s);
+        let mut out = [V3::ZERO; 8];
+        for (i, c) in out.iter_mut().enumerate() {
+            let p = v3(
+                if i & 1 == 0 { mn.x } else { mx.x },
+                if i & 2 == 0 { mn.y } else { mx.y },
+                if i & 4 == 0 { mn.z } else { mx.z },
+            );
+            *c = self.pos + self.rot.rotate(p);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Ymap {
+    pub name: String,
+    pub parent: String,
+    pub flags: u32,
+    pub content_flags: u32,
+    pub entities: Vec<Entity>,
+    pub visible: bool,
+    /// La carte d'exemple générée (remplace la vraie carte du jeu).
+    pub sample: bool,
+    /// Sections non gérées (carGenerators, LODLights...) gardées telles quelles.
+    #[serde(default)]
+    pub raw_sections: Vec<(String, String)>,
+    /// Copie d'un ymap du jeu (la version du jeu est alors cachée dans la vue).
+    #[serde(default)]
+    pub from_game: bool,
+}
+
+impl Ymap {
+    pub fn new(name: &str) -> Ymap {
+        Ymap {
+            name: name.to_string(),
+            parent: String::new(),
+            flags: 0,
+            content_flags: mech::NEW_YMAP_CONTENT_FLAGS,
+            entities: Vec::new(),
+            visible: true,
+            sample: false,
+            raw_sections: Vec::new(),
+            from_game: false,
+        }
+    }
+
+    /// Recalcule flags et contentFlags (règles de YmapFile::CalcFlags).
+    pub fn calc_flags(&mut self) {
+        let mut flags = 0u32;
+        let mut cf = 0u32;
+        for e in &self.entities {
+            match e.lod_level.as_str() {
+                "LODTYPES_DEPTH_HD" | "LODTYPES_DEPTH_ORPHANHD" => cf |= 1,
+                "LODTYPES_DEPTH_LOD" => {
+                    cf |= 2;
+                    flags |= 2;
+                }
+                "LODTYPES_DEPTH_SLOD1" => {
+                    cf |= 16;
+                    flags |= 2;
+                }
+                _ => {
+                    cf |= 4 | 16;
+                    flags |= 2;
+                }
+            }
+            if e.mlo.is_some() {
+                cf |= 8;
+            }
+        }
+        // garde les bits qu'on ne gère pas (physique, lumières...)
+        self.flags = (self.flags & !2) | flags;
+        self.content_flags = (self.content_flags & !(1 | 2 | 4 | 8 | 16)) | cf;
+    }
+
+    /// (entitiesMin, entitiesMax, streamingMin, streamingMax) — YmapFile::CalcExtents.
+    pub fn extents(&self, proj: &Project) -> (V3, V3, V3, V3) {
+        let big = 3.0e38f32;
+        let (mut emn, mut emx) = (v3(big, big, big), v3(-big, -big, -big));
+        let (mut smn, mut smx) = (emn, emx);
+        for e in &self.entities {
+            for c in e.corners(proj) {
+                emn = emn.min(c);
+                emx = emx.max(c);
+            }
+            let (bmn, bmx) = e.local_box(proj);
+            let s = e.scale();
+            let l = e.lod_dist;
+            let mn = bmn.mulv(s) - v3(l, l, l);
+            let mx = bmx.mulv(s) + v3(l, l, l);
+            for i in 0..8 {
+                let p = v3(
+                    if i & 1 == 0 { mn.x } else { mx.x },
+                    if i & 2 == 0 { mn.y } else { mx.y },
+                    if i & 4 == 0 { mn.z } else { mx.z },
+                );
+                let w = e.pos + e.rot.rotate(p);
+                smn = smn.min(w);
+                smx = smx.max(w);
+            }
+        }
+        if self.entities.is_empty() {
+            return (V3::ZERO, V3::ZERO, V3::ZERO, V3::ZERO);
+        }
+        (emn, emx, smn, smx)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Room {
+    pub name: String,
+    pub bb_min: V3,
+    pub bb_max: V3,
+    pub blend: f32,
+    pub timecycle: String,
+    pub secondary_timecycle: String,
+    pub flags: u32,
+    pub floor_id: u32,
+    pub ext_vis_depth: i32,
+}
+
+impl Room {
+    pub fn new(name: &str, bb_min: V3, bb_max: V3) -> Room {
+        Room {
+            name: name.to_string(),
+            bb_min,
+            bb_max,
+            blend: mech::ROOM_BLEND,
+            timecycle: String::new(),
+            secondary_timecycle: String::new(),
+            flags: mech::ROOM_FLAGS,
+            floor_id: 0,
+            ext_vis_depth: mech::ROOM_EXT_VIS_DEPTH,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Portal {
+    pub room_from: u32,
+    pub room_to: u32,
+    pub flags: u32,
+    pub mirror_priority: u32,
+    pub opacity: u32,
+    pub audio_occlusion: u32,
+    pub corners: [V3; 4],
+}
+
+impl Portal {
+    pub fn new(from: u32, to: u32, corners: [V3; 4]) -> Portal {
+        Portal { room_from: from, room_to: to, flags: 0, mirror_priority: 0, opacity: 0, audio_occlusion: 0, corners }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EntitySet {
+    pub name: String,
+    pub entities: Vec<Entity>,
+}
+
+/// Un intérieur (CMloArchetypeDef).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MloArchetype {
+    pub name: String,
+    pub lod_dist: f32,
+    pub flags: u32,
+    pub mlo_flags: u32,
+    pub entities: Vec<Entity>,
+    pub rooms: Vec<Room>,
+    pub portals: Vec<Portal>,
+    pub entity_sets: Vec<EntitySet>,
+}
+
+impl MloArchetype {
+    pub fn bb_min(&self) -> V3 {
+        let mut m = v3(0.0, 0.0, 0.0);
+        let mut first = true;
+        for r in self.rooms.iter().skip(1) {
+            m = if first { r.bb_min } else { m.min(r.bb_min) };
+            first = false;
+        }
+        m
+    }
+    pub fn bb_max(&self) -> V3 {
+        let mut m = v3(1.0, 1.0, 1.0);
+        let mut first = true;
+        for r in self.rooms.iter().skip(1) {
+            m = if first { r.bb_max } else { m.max(r.bb_max) };
+            first = false;
+        }
+        m
+    }
+    /// Indices des entités dans chaque pièce (attachedObjects).
+    pub fn attached(&self, room: usize) -> Vec<usize> {
+        self.entities.iter().enumerate().filter(|(_, e)| e.room == room).map(|(i, _)| i).collect()
+    }
+    pub fn portal_count(&self, room: usize) -> usize {
+        self.portals.iter().filter(|p| p.room_from as usize == room || p.room_to as usize == room).count()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Ytyp {
+    pub name: String,
+    pub mlos: Vec<MloArchetype>,
+    pub visible: bool,
+    /// Archétypes simples (CBaseArchetypeDef...) gardés tels quels.
+    #[serde(default)]
+    pub raw_archetypes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Project {
+    pub name: String,
+    pub ymaps: Vec<Ymap>,
+    pub ytyps: Vec<Ytyp>,
+}
+
+/// Un élément sélectionnable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemRef {
+    /// (ymap, index de l'entité)
+    Ent(usize, usize),
+    /// (ytyp, mlo, index de l'entité)
+    MloEnt(usize, usize, usize),
+}
+
+impl Project {
+    pub fn find_mlo(&self, name: &str) -> Option<&MloArchetype> {
+        self.ytyps.iter().flat_map(|y| y.mlos.iter()).find(|m| m.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Placement (position, orientation) d'un intérieur dans le monde.
+    pub fn mlo_placement(&self, name: &str) -> Option<(V3, Quat)> {
+        for y in &self.ymaps {
+            for e in &y.entities {
+                if e.mlo.is_some() && e.archetype.eq_ignore_ascii_case(name) {
+                    return Some((e.pos, e.rot));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn ent(&self, r: ItemRef) -> Option<&Entity> {
+        match r {
+            ItemRef::Ent(y, i) => self.ymaps.get(y)?.entities.get(i),
+            ItemRef::MloEnt(t, m, i) => self.ytyps.get(t)?.mlos.get(m)?.entities.get(i),
+        }
+    }
+    pub fn ent_mut(&mut self, r: ItemRef) -> Option<&mut Entity> {
+        match r {
+            ItemRef::Ent(y, i) => self.ymaps.get_mut(y)?.entities.get_mut(i),
+            ItemRef::MloEnt(t, m, i) => self.ytyps.get_mut(t)?.mlos.get_mut(m)?.entities.get_mut(i),
+        }
+    }
+
+    pub fn find_id(&self, id: u64) -> Option<ItemRef> {
+        for (yi, y) in self.ymaps.iter().enumerate() {
+            if let Some(i) = y.entities.iter().position(|e| e.id == id) {
+                return Some(ItemRef::Ent(yi, i));
+            }
+        }
+        for (ti, t) in self.ytyps.iter().enumerate() {
+            for (mi, m) in t.mlos.iter().enumerate() {
+                if let Some(i) = m.entities.iter().position(|e| e.id == id) {
+                    return Some(ItemRef::MloEnt(ti, mi, i));
+                }
+            }
+        }
+        None
+    }
+
+    /// Entité exprimée dans le monde (les entités d'intérieur sont transformées par le placement).
+    pub fn world_entity(&self, r: ItemRef) -> Option<Entity> {
+        let e = self.ent(r)?.clone();
+        match r {
+            ItemRef::Ent(..) => Some(e),
+            ItemRef::MloEnt(t, m, _) => {
+                let mlo = &self.ytyps[t].mlos[m];
+                let (p, q) = self.mlo_placement(&mlo.name).unwrap_or((V3::ZERO, Quat::IDENTITY));
+                let mut w = e;
+                w.pos = p + q.rotate(w.pos);
+                w.rot = q.mul(w.rot).normalized();
+                Some(w)
+            }
+        }
+    }
+
+    /// Change la position (dans le monde) d'un élément.
+    pub fn set_world_pos(&mut self, r: ItemRef, world: V3) {
+        match r {
+            ItemRef::Ent(..) => {
+                if let Some(e) = self.ent_mut(r) {
+                    e.pos = world;
+                }
+            }
+            ItemRef::MloEnt(t, m, _) => {
+                let name = self.ytyps[t].mlos[m].name.clone();
+                let (p, q) = self.mlo_placement(&name).unwrap_or((V3::ZERO, Quat::IDENTITY));
+                let local = q.inverse().rotate(world - p);
+                if let Some(e) = self.ent_mut(r) {
+                    e.pos = local;
+                }
+            }
+        }
+    }
+
+    /// Tous les éléments visibles.
+    pub fn all_items(&self) -> Vec<ItemRef> {
+        let mut v = Vec::new();
+        for (yi, y) in self.ymaps.iter().enumerate() {
+            if !y.visible {
+                continue;
+            }
+            for i in 0..y.entities.len() {
+                v.push(ItemRef::Ent(yi, i));
+            }
+        }
+        for (ti, t) in self.ytyps.iter().enumerate() {
+            if !t.visible {
+                continue;
+            }
+            for (mi, m) in t.mlos.iter().enumerate() {
+                for i in 0..m.entities.len() {
+                    v.push(ItemRef::MloEnt(ti, mi, i));
+                }
+            }
+        }
+        v
+    }
+
+    /// Supprime des éléments par identifiant. Renvoie le nombre supprimé.
+    pub fn delete_ids(&mut self, ids: &std::collections::HashSet<u64>) -> usize {
+        let mut n = 0;
+        for y in &mut self.ymaps {
+            let before = y.entities.len();
+            y.entities.retain(|e| !ids.contains(&e.id));
+            n += before - y.entities.len();
+        }
+        for t in &mut self.ytyps {
+            for m in &mut t.mlos {
+                let before = m.entities.len();
+                m.entities.retain(|e| !ids.contains(&e.id));
+                n += before - m.entities.len();
+            }
+        }
+        n
+    }
+
+    pub fn max_id(&self) -> u64 {
+        let mut m = 0;
+        for y in &self.ymaps {
+            for e in &y.entities {
+                m = m.max(e.id);
+            }
+        }
+        for t in &self.ytyps {
+            for mlo in &t.mlos {
+                for e in &mlo.entities {
+                    m = m.max(e.id);
+                }
+            }
+        }
+        m
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.ymaps.iter().map(|y| y.entities.len()).sum::<usize>()
+            + self.ytyps.iter().flat_map(|t| t.mlos.iter()).map(|m| m.entities.len()).sum::<usize>()
+    }
+
+    pub fn next_ymap_name(&self) -> String {
+        let mut i = 1;
+        loop {
+            let n = format!("{}{}", mech::NEW_YMAP_PREFIX, i);
+            if !self.ymaps.iter().any(|y| y.name == n) {
+                return n;
+            }
+            i += 1;
+        }
+    }
+    pub fn next_ytyp_name(&self) -> String {
+        let mut i = 1;
+        loop {
+            let n = format!("{}{}", mech::NEW_YTYP_PREFIX, i);
+            if !self.ytyps.iter().any(|y| y.name == n) {
+                return n;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Crée un intérieur en grille : `cols` x `rows` pièces de `w` x `d` x `h` mètres,
+/// avec la pièce « limbo » en 0, des portails entre pièces voisines et une porte vers l'extérieur.
+pub fn build_mlo(name: &str, cols: usize, rows: usize, w: f32, d: f32, h: f32) -> MloArchetype {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let mut rooms = vec![Room::new("limbo", V3::ZERO, V3::ZERO)];
+    let total_w = cols as f32 * w;
+    let total_d = rows as f32 * d;
+    let ox = -total_w * 0.5;
+    let oy = -total_d * 0.5;
+    for r in 0..rows {
+        for c in 0..cols {
+            let mn = v3(ox + c as f32 * w, oy + r as f32 * d, 0.0);
+            let mx = v3(mn.x + w, mn.y + d, h);
+            let label = if rows * cols == 1 { "piece_principale".to_string() } else { format!("piece_{}", r * cols + c + 1) };
+            rooms.push(Room::new(&label, mn, mx));
+        }
+    }
+    let idx = |c: usize, r: usize| (r * cols + c + 1) as u32;
+    let mut portals = Vec::new();
+    let door_w = (w.min(d) * 0.3).clamp(1.0, 2.0);
+    let door_h = (h * 0.8).min(2.4);
+    // portails entre pièces voisines (porte au milieu du mur)
+    for r in 0..rows {
+        for c in 0..cols {
+            if c + 1 < cols {
+                let x = ox + (c + 1) as f32 * w;
+                let cy = oy + r as f32 * d + d * 0.5;
+                portals.push(Portal::new(
+                    idx(c, r),
+                    idx(c + 1, r),
+                    [
+                        v3(x, cy - door_w * 0.5, 0.0),
+                        v3(x, cy - door_w * 0.5, door_h),
+                        v3(x, cy + door_w * 0.5, door_h),
+                        v3(x, cy + door_w * 0.5, 0.0),
+                    ],
+                ));
+            }
+            if r + 1 < rows {
+                let y = oy + (r + 1) as f32 * d;
+                let cx = ox + c as f32 * w + w * 0.5;
+                portals.push(Portal::new(
+                    idx(c, r),
+                    idx(c, r + 1),
+                    [
+                        v3(cx - door_w * 0.5, y, 0.0),
+                        v3(cx - door_w * 0.5, y, door_h),
+                        v3(cx + door_w * 0.5, y, door_h),
+                        v3(cx + door_w * 0.5, y, 0.0),
+                    ],
+                ));
+            }
+        }
+    }
+    // porte d'entrée : de la première pièce vers l'extérieur (pièce 0), mur sud
+    let cx = ox + w * 0.5;
+    portals.push(Portal::new(
+        mech::PORTAL_ROOM_FROM,
+        mech::PORTAL_ROOM_TO,
+        [
+            v3(cx - door_w * 0.5, oy, 0.0),
+            v3(cx - door_w * 0.5, oy, door_h),
+            v3(cx + door_w * 0.5, oy, door_h),
+            v3(cx + door_w * 0.5, oy, 0.0),
+        ],
+    ));
+    MloArchetype {
+        name: name.to_string(),
+        lod_dist: 200.0,
+        flags: 0,
+        mlo_flags: 0,
+        entities: Vec::new(),
+        rooms,
+        portals,
+        entity_sets: Vec::new(),
+    }
+}
+
+/// Trouve la pièce (index >= 1) qui contient un point local, sinon 0 (limbo). Avec des pièces sur plusieurs
+/// étages, la hauteur compte aussi (à 0,5 m près) ; à défaut, seulement la position au sol.
+pub fn room_at(mlo: &MloArchetype, local: V3) -> usize {
+    for (i, r) in mlo.rooms.iter().enumerate().skip(1) {
+        if local.x >= r.bb_min.x && local.x <= r.bb_max.x && local.y >= r.bb_min.y && local.y <= r.bb_max.y && local.z >= r.bb_min.z - 0.5 && local.z <= r.bb_max.z + 0.5 {
+            return i;
+        }
+    }
+    for (i, r) in mlo.rooms.iter().enumerate().skip(1) {
+        if local.x >= r.bb_min.x && local.x <= r.bb_max.x && local.y >= r.bb_min.y && local.y <= r.bb_max.y {
+            return i;
+        }
+    }
+    if mlo.rooms.len() > 1 {
+        1
+    } else {
+        0
+    }
+}

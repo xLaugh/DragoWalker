@@ -1,0 +1,1305 @@
+//! Fenêtre principale de DragoWalker : état, actions communes et boucle d'affichage.
+//! Les panneaux sont dans ui.rs, la vue 3D dans view.rs.
+
+use crate::ai::{self, Action, AiReply, ChatLine};
+use crate::camera::Camera;
+use crate::math::{v3, Quat, Rng, V3};
+use crate::mech;
+use crate::model::{self, Entity, ItemRef, MloInstData, Project, Ymap, Ytyp};
+use crate::render::ViewOpts;
+use crate::sample;
+use crate::xmlio;
+use eframe::egui::{self, Color32, Pos2, RichText};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Select,
+    Place,
+    Erase,
+    /// sélection en rectangle : glisser n'importe où trace un rectangle (même sur le sol ou un bâtiment)
+    Rect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Game,
+    Selection,
+    Props,
+    Interior,
+    Ai,
+    Options,
+}
+
+pub enum Drag {
+    /// glisser d'une poignée (déplacer / tourner / agrandir)
+    Gizmo(crate::gizmo::GizmoDrag),
+    None,
+    Rect(Pos2),
+    Move(V3),
+    Erase,
+    Place(V3),
+}
+
+/// Point de l'écran utilisé par les tests : le centre de la vue, décalé de DW_TEST_AT="dx,dy" pixels.
+pub fn test_point(rect: egui::Rect) -> Pos2 {
+    let off = std::env::var("DW_TEST_AT").ok().and_then(|v| {
+        let p: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if p.len() == 2 { Some(egui::vec2(p[0], p[1])) } else { None }
+    });
+    rect.center() + off.unwrap_or(egui::Vec2::ZERO)
+}
+
+pub struct DwApp {
+    pub proj: Project,
+    pub cam: Camera,
+    pub selected: Vec<u64>,
+    pub sel_set: HashSet<u64>,
+    pub hover: Option<u64>,
+    pub tool: Tool,
+    pub tab: Tab,
+    pub place_arch: String,
+    pub target_ymap: usize,
+    pub rand_rot: bool,
+    pub rand_scale: bool,
+    pub stroke_spacing: f32,
+    pub place_into_mlo: bool,
+    pub snap: bool,
+    pub snap_size: f32,
+    pub erase_radius: f32,
+    pub erase_filter: String,
+    pub erase_buildings: bool,
+    pub area_radius: f32,
+    pub undo: Vec<Project>,
+    pub redo: Vec<Project>,
+    pub status: String,
+    pub frame: u64,
+    pub shot_path: Option<PathBuf>,
+    pub shot_sent: bool,
+    pub shot_wait: u32,
+    pub speed_mult: f32,
+    pub drag: Drag,
+    pub cat_filter: String,
+    pub cat_cat: &'static str,
+    pub chat: Vec<ChatLine>,
+    pub chat_input: String,
+    pub api_key: String,
+    pub use_claude: bool,
+    /// moteur d'IA choisi et ses réglages
+    pub ai_provider: ai::Provider,
+    pub claude_code: Option<PathBuf>,
+    pub cc_model: String,
+    pub oa_base: String,
+    pub oa_key: String,
+    pub oa_model: String,
+    pub cli_cmd: String,
+    pub cli_tools: Vec<(&'static str, &'static str)>,
+    pub pending: Option<Receiver<Result<AiReply, String>>>,
+    pub mlo_name: String,
+    pub mlo_cols: u32,
+    pub mlo_rows: u32,
+    pub mlo_w: f32,
+    pub mlo_d: f32,
+    pub mlo_h: f32,
+    pub cur_mlo: Option<(usize, usize)>,
+    pub opts: ViewOpts,
+    pub project_path: Option<PathBuf>,
+    pub rng: Rng,
+    pub ground_z: f32,
+    pub mouse_ground: Option<V3>,
+    pub move_step: f32,
+    pub game: crate::game_ui::GameState,
+    pub sollumz: crate::sollumz::SollumzState,
+    /// génération des modèles personnels déjà envoyés à la carte graphique
+    pub sollumz_sent: u64,
+    /// poignées : mode et poignée sous la souris
+    pub gizmo_mode: crate::gizmo::GizmoMode,
+    pub gizmo_hover: Option<u8>,
+    /// axes de l'objet au lieu de ceux du monde
+    pub gizmo_object_space: bool,
+}
+
+fn settings_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("DragoWalker").join("settings.json"))
+}
+
+/// Réglages enregistrés (clé API, dossier du jeu, zones actives…).
+pub fn load_settings() -> serde_json::Value {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+pub fn save_setting(key: &str, value: serde_json::Value) {
+    if let Some(p) = settings_path() {
+        let mut v = load_settings();
+        v[key] = value;
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, v.to_string());
+    }
+}
+
+fn load_api_key() -> String {
+    load_settings()["api_key"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .unwrap_or_default()
+}
+
+pub fn save_api_key(k: &str) {
+    save_setting("api_key", serde_json::json!(k));
+}
+
+fn setup_style(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = Color32::from_rgb(37, 40, 46);
+    v.window_fill = Color32::from_rgb(37, 40, 46);
+    v.extreme_bg_color = Color32::from_rgb(24, 26, 30);
+    v.selection.bg_fill = Color32::from_rgb(214, 120, 30);
+    v.hyperlink_color = Color32::from_rgb(255, 170, 70);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(70, 76, 88);
+    v.widgets.active.bg_fill = Color32::from_rgb(214, 120, 30);
+    ctx.set_visuals(v);
+    let mut s = (*ctx.style()).clone();
+    s.spacing.item_spacing = egui::vec2(6.0, 5.0);
+    s.spacing.button_padding = egui::vec2(7.0, 3.0);
+    ctx.set_style(s);
+}
+
+impl DwApp {
+    pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
+        setup_style(&cc.egui_ctx);
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![] };
+        let first = proj.next_ymap_name();
+        proj.ymaps.push(Ymap::new(&first));
+        let mut app = DwApp {
+            proj,
+            cam: Camera::new(),
+            selected: Vec::new(),
+            sel_set: HashSet::new(),
+            hover: None,
+            tool: Tool::Select,
+            tab: Tab::Props,
+            place_arch: "prop_bench_01a".into(),
+            target_ymap: 1,
+            rand_rot: false,
+            rand_scale: false,
+            stroke_spacing: 4.0,
+            place_into_mlo: true,
+            snap: false,
+            snap_size: mech::SNAP_GRID_SIZE,
+            erase_radius: 15.0,
+            erase_filter: String::new(),
+            erase_buildings: true,
+            area_radius: 60.0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            status: "Bienvenue dans DragoWalker. Clic droit + glisser : tourner la vue · ZQSD/WASD : se déplacer · molette : zoom.".into(),
+            frame: 0,
+            shot_path,
+            shot_sent: false,
+            shot_wait: 0,
+            speed_mult: 1.0,
+            drag: Drag::None,
+            cat_filter: String::new(),
+            cat_cat: "Tous",
+            chat: vec![ChatLine {
+                from_user: false,
+                text: "Salut ! Dis-moi ce que tu veux faire sur la carte, par exemple « pose 12 arbres en cercle », « supprime tout dans un rayon de 50 m » ou « crée un intérieur de 4 pièces ».".into(),
+            }],
+            chat_input: String::new(),
+            api_key: load_api_key(),
+            use_claude: true,
+            ai_provider: ai::Provider::Local,
+            claude_code: ai::find_claude_code(),
+            cc_model: load_settings()["ai_cc_model"].as_str().unwrap_or("").to_string(),
+            oa_base: load_settings()["ai_oa_base"].as_str().unwrap_or("http://localhost:11434/v1").to_string(),
+            oa_key: load_settings()["ai_oa_key"].as_str().unwrap_or("").to_string(),
+            oa_model: load_settings()["ai_oa_model"].as_str().unwrap_or("").to_string(),
+            cli_cmd: load_settings()["ai_cli_cmd"].as_str().unwrap_or("").to_string(),
+            cli_tools: ai::find_cli_tools(),
+            pending: None,
+            mlo_name: "dw_interieur_1".into(),
+            mlo_cols: 2,
+            mlo_rows: 2,
+            mlo_w: 6.0,
+            mlo_d: 6.0,
+            mlo_h: 3.2,
+            cur_mlo: None,
+            opts: ViewOpts { show_grid: true, show_rooms: true, show_sample: true },
+            project_path: None,
+            rng: Rng::new(7),
+            ground_z: 0.0,
+            mouse_ground: None,
+            move_step: 1.0,
+            game: crate::game_ui::GameState::new(),
+            sollumz: crate::sollumz::SollumzState::new(),
+            sollumz_sent: 0,
+            gizmo_mode: crate::gizmo::GizmoMode::Move,
+            gizmo_hover: None,
+            gizmo_object_space: false,
+        };
+        // moteur d'IA : celui enregistré, sinon Claude Code s'il est installé, sinon la clé API, sinon le local
+        app.ai_provider = load_settings()["ai_provider"].as_str().and_then(ai::Provider::from_key).unwrap_or(if app.claude_code.is_some() {
+            ai::Provider::ClaudeCode
+        } else if !app.api_key.trim().is_empty() {
+            ai::Provider::ClaudeApi
+        } else {
+            ai::Provider::Local
+        });
+        // modes test : choix du moteur d'IA sans toucher aux réglages enregistrés
+        if let Ok(p) = std::env::var("DW_AI_PROVIDER") {
+            if let Some(pr) = ai::Provider::from_key(&p) {
+                app.ai_provider = pr;
+            }
+        }
+        if let Ok(v) = std::env::var("DW_AI_CLI") {
+            app.cli_cmd = v;
+        }
+        if let Ok(v) = std::env::var("DW_AI_BASE") {
+            app.oa_base = v;
+        }
+        if let Ok(v) = std::env::var("DW_AI_MODEL") {
+            app.oa_model = v;
+        }
+        // la carte du jeu se charge toute seule si GTA V est trouvé
+        if !app.game.dir.is_empty() {
+            app.tab = Tab::Game;
+            app.start_game_load();
+        }
+        for f in open_files {
+            app.import_file(&f);
+        }
+        app
+    }
+
+    // ------------------------------------------------------------ outils communs
+
+    pub fn push_undo(&mut self) {
+        self.undo.push(self.proj.clone());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    pub fn do_undo(&mut self) {
+        if let Some(p) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.proj, p));
+            self.clean_selection();
+            self.sync_game_project();
+            self.status = "Annulé.".into();
+        }
+    }
+
+    pub fn do_redo(&mut self) {
+        if let Some(p) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.proj, p));
+            self.clean_selection();
+            self.sync_game_project();
+            self.status = "Rétabli.".into();
+        }
+    }
+
+    pub fn clean_selection(&mut self) {
+        let proj = &self.proj;
+        self.selected.retain(|id| proj.find_id(*id).is_some());
+        self.sel_set = self.selected.iter().copied().collect();
+        if let Some((t, m)) = self.cur_mlo {
+            if self.proj.ytyps.get(t).and_then(|y| y.mlos.get(m)).is_none() {
+                self.cur_mlo = None;
+            }
+        }
+        if self.target_ymap >= self.proj.ymaps.len() {
+            self.target_ymap = 0;
+        }
+    }
+
+    pub fn set_selection(&mut self, ids: Vec<u64>) {
+        self.selected = ids;
+        self.sel_set = self.selected.iter().copied().collect();
+    }
+
+    pub fn add_selection(&mut self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids {
+            if self.sel_set.insert(id) {
+                self.selected.push(id);
+            }
+        }
+    }
+
+    /// Ymap de destination des nouveaux props (jamais la carte d'exemple).
+    pub fn ensure_target_ymap(&mut self) -> usize {
+        if let Some(y) = self.proj.ymaps.get(self.target_ymap) {
+            if !y.sample {
+                return self.target_ymap;
+            }
+        }
+        if let Some(i) = self.proj.ymaps.iter().position(|y| !y.sample) {
+            self.target_ymap = i;
+            return i;
+        }
+        let n = self.proj.next_ymap_name();
+        self.proj.ymaps.push(Ymap::new(&n));
+        self.target_ymap = self.proj.ymaps.len() - 1;
+        self.target_ymap
+    }
+
+    pub fn snap_pos(&self, p: V3) -> V3 {
+        if self.snap && self.snap_size > 0.0 {
+            let s = self.snap_size;
+            v3((p.x / s).round() * s, (p.y / s).round() * s, p.z)
+        } else {
+            p
+        }
+    }
+
+    /// Trouve l'intérieur (et sa pièce) qui contient un point du monde.
+    pub fn mlo_at(&self, world: V3) -> Option<(usize, usize, usize, V3)> {
+        for (ti, t) in self.proj.ytyps.iter().enumerate() {
+            for (mi, m) in t.mlos.iter().enumerate() {
+                let Some((p, q)) = self.proj.mlo_placement(&m.name) else { continue };
+                let local = q.inverse().rotate(world - p);
+                for (ri, r) in m.rooms.iter().enumerate().skip(1) {
+                    if local.x >= r.bb_min.x && local.x <= r.bb_max.x && local.y >= r.bb_min.y && local.y <= r.bb_max.y {
+                        return Some((ti, mi, ri, local));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Pose un prop (dans le monde, ou dans un intérieur si le point est dans une pièce).
+    pub fn place_prop(&mut self, arch: &str, world: V3, heading_deg: Option<f32>) -> u64 {
+        let p = self.snap_pos(world);
+        let heading = heading_deg.unwrap_or_else(|| if self.rand_rot { self.rng.range(0.0, 360.0) } else { 0.0 });
+        let scale = if self.rand_scale { self.rng.range(0.85, 1.15) } else { 1.0 };
+        if self.place_into_mlo {
+            if let Some((ti, mi, ri, local)) = self.mlo_at(p) {
+                let name = self.proj.ytyps[ti].mlos[mi].name.clone();
+                let (_, q) = self.proj.mlo_placement(&name).unwrap_or((V3::ZERO, Quat::IDENTITY));
+                let mut e = Entity::new(arch, v3(local.x, local.y, 0.0));
+                e.flags = mech::MLO_ENTITY_FLAGS;
+                e.room = ri;
+                e.rot = q.inverse().mul(Quat::from_z(heading.to_radians())).normalized();
+                e.scale_xy = scale;
+                e.scale_z = scale;
+                let id = e.id;
+                self.proj.ytyps[ti].mlos[mi].entities.push(e);
+                self.cur_mlo = Some((ti, mi));
+                return id;
+            }
+        }
+        let yi = self.ensure_target_ymap();
+        // avec le jeu chargé, le prop se pose à la hauteur réelle du sol
+        let z = if self.game.world.is_some() { p.z } else { self.ground_z };
+        let mut e = Entity::new(arch, v3(p.x, p.y, z));
+        e.rot = Quat::from_z(heading.to_radians());
+        e.scale_xy = scale;
+        e.scale_z = scale;
+        let id = e.id;
+        self.proj.ymaps[yi].entities.push(e);
+        id
+    }
+
+    pub fn delete_selected(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let ids: HashSet<u64> = self.sel_set.clone();
+        let n = self.proj.delete_ids(&ids);
+        self.set_selection(vec![]);
+        self.status = format!("{n} objet(s) supprimé(s) d'un coup.");
+    }
+
+    pub fn sample_hidden(&self, it: ItemRef) -> bool {
+        matches!(it, ItemRef::Ent(y, _) if self.proj.ymaps[y].sample && !self.opts.show_sample)
+    }
+
+    pub fn items_in_radius(&self, c: V3, r: f32, filter: &str, buildings: bool) -> Vec<u64> {
+        let f = filter.to_lowercase();
+        let mut out = Vec::new();
+        for it in self.proj.all_items() {
+            if self.sample_hidden(it) {
+                continue;
+            }
+            let Some(e) = self.proj.world_entity(it) else { continue };
+            if e.mlo.is_some() {
+                continue;
+            }
+            if !buildings && e.archetype.starts_with("dw_batiment") {
+                continue;
+            }
+            if !f.is_empty() && !e.archetype.to_lowercase().contains(&f) {
+                continue;
+            }
+            if e.pos.dist2d(c) <= r {
+                out.push(e.id);
+            }
+        }
+        out
+    }
+
+    /// Décalage d'une copie, comme ProjectForm::NewEntity : rayon englobant le plus grand × 2.5,
+    /// sur l'axe « droite » de la caméra (à plat) pour que la copie reste visible.
+    pub fn copy_offset(&self) -> V3 {
+        let mut radius: f32 = 0.0;
+        for id in &self.selected {
+            if let Some(e) = self.proj.find_id(*id).and_then(|r| self.proj.ent(r)) {
+                let (mn, mx) = e.local_box(&self.proj);
+                let s = e.scale();
+                let half = v3((mx.x - mn.x) * s.x, (mx.y - mn.y) * s.y, (mx.z - mn.z) * s.z) * 0.5;
+                radius = radius.max(half.dot(half).sqrt());
+            }
+        }
+        let (_, right) = self.cam.flat_axes();
+        right * (radius.max(0.5) * mech::SPAWN_COPY_RADIUS_MULT)
+    }
+
+    pub fn duplicate_selected(&mut self, off: V3) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut new_ids = Vec::new();
+        for id in self.selected.clone() {
+            let Some(r) = self.proj.find_id(id) else { continue };
+            let mut e = self.proj.ent(r).unwrap().clone();
+            e.id = model::new_id();
+            e.game_index = -1;
+            e.pos = e.pos + off;
+            new_ids.push(e.id);
+            match r {
+                ItemRef::Ent(y, _) => {
+                    if self.proj.ymaps[y].sample {
+                        let t = self.ensure_target_ymap();
+                        self.proj.ymaps[t].entities.push(e);
+                    } else {
+                        self.proj.ymaps[y].entities.push(e);
+                    }
+                }
+                ItemRef::MloEnt(t, m, _) => self.proj.ytyps[t].mlos[m].entities.push(e),
+            }
+        }
+        let n = new_ids.len();
+        self.set_selection(new_ids);
+        self.status = format!("{n} objet(s) dupliqué(s).");
+    }
+
+    pub fn move_selected(&mut self, d: V3) {
+        for id in self.selected.clone() {
+            if let Some(r) = self.proj.find_id(id) {
+                if let Some(w) = self.proj.world_entity(r) {
+                    self.proj.set_world_pos(r, w.pos + d);
+                }
+            }
+        }
+    }
+
+    pub fn rotate_selected(&mut self, deg: f32) {
+        let q = Quat::from_z(deg.to_radians());
+        let center = self.selection_center();
+        for id in self.selected.clone() {
+            if let Some(r) = self.proj.find_id(id) {
+                if let Some(w) = self.proj.world_entity(r) {
+                    let np = center + q.rotate(w.pos - center);
+                    self.proj.set_world_pos(r, np);
+                    if let Some(e) = self.proj.ent_mut(r) {
+                        e.rot = q.mul(e.rot).normalized();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn selection_center(&self) -> V3 {
+        let mut c = V3::ZERO;
+        let mut n = 0.0;
+        for id in &self.selected {
+            if let Some(w) = self.proj.find_id(*id).and_then(|r| self.proj.world_entity(r)) {
+                c = c + w.pos;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            c * (1.0 / n)
+        } else {
+            self.cam.target
+        }
+    }
+
+    pub fn create_mlo(&mut self, name: &str, cols: u32, rows: u32, w: f32, d: f32, h: f32) {
+        self.push_undo();
+        let mut name = name.trim().to_string();
+        if name.is_empty() || self.proj.find_mlo(&name).is_some() {
+            let mut i = 1;
+            loop {
+                let n = format!("dw_interieur_{i}");
+                if self.proj.find_mlo(&n).is_none() {
+                    name = n;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let mlo = model::build_mlo(&name, cols as usize, rows as usize, w, d, h);
+        let exits = mlo.portals.iter().filter(|p| p.room_to == 0 || p.room_from == 0).count() as u32;
+        if self.proj.ytyps.is_empty() {
+            let n = self.proj.next_ytyp_name();
+            self.proj.ytyps.push(Ytyp { name: n, mlos: vec![], visible: true, raw_archetypes: vec![] });
+        }
+        let ti = self.cur_mlo.map(|(t, _)| t).unwrap_or(0).min(self.proj.ytyps.len() - 1);
+        self.proj.ytyps[ti].mlos.push(mlo);
+        let mi = self.proj.ytyps[ti].mlos.len() - 1;
+        self.cur_mlo = Some((ti, mi));
+        // placement de l'intérieur dans le ymap de destination, au centre de la vue
+        let yi = self.ensure_target_ymap();
+        let mut inst = Entity::new(&name, self.snap_pos(v3(self.cam.target.x, self.cam.target.y, self.ground_z)));
+        inst.mlo = Some(MloInstData { num_exit_portals: exits, ..Default::default() });
+        inst.lod_dist = 200.0;
+        let id = inst.id;
+        self.proj.ymaps[yi].entities.push(inst);
+        self.set_selection(vec![id]);
+        self.mlo_name = format!("dw_interieur_{}", self.proj.ytyps.iter().map(|t| t.mlos.len()).sum::<usize>() + 1);
+        self.status = format!("Intérieur « {name} » créé : {} pièce(s), portails et porte compris. Pose des props dedans avec l'outil Poser.", cols * rows);
+    }
+
+    /// Crée un intérieur avec les pièces proposées pour l'étage `li` du bâtiment analysé, placé exactement sur
+    /// le bâtiment ; les pièces se corrigent ensuite dans l'onglet Intérieur.
+    pub fn rooms_from_level(&mut self, li: usize) {
+        let Some(a) = self.game.analysis.as_ref() else { return };
+        let Some(plan) = crate::analyse::propose_rooms(a, li) else {
+            self.status = "Aucune pièce trouvée à cet étage (pas assez de sol).".into();
+            return;
+        };
+        let (bpos, brot, bname) = (a.pos, a.rot, a.name.clone());
+        self.push_undo();
+        let mut name = format!("{}_etage{}", bname, li + 1);
+        let mut k = 2;
+        while self.proj.find_mlo(&name).is_some() {
+            name = format!("{}_etage{}_{k}", bname, li + 1);
+            k += 1;
+        }
+        let mut rooms = vec![model::Room::new("limbo", V3::ZERO, V3::ZERO)];
+        for (n, lo, hi) in &plan.rooms {
+            rooms.push(model::Room::new(n, *lo, *hi));
+        }
+        let portals: Vec<model::Portal> = plan.portals.iter().map(|(f, t, c)| model::Portal::new(*f, *t, *c)).collect();
+        let exits = portals.iter().filter(|p| p.room_to == 0 || p.room_from == 0).count() as u32;
+        let mlo = model::MloArchetype { name: name.clone(), lod_dist: 200.0, flags: 0, mlo_flags: 0, entities: Vec::new(), rooms, portals, entity_sets: Vec::new() };
+        let n_rooms = plan.rooms.len();
+        let n_portals = mlo.portals.len();
+        if self.proj.ytyps.is_empty() {
+            let n = self.proj.next_ytyp_name();
+            self.proj.ytyps.push(Ytyp { name: n, mlos: vec![], visible: true, raw_archetypes: vec![] });
+        }
+        let ti = self.cur_mlo.map(|(t, _)| t).unwrap_or(0).min(self.proj.ytyps.len() - 1);
+        self.proj.ytyps[ti].mlos.push(mlo);
+        let mi = self.proj.ytyps[ti].mlos.len() - 1;
+        self.cur_mlo = Some((ti, mi));
+        // placement : exactement sur le bâtiment (même position et orientation)
+        let yi = self.ensure_target_ymap();
+        let mut inst = Entity::new(&name, bpos);
+        inst.rot = brot;
+        inst.mlo = Some(MloInstData { num_exit_portals: exits, ..Default::default() });
+        inst.lod_dist = 200.0;
+        self.proj.ymaps[yi].entities.push(inst);
+        self.opts.show_rooms = true;
+        self.status = format!("Étage {} : {n_rooms} pièce(s) et {n_portals} passage(s) proposés ({:.0} m² de sol) dans l'intérieur « {name} ». Corrige-les dans la liste des pièces (nom, coins, hauteur).", li + 1, plan.floor_area);
+    }
+
+    pub fn furnish_mlo(&mut self, style: &str) -> String {
+        self.furnish_rooms(style, None)
+    }
+
+    /// Meuble toutes les pièces (`only` = None) ou une seule, selon un type de pièce ; les meubles sont posés sur
+    /// le sol de la pièce (bas de sa boîte), donc à la bonne hauteur pour les pièces proposées par étage.
+    pub fn furnish_rooms(&mut self, style: &str, only: Option<usize>) -> String {
+        if self.cur_mlo.is_none() {
+            return "Aucun intérieur courant : crée-en un d'abord.".into();
+        }
+        self.push_undo();
+        self.furnish_rooms_inner(style, only)
+    }
+
+    /// Même chose, sans point d'annulation (pour l'enchaîner dans « Transformer en intérieur »).
+    pub fn furnish_rooms_inner(&mut self, style: &str, only: Option<usize>) -> String {
+        let Some((t, m)) = self.cur_mlo else { return "Aucun intérieur courant : crée-en un d'abord.".into() };
+        let mut added = 0;
+        let rooms: Vec<(usize, V3, V3)> = self.proj.ytyps[t].mlos[m].rooms.iter().enumerate().skip(1).filter(|(i, _)| only.map(|o| o == *i).unwrap_or(true)).map(|(i, r)| (i, r.bb_min, r.bb_max)).collect();
+        for (ri, mn, mx) in rooms {
+            let c = (mn + mx) * 0.5;
+            let w = mx.x - mn.x;
+            let d = mx.y - mn.y;
+            let mut items: Vec<(&str, f32, f32, f32)> = Vec::new(); // (prop, x, y, cap)
+            match style {
+                "bureau" => {
+                    let nx = ((w - 1.0) / 2.4).floor().max(1.0) as i32;
+                    for i in 0..nx {
+                        let x = mn.x + 1.2 + i as f32 * 2.4 + 0.8;
+                        items.push(("prop_off_desk_01", x, c.y, 0.0));
+                        items.push(("prop_chair_01a", x, c.y - 0.9, 180.0));
+                    }
+                    items.push(("prop_plant_01a", mx.x - 0.5, mx.y - 0.5, 0.0));
+                }
+                "bar" => {
+                    items.push(("v_ret_ml_tablea", c.x, mx.y - 1.0, 0.0));
+                    for i in -1..=1 {
+                        items.push(("prop_bar_stool_01", c.x + i as f32 * 0.8, mx.y - 1.9, 0.0));
+                    }
+                    items.push(("prop_table_03", c.x, c.y - d * 0.2, 0.0));
+                }
+                "magasin" => {
+                    items.push(("v_ret_ml_tablea", c.x, mn.y + 1.2, 0.0));
+                    items.push(("prop_atm_01", mx.x - 0.6, c.y, 270.0));
+                    items.push(("prop_vend_soda_01", mn.x + 0.6, c.y, 90.0));
+                }
+                "cuisine" => {
+                    items.push(("v_res_fridgemodsml", mn.x + 0.6, mx.y - 0.6, 180.0));
+                    items.push(("prop_table_03", c.x, c.y, 0.0));
+                    items.push(("prop_chair_01a", c.x - 0.6, c.y - 0.8, 0.0));
+                    items.push(("prop_chair_01a", c.x + 0.6, c.y + 0.8, 180.0));
+                }
+                _ => {
+                    items.push(("prop_couch_01", c.x, mn.y + 0.7, 0.0));
+                    items.push(("prop_table_03", c.x, c.y, 0.0));
+                    items.push(("prop_tv_flat_01", c.x, mx.y - 0.3, 180.0));
+                    items.push(("prop_plant_01a", mx.x - 0.5, mn.y + 0.5, 0.0));
+                }
+            }
+            for (arch, x, y, cap) in items {
+                let mut e = Entity::new(arch, v3(x, y, mn.z));
+                e.flags = mech::MLO_ENTITY_FLAGS;
+                e.room = ri;
+                e.rot = Quat::from_z(cap.to_radians());
+                self.proj.ytyps[t].mlos[m].entities.push(e);
+                added += 1;
+            }
+        }
+        match only {
+            Some(ri) => format!("{added} meuble(s) ajouté(s) dans la pièce {ri} (type {style})."),
+            None => format!("{added} meuble(s) ajouté(s) (style {style})."),
+        }
+    }
+
+    pub fn select_filtered(&mut self, filter: &str, radius: f32) -> usize {
+        let f = filter.to_lowercase();
+        let c = self.cam.target;
+        let mut ids = Vec::new();
+        for it in self.proj.all_items() {
+            if self.sample_hidden(it) {
+                continue;
+            }
+            let Some(e) = self.proj.world_entity(it) else { continue };
+            if !f.is_empty() && !e.archetype.to_lowercase().contains(&f) {
+                continue;
+            }
+            if radius > 0.0 && e.pos.dist2d(c) > radius {
+                continue;
+            }
+            ids.push(e.id);
+        }
+        let n = ids.len();
+        self.set_selection(ids);
+        n
+    }
+
+    /// Exécute une action de l'assistant.
+    pub fn run_action(&mut self, a: &Action) -> String {
+        let c = v3(self.cam.target.x, self.cam.target.y, self.ground_z);
+        match a {
+            Action::Place { archetype, count, pattern, size } => {
+                self.push_undo();
+                let n = (*count).clamp(1, 500);
+                let mut ids = Vec::new();
+                let (fwd, right) = self.cam.flat_axes();
+                for i in 0..n {
+                    let fi = i as f32;
+                    let p = match pattern.as_str() {
+                        "ligne" => c + right * ((fi - (n as f32 - 1.0) * 0.5) * size),
+                        "cercle" => {
+                            let a = fi / n as f32 * std::f32::consts::TAU;
+                            c + v3(a.cos() * size, a.sin() * size, 0.0)
+                        }
+                        "grille" => {
+                            let side = (n as f32).sqrt().ceil() as u32;
+                            let gx = (i % side) as f32 - (side as f32 - 1.0) * 0.5;
+                            let gy = (i / side) as f32 - (side as f32 - 1.0) * 0.5;
+                            c + right * (gx * size) + fwd * (gy * size)
+                        }
+                        "aleatoire" => {
+                            let a = self.rng.range(0.0, std::f32::consts::TAU);
+                            let r = size * self.rng.f().sqrt();
+                            c + v3(a.cos() * r, a.sin() * r, 0.0)
+                        }
+                        _ => c,
+                    };
+                    let heading = match pattern.as_str() {
+                        "aleatoire" => Some(self.rng.range(0.0, 360.0)),
+                        "cercle" => Some((fi / n as f32 * 360.0 + 90.0) % 360.0),
+                        _ => Some(0.0),
+                    };
+                    ids.push(self.place_prop(archetype, p, heading));
+                }
+                self.set_selection(ids);
+                format!("{n} × {archetype} posé(s).")
+            }
+            Action::DeleteRadius { radius, filter } => {
+                let ids: HashSet<u64> = self.items_in_radius(c, *radius, filter, true).into_iter().collect();
+                if ids.is_empty() {
+                    return "Rien à supprimer dans cette zone.".into();
+                }
+                self.push_undo();
+                let n = self.proj.delete_ids(&ids);
+                self.clean_selection();
+                format!("{n} objet(s) supprimé(s) dans un rayon de {radius} m.")
+            }
+            Action::DeleteSelection => {
+                let n = self.selected.len();
+                self.delete_selected();
+                format!("{n} objet(s) supprimé(s).")
+            }
+            Action::Select { filter, radius } => {
+                let n = self.select_filtered(filter, *radius);
+                format!("{n} objet(s) sélectionné(s).")
+            }
+            Action::ClearSelection => {
+                self.set_selection(vec![]);
+                "Sélection vidée.".into()
+            }
+            Action::MoveSelection { dx, dy, dz } => {
+                if self.selected.is_empty() {
+                    return "Rien n'est sélectionné.".into();
+                }
+                self.push_undo();
+                self.move_selected(v3(*dx, *dy, *dz));
+                "Sélection déplacée.".into()
+            }
+            Action::RotateSelection { degrees } => {
+                if self.selected.is_empty() {
+                    return "Rien n'est sélectionné.".into();
+                }
+                self.push_undo();
+                self.rotate_selected(*degrees);
+                format!("Sélection tournée de {degrees}°.")
+            }
+            Action::ScaleSelection { factor } => {
+                if self.selected.is_empty() {
+                    return "Rien n'est sélectionné.".into();
+                }
+                self.push_undo();
+                for id in self.selected.clone() {
+                    if let Some(r) = self.proj.find_id(id) {
+                        if let Some(e) = self.proj.ent_mut(r) {
+                            e.scale_xy = (e.scale_xy * factor).clamp(0.05, 50.0);
+                            e.scale_z = (e.scale_z * factor).clamp(0.05, 50.0);
+                        }
+                    }
+                }
+                format!("Taille ×{factor}.")
+            }
+            Action::DuplicateSelection { dx, dy } => {
+                self.duplicate_selected(v3(*dx, *dy, 0.0));
+                "Sélection dupliquée.".into()
+            }
+            Action::CreateMlo { name, cols, rows, width, depth, height } => {
+                self.create_mlo(name, (*cols).clamp(1, 8), (*rows).clamp(1, 8), width.clamp(2.0, 60.0), depth.clamp(2.0, 60.0), height.clamp(2.0, 20.0));
+                self.status.clone()
+            }
+            Action::FurnishMlo { style } => self.furnish_mlo(style),
+            Action::Goto { x, y } => {
+                self.cam.target = v3(*x, *y, self.ground_z);
+                format!("Vue centrée sur ({x}, {y}).")
+            }
+            Action::Undo => {
+                self.do_undo();
+                "Annulé.".into()
+            }
+        }
+    }
+
+    pub fn scene_summary(&self) -> String {
+        let mut s = format!(
+            "Centre de la vue : ({:.1}, {:.1}, {:.1}). Sol à z = {:.1}.\nSélection : {} objet(s).\n",
+            self.cam.target.x, self.cam.target.y, self.cam.target.z, self.ground_z, self.selected.len()
+        );
+        for id in self.selected.iter().take(15) {
+            if let Some(e) = self.proj.find_id(*id).and_then(|r| self.proj.world_entity(r)) {
+                s += &format!("  - {} à ({:.1}, {:.1}, {:.1})\n", e.archetype, e.pos.x, e.pos.y, e.pos.z);
+            }
+        }
+        for y in &self.proj.ymaps {
+            s += &format!("Ymap {} : {} objets{}\n", y.name, y.entities.len(), if y.sample { " (carte d'exemple)" } else { "" });
+        }
+        for t in &self.proj.ytyps {
+            for m in &t.mlos {
+                s += &format!("Intérieur {} : {} pièces, {} portails, {} objets\n", m.name, m.rooms.len().saturating_sub(1), m.portals.len(), m.entities.len());
+            }
+        }
+        let near = self.items_in_radius(self.cam.target, 60.0, "", true);
+        s += &format!("Objets à moins de 60 m du centre : {}\n", near.len());
+        s
+    }
+
+    pub fn send_chat(&mut self) {
+        let text = self.chat_input.trim().to_string();
+        if text.is_empty() || self.pending.is_some() {
+            return;
+        }
+        self.chat_input.clear();
+        self.chat.push(ChatLine { from_user: true, text: text.clone() });
+        if self.ai_provider != ai::Provider::Local {
+            let cfg = ai::AiConfig {
+                provider: self.ai_provider,
+                claude_key: self.api_key.trim().to_string(),
+                claude_code: self.claude_code.clone(),
+                cc_model: self.cc_model.clone(),
+                oa_base: self.oa_base.clone(),
+                oa_key: self.oa_key.clone(),
+                oa_model: self.oa_model.clone(),
+                cli_cmd: self.cli_cmd.clone(),
+            };
+            self.pending = Some(ai::ask(cfg, self.chat.clone(), self.scene_summary()));
+        } else {
+            let r = ai::local_parse(&text);
+            self.apply_reply(r);
+        }
+    }
+
+    pub fn apply_reply(&mut self, r: AiReply) {
+        if std::env::var("DW_TEST_AI").is_ok() {
+            println!("réponse IA : {} | actions {:?}", r.message, r.actions);
+        }
+        let mut out = r.message;
+        for a in &r.actions {
+            let res = self.run_action(a);
+            out.push_str(&format!("\n✔ {res}"));
+        }
+        self.status = out.lines().last().unwrap_or("").trim_start_matches("✔ ").to_string();
+        self.chat.push(ChatLine { from_user: false, text: out });
+    }
+
+    // ------------------------------------------------------------ fichiers
+
+    pub fn import_file(&mut self, path: &std::path::Path) {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            self.status = format!("Impossible de lire {}", path.display());
+            return;
+        };
+        let fname = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        let base = fname.split('.').next().unwrap_or("import").to_string();
+        if fname.to_lowercase().ends_with(".dwproj") {
+            self.open_project_str(&src, path);
+            return;
+        }
+        if src.contains("<CMapTypes") {
+            match xmlio::read_ytyp(&src, &base) {
+                Ok(t) => {
+                    self.push_undo();
+                    let n = t.mlos.len();
+                    self.proj.ytyps.push(t);
+                    model::bump_ids(self.proj.max_id());
+                    self.status = format!("ytyp « {base} » importé ({n} intérieur(s)).");
+                }
+                Err(e) => self.status = e,
+            }
+        } else {
+            match xmlio::read_ymap(&src, &base) {
+                Ok(y) => {
+                    self.push_undo();
+                    let n = y.entities.len();
+                    // centrer la vue sur le ymap importé et ajuster le sol
+                    if n > 0 {
+                        let mut zs: Vec<f32> = y.entities.iter().map(|e| e.pos.z).collect();
+                        zs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let c = y.entities.iter().fold(V3::ZERO, |a, e| a + e.pos) * (1.0 / n as f32);
+                        self.ground_z = zs[zs.len() / 4];
+                        self.cam.target = v3(c.x, c.y, self.ground_z);
+                        if c.dist2d(V3::ZERO) > sample::CITY_HALF * 2.0 {
+                            self.opts.show_sample = false;
+                        }
+                    }
+                    self.proj.ymaps.push(y);
+                    self.target_ymap = self.proj.ymaps.len() - 1;
+                    model::bump_ids(self.proj.max_id());
+                    self.status = format!("ymap « {base} » importé ({n} objets). Il devient le ymap de destination.");
+                }
+                Err(e) => self.status = e,
+            }
+        }
+    }
+
+    pub fn open_project_str(&mut self, src: &str, path: &std::path::Path) {
+        match serde_json::from_str::<Project>(src) {
+            Ok(mut p) => {
+                if !p.ymaps.iter().any(|y| y.sample) {
+                    p.ymaps.insert(0, sample::generate());
+                }
+                self.proj = p;
+                model::bump_ids(self.proj.max_id());
+                self.undo.clear();
+                self.redo.clear();
+                self.set_selection(vec![]);
+                self.target_ymap = self.proj.ymaps.iter().position(|y| !y.sample).unwrap_or(0);
+                self.project_path = Some(path.to_path_buf());
+                self.status = format!("Projet ouvert : {}", path.display());
+            }
+            Err(e) => self.status = format!("Projet illisible : {e}"),
+        }
+    }
+
+    pub fn save_project(&mut self, ask: bool) {
+        let path = if ask || self.project_path.is_none() {
+            rfd::FileDialog::new().add_filter("Projet DragoWalker", &["dwproj"]).set_file_name(format!("{}.dwproj", self.proj.name)).save_file()
+        } else {
+            self.project_path.clone()
+        };
+        let Some(path) = path else { return };
+        // la carte d'exemple est regénérée à l'ouverture
+        let mut p = self.proj.clone();
+        p.ymaps.retain(|y| !y.sample);
+        match serde_json::to_string_pretty(&p) {
+            Ok(s) => match std::fs::write(&path, s) {
+                Ok(_) => {
+                    self.status = format!("Projet enregistré : {}", path.display());
+                    self.project_path = Some(path);
+                }
+                Err(e) => self.status = format!("Échec de l'enregistrement : {e}"),
+            },
+            Err(e) => self.status = format!("Échec : {e}"),
+        }
+    }
+
+    pub fn export_xml(&mut self, fivem: bool) {
+        let Some(dir) = rfd::FileDialog::new().set_title("Dossier d'export").pick_folder() else { return };
+        self.status = self.export_project(&dir, fivem);
+    }
+}
+
+impl eframe::App for DwApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame += 1;
+        let dt = ctx.input(|i| i.stable_dt).min(mech::MAX_FRAME_STEP);
+        self.poll_game_load(ctx);
+        self.sollumz_tick(ctx);
+        // capture automatique : attendre la fin du chargement du jeu (au plus ~90 s)
+        if self.shot_path.is_some() && self.game.loading.is_some() && self.frame > 2 && self.frame < 6000 {
+            self.frame = 2;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        // mode test : DW_TEST_PROBE pose un banc sur la surface visible au centre de la vue
+        static PROBE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && std::env::var("DW_TEST_PROBE").is_ok() && !PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            match self.mouse_ground {
+                Some(g) => {
+                    println!("sol sous le centre de la vue : {:.2} {:.2} {:.2}", g.x, g.y, g.z);
+                    self.push_undo();
+                    let id = self.place_prop("prop_bench_01a", g, None);
+                    self.set_selection(vec![id]);
+                }
+                None => println!("sol sous le centre : rien"),
+            }
+        }
+        // mode test : DW_TEST_RECT="largeur,hauteur" sélectionne un rectangle au centre de la vue avec l'outil Rectangle
+        static RECT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !RECT_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(v) = std::env::var("DW_TEST_RECT").ok() {
+                let p: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if p.len() == 2 {
+                    self.tool = Tool::Rect;
+                    let r = egui::Rect::from_center_size(self.cam.rect.center(), egui::vec2(p[0], p[1]));
+                    let n = self.rect_select(r, false);
+                    println!("rectangle {}x{} : {n} objet(s) | {}", p[0], p[1], self.status);
+                    if std::env::var("DW_TEST_RECT_SCALE").is_ok() && n > 1 {
+                        let spread = |s: &DwApp| {
+                            let c = s.selection_center();
+                            let ps: Vec<V3> = s.selected.iter().filter_map(|id| s.proj.find_id(*id).and_then(|r| s.proj.world_entity(r)).map(|e| e.pos)).collect();
+                            ps.iter().map(|p| (*p - c).len()).sum::<f32>() / ps.len().max(1) as f32
+                        };
+                        let before = spread(self);
+                        self.gizmo_mode = crate::gizmo::GizmoMode::Scale;
+                        let c = self.selection_center();
+                        if let Some((pc, _)) = self.cam.project(c) {
+                            if self.gizmo_begin(pc) {
+                                self.gizmo_update(pc + egui::vec2(0.0, -50.0));
+                                self.drag = Drag::None;
+                            }
+                        }
+                        println!("groupe agrandi : écart moyen au centre {before:.2} m -> {:.2} m | {}", spread(self), self.status);
+                    }
+                }
+            }
+        }
+        // mode test : DW_TEST_ANALYSE=1 prend le bâtiment sous le point de test, l'analyse et ouvre l'onglet Intérieur
+        static ANALYSE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && std::env::var("DW_TEST_ANALYSE").is_ok() && !ANALYSE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let c = test_point(self.cam.rect);
+            // DW_TEST_ANALYSE="nom" : l'objet du jeu de ce nom le plus proche du centre de la vue
+            let want = std::env::var("DW_TEST_ANALYSE").unwrap_or_default();
+            let named: Option<u32> = self.game.world.as_ref().and_then(|w| {
+                let h = crate::gta::crypto::joaat(&want);
+                (0..w.ents.len() as u32).filter(|i| w.ents[*i as usize].arch == h && w.ymaps[w.ents[*i as usize].ymap as usize].visible).min_by(|a, b| {
+                    let da = (w.ents[*a as usize].pos - self.cam.target).len();
+                    let db = (w.ents[*b as usize].pos - self.cam.target).len();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+            let picked = match named {
+                Some(ei) => {
+                    self.push_undo();
+                    self.game_ents_to_project(&[ei]).into_iter().next()
+                }
+                None => self.pick_any(c, false),
+            };
+            if let Some(id) = picked {
+                self.set_selection(vec![id]);
+                self.analyse_selected();
+                self.tab = Tab::Interior;
+                println!("{}", self.status);
+                if let Some(a) = &self.game.analysis {
+                    for (z, s) in &a.levels {
+                        println!("   étage à {z:.1} m : {s:.0} m²");
+                    }
+                }
+                if std::env::var("DW_TEST_CONVERT").is_ok() {
+                    let msg = self.convert_to_interior();
+                    println!("{msg}");
+                    if let Some((t, m)) = self.cur_mlo {
+                        let mlo = &self.proj.ytyps[t].mlos[m];
+                        for r in mlo.rooms.iter().skip(1).take(6) {
+                            println!("   {} · ambiance « {} » · sol {:.1}", r.name, r.timecycle, r.bb_min.z);
+                        }
+                        // pièces supprimées : les objets orphelins doivent être rangés à l'export
+                        let mut y = self.proj.ytyps[t].clone();
+                        let nr = y.mlos[m].rooms.len();
+                        y.mlos[m].rooms.truncate(nr - 5);
+                        let xml = crate::xmlio::write_ytyp(&y);
+                        let attached: usize = xml.split("<attachedObjects").skip(1).map(|p| p.split("</attachedObjects>").next().unwrap_or("").split_whitespace().filter(|w| w.trim_start_matches('>').parse::<u32>().is_ok()).count()).sum();
+                        println!("   export après suppression de 5 pièces : {attached} objet(s) rangés dans une pièce sur {}", y.mlos[m].entities.len());
+                        for e in mlo.entities.iter().filter(|e| e.archetype.contains("door")).take(3) {
+                            println!("   porte {} à {:.1} {:.1} {:.1}, cap {:.0}°", e.archetype, e.pos.x, e.pos.y, e.pos.z, e.rot.heading_deg());
+                        }
+                    }
+                    self.status = msg;
+                }
+                if let Some(li) = std::env::var("DW_TEST_ROOMS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    self.rooms_from_level(li);
+                    println!("{}", self.status);
+                    let msg = self.furnish_rooms("salon", Some(1));
+                    if let Some((t, m)) = self.cur_mlo {
+                        let mlo = &self.proj.ytyps[t].mlos[m];
+                        let z: Vec<String> = mlo.entities.iter().map(|e| format!("{} z {:.1}", e.archetype, e.pos.z)).collect();
+                        println!("{msg} -> {:?} (sol de la pièce 1 : {:.1})", z, mlo.rooms[1].bb_min.z);
+                    }
+                    if let Some((t, m)) = self.cur_mlo {
+                        for r in self.proj.ytyps[t].mlos[m].rooms.iter().skip(1) {
+                            println!("   {} : {:.1}..{:.1} x {:.1}..{:.1}, sol {:.1}, haut {:.1}", r.name, r.bb_min.x, r.bb_max.x, r.bb_min.y, r.bb_max.y, r.bb_min.z, r.bb_max.z);
+                        }
+                    }
+                    if let Some(z) = self.game.analysis.as_ref().and_then(|a| a.levels.get(li)).map(|l| l.0) {
+                        self.cam.target.z = z;
+                        self.game.cut_on = true;
+                        self.game.cut_h = 2.5;
+                    }
+                }
+            }
+        }
+        // mode test : DW_TEST_GIZMO="z" pose un banc au centre de la vue, puis saisit chaque poignée et glisse de 60 pixels
+        // (vers la droite pour les axes X/Y, vers le haut pour Z) dans les trois modes ; la poignée reste affichée en mode `z`
+        static GIZMO_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !GIZMO_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(final_mode) = std::env::var("DW_TEST_GIZMO") {
+                use crate::gizmo::GizmoMode;
+                let g = self.mouse_ground.unwrap_or(self.cam.target);
+                self.push_undo();
+                self.gizmo_object_space = std::env::var("DW_GIZMO_OBJ").is_ok();
+                let id = self.place_prop("prop_bench_01a", g, Some(if self.gizmo_object_space { 45.0 } else { 0.0 }));
+                self.set_selection(vec![id]);
+                let show = |s: &DwApp| s.proj.find_id(id).and_then(|r| s.proj.world_entity(r)).map(|e| format!("pos {:.2} {:.2} {:.2} cap {:.0}° taille {:.2}/{:.2}", e.pos.x, e.pos.y, e.pos.z, e.rot.heading_deg(), e.scale_xy, e.scale_z)).unwrap_or_default();
+                println!("banc posé : {}", show(self));
+                for mode in [GizmoMode::Move, GizmoMode::Rotate, GizmoMode::Scale] {
+                    self.gizmo_mode = mode;
+                    for axis in 0..3u8 {
+                        let c = self.selection_center();
+                        let s = self.gizmo_world_size(c, match mode { GizmoMode::Rotate => crate::gizmo::ROT_PX, _ => crate::gizmo::MOVE_PX });
+                        let ax = self.gizmo_axes();
+                        let a = ax[axis as usize];
+                        // point de saisie : sur la flèche (0,8 × taille) ou sur l'anneau
+                        let grab = match mode {
+                            GizmoMode::Rotate => {
+                                // à mi-chemin entre deux axes : sur cet anneau seulement
+                                let (u, v) = [(ax[1], ax[2]), (ax[2], ax[0]), (ax[0], ax[1])][axis as usize];
+                                c + (u + v).norm() * s
+                            }
+                            _ => c + a * (s * 0.8),
+                        };
+                        let Some((p, _)) = self.cam.project(grab) else { continue };
+                        if !self.gizmo_begin(p) {
+                            println!("{mode:?} axe {axis} : poignée non trouvée");
+                            continue;
+                        }
+                        let dir = if axis == 2 { egui::vec2(0.0, -60.0) } else { egui::vec2(60.0, 0.0) };
+                        for k in 1..=6 {
+                            self.gizmo_update(p + dir * (k as f32 / 6.0));
+                        }
+                        self.drag = Drag::None;
+                        println!("{mode:?} axe {axis} : {} | {}", show(self), self.status);
+                    }
+                }
+                self.gizmo_mode = match final_mode.as_str() { "r" => GizmoMode::Rotate, "t" => GizmoMode::Scale, _ => GizmoMode::Move };
+            }
+        }
+        // mode test : DW_TEST_CLICKS="n" clique n fois au point de test (centre, ou DW_TEST_AT="dx,dy") (reclic = objet de derrière), puis cache le dernier (H)
+        static CLICKS_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !CLICKS_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(n) = std::env::var("DW_TEST_CLICKS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                let c = test_point(self.cam.rect);
+                println!("sous le centre : {} objet(s), point visible {:?}", self.under_cursor(c).len(), self.game.surface);
+                // tout ce que le rayon traverse dans la carte entière, dessiné ou non (pour chercher un sol manquant)
+                if let Some(w) = self.game.world.as_ref() {
+                    let (o, d) = self.cam.ray(c);
+                    let drawn: std::collections::HashSet<u32> = self.game.drawn.iter().copied().collect();
+                    let mut hits: Vec<(f32, u32)> = (0..w.ents.len() as u32).filter(|ei| w.ymaps[w.ents[*ei as usize].ymap as usize].visible).filter_map(|ei| crate::game_ui::ray_box_pub(w, ei, o, d).map(|_| { let (mn, mx) = w.arch_box(w.ents[ei as usize].arch); ((mx - mn).len(), ei) })).collect();
+                    hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    for (t, ei) in hits.iter().take(40) {
+                        let e = &w.ents[*ei as usize];
+                        let y = &w.ymaps[e.ymap as usize];
+                        println!("   taille {t:.0} m : {} lod {} intérieur {} dessiné {} carte {} visible {} groupe {}", w.name_of(e.arch), e.lod_level, e.mlo, drawn.contains(ei), y.name, y.visible, y.group);
+                    }
+                }
+                if let Some(w) = self.game.world.as_ref() {
+                    for u in self.under_cursor(c).iter().take(6) {
+                        if let crate::game_ui::Under::Game(ei) = u {
+                            let e = &w.ents[*ei as usize];
+                            let (mn, mx) = w.arch_box(e.arch);
+                            println!("   {} boîte {:?} .. {:?}", w.name_of(e.arch), mn, mx);
+                        }
+                    }
+                }
+                let mut last = None;
+                for k in 0..n {
+                    let id = self.pick_any(c, true);
+                    let name = id.and_then(|id| self.proj.find_id(id)).and_then(|r| self.proj.ent(r)).map(|e| format!("{} #{} lod={} {:.1},{:.1},{:.1}", e.archetype, e.id, e.lod_level, e.pos.x, e.pos.y, e.pos.z)).unwrap_or_default();
+                    println!("clic {} : {name} | {}", k + 1, self.status);
+                    last = id;
+                }
+                if std::env::var("DW_TEST_CTRL").is_ok() {
+                    // Ctrl + clic à deux endroits : les deux objets touchés s'ajoutent
+                    self.set_selection(Vec::new());
+                    for dx in [0.0f32, -330.0, 300.0] {
+                        let p = c + egui::vec2(dx, 0.0);
+                        if let Some(id) = self.pick_any(p, false) {
+                            if self.sel_set.contains(&id) { self.selected.retain(|x| *x != id); self.sel_set.remove(&id); } else { self.add_selection([id]); }
+                            let name = self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()).unwrap_or_default();
+                            println!("ctrl+clic ({dx}) : {name} -> {} sélectionné(s)", self.selected.len());
+                        }
+                    }
+                    last = None;
+                }
+                if let Some(id) = last {
+                    self.set_selection(vec![id]);
+                    self.game.hidden_ids.insert(id);
+                    self.game.click_at = None;
+                    println!("après H : {} objet(s) sous le centre, premier = {:?}", self.under_cursor(c).len(), self.pick(c).and_then(|id| self.proj.find_id(id)).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()));
+                }
+            }
+        }
+        // capture : attendre aussi que les vrais modèles visibles soient chargés (au plus ~60 s)
+        if self.shot_path.is_some() && self.frame > 60 && self.frame < 120 {
+            let busy = self.pending.is_some() || self.game.gpu.as_ref().map(|g| g.lock().map(|g| g.busy()).unwrap_or(false)).unwrap_or(false);
+            if busy && self.shot_wait < 4000 {
+                self.shot_wait += 1;
+                self.frame = 60;
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+
+        // réponse de Claude
+        if let Some(rx) = &self.pending {
+            if let Ok(res) = rx.try_recv() {
+                self.pending = None;
+                match res {
+                    Ok(r) => self.apply_reply(r),
+                    Err(e) => {
+                        if std::env::var("DW_TEST_AI").is_ok() {
+                            println!("erreur IA : {e}");
+                        }
+                        // repli sur l'interpréteur local
+                        let last = self.chat.iter().rev().find(|l| l.from_user).map(|l| l.text.clone()).unwrap_or_default();
+                        self.chat.push(ChatLine { from_user: false, text: format!("{e}\nJe passe par l'interpréteur local.") });
+                        let r = ai::local_parse(&last);
+                        self.apply_reply(r);
+                    }
+                }
+            }
+        }
+
+        // capture d'écran automatique (--screenshot)
+        if self.shot_path.is_some() {
+            let shot = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+            if let Some(img) = shot {
+                let path = self.shot_path.clone().unwrap();
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let [w, h] = img.size;
+                let mut buf = Vec::with_capacity(w * h * 4);
+                for p in &img.pixels {
+                    buf.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
+                }
+                let _ = image::save_buffer(&path, &buf, w as u32, h as u32, image::ExtendedColorType::Rgba8);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self.frame >= 120 && !self.shot_sent {
+                self.shot_sent = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            }
+        }
+
+        self.shortcuts(ctx);
+
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            self.menu_bar(ui, ctx);
+        });
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            self.toolbar(ui);
+            ui.add_space(2.0);
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&self.status).color(Color32::from_rgb(220, 220, 220)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let t = self.cam.target;
+                    ui.label(format!("Cible {:.1}, {:.1}, {:.1}", t.x, t.y, t.z));
+                    ui.separator();
+                    if let Some(g) = self.mouse_ground {
+                        ui.label(format!("Souris {:.1}, {:.1}", g.x, g.y));
+                        ui.separator();
+                    }
+                    ui.label(format!("{} sélectionné(s)", self.selected.len()));
+                    ui.separator();
+                    ui.label(format!("{} objets", self.proj.entity_count()));
+                });
+            });
+        });
+        egui::SidePanel::left("project").default_width(250.0).resizable(true).show(ctx, |ui| {
+            self.project_panel(ui);
+        });
+        egui::SidePanel::right("toolbox").default_width(340.0).resizable(true).show(ctx, |ui| {
+            self.toolbox(ui);
+        });
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {
+            self.view(ui, dt);
+        });
+        ctx.request_repaint();
+    }
+}

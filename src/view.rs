@@ -1,0 +1,578 @@
+//! Vue 3D / carte : caméra, outils à la souris, raccourcis clavier.
+
+use crate::app::{Drag, DwApp, Tab, Tool};
+use crate::math::{v3, V3};
+use crate::mech;
+use crate::model::{Entity, ItemRef};
+use crate::render;
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke};
+use std::collections::HashSet;
+
+impl DwApp {
+    pub fn pick(&self, s: Pos2) -> Option<u64> {
+        if self.game.world.is_some() {
+            return self.under_cursor(s).into_iter().find_map(|u| if let crate::game_ui::Under::Proj(id) = u { Some(id) } else { None });
+        }
+        let (o, d) = self.cam.ray(s);
+        let mut best: Option<(f32, u64, f32)> = None;
+        for it in self.proj.all_items() {
+            if self.sample_hidden(it) {
+                continue;
+            }
+            let Some(e) = self.proj.world_entity(it) else { continue };
+            if let Some(t) = render::ray_hit(&e, &self.proj, o, d) {
+                let (mn, mx) = e.local_box(&self.proj);
+                let size = (mx - mn).len();
+                // un placement d'intérieur ne passe jamais devant ses objets
+                let score = t + if e.mlo.is_some() { 1e6 } else { 0.0 };
+                let better = match best {
+                    None => true,
+                    Some(b) => score < b.0 - 0.5 || ((score - b.0).abs() <= 0.5 && size < b.2),
+                };
+                if better {
+                    best = Some((score, e.id, size));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    fn erase_at(&mut self, g: V3) {
+        let f = self.erase_filter.clone();
+        let ids: HashSet<u64> = self.items_in_radius(g, self.erase_radius, &f, self.erase_buildings).into_iter().collect();
+        let mut n = 0;
+        if !ids.is_empty() {
+            n += self.proj.delete_ids(&ids);
+        }
+        n += self.game_erase_at(g);
+        if n > 0 {
+            self.clean_selection();
+            self.status = format!("Gomme : {n} objet(s) supprimé(s).");
+        }
+    }
+
+    pub fn view(&mut self, ui: &mut egui::Ui, dt: f32) {
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        self.cam.rect = rect;
+        let ctx = ui.ctx().clone();
+        let hover_pos = resp.hover_pos();
+        // mode test : la souris est simulée au centre de la vue
+        let hover_pos = hover_pos.or_else(|| std::env::var("DW_TEST_PROBE").or_else(|_| std::env::var("DW_TEST_CLICKS")).or_else(|_| std::env::var("DW_TEST_ANALYSE")).ok().map(|_| crate::app::test_point(rect)));
+        let mods = ctx.input(|i| i.modifiers);
+
+        // caméra : clic droit tourne (vue carte : déplace), clic molette déplace, molette zoome
+        if resp.dragged_by(PointerButton::Secondary) {
+            let d = resp.drag_delta();
+            if self.cam.map_view {
+                let mpp = self.cam.meters_per_pixel();
+                self.cam.target = self.cam.target + v3(-d.x * mpp, d.y * mpp, 0.0);
+            } else {
+                self.cam.mouse_rotate(d.x, d.y);
+            }
+        }
+        if resp.dragged_by(PointerButton::Middle) {
+            let d = resp.drag_delta();
+            let mpp = self.cam.meters_per_pixel();
+            let (f, r) = self.cam.flat_axes();
+            self.cam.target = self.cam.target - r * (d.x * mpp) + f * (d.y * mpp);
+        }
+        if resp.hovered() {
+            let scroll = ctx.input(|i| i.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                if self.tool == Tool::Erase && mods.alt {
+                    self.erase_radius = (self.erase_radius * if scroll > 0.0 { 1.1 } else { 0.9 }).clamp(1.0, 500.0);
+                } else if mods.alt && self.game.cut_on {
+                    // la molette + Alt règle la hauteur de coupe (plus bas)
+                } else {
+                    self.cam.mouse_zoom(scroll.signum());
+                }
+            }
+        }
+
+        // déplacement clavier (WorldForm::UpdateControlInputs)
+        if !ctx.wants_keyboard_input() {
+            let free_arrows = self.selected.is_empty();
+            let keys = ctx.input(|i| {
+                [
+                    i.key_down(Key::W) || (i.key_down(Key::Z) && !i.modifiers.command) || (free_arrows && i.key_down(Key::ArrowUp)),
+                    i.key_down(Key::S) && !i.modifiers.command || (free_arrows && i.key_down(Key::ArrowDown)),
+                    i.key_down(Key::A) && !i.modifiers.command || i.key_down(Key::Q) || (free_arrows && i.key_down(Key::ArrowLeft)),
+                    (i.key_down(Key::D) && !i.modifiers.command) || (free_arrows && i.key_down(Key::ArrowRight)),
+                    i.key_down(Key::PageUp),
+                    i.key_down(Key::PageDown),
+                ]
+            });
+            let (f, r) = self.cam.flat_axes();
+            let dirs = [f, -f, -r, r, v3(0.0, 0.0, 1.0), v3(0.0, 0.0, -1.0)];
+            let mut mv = V3::ZERO;
+            for (k, d) in keys.iter().zip(dirs.iter()) {
+                if *k {
+                    mv = mv + *d;
+                }
+            }
+            if mv.len() > 0.0 {
+                let mut speed = mech::BASE_MOVE_SPEED * self.speed_mult;
+                if mods.shift {
+                    speed *= mech::SHIFT_MULT;
+                }
+                if mods.ctrl {
+                    speed *= mech::CTRL_MULT;
+                }
+                self.cam.target = self.cam.target + mv.norm() * (dt * speed * self.cam.move_scale());
+            }
+        }
+        self.cam.update(dt);
+
+        // survol
+        // sol sous la souris : la vraie surface visible (profondeur lue dans la carte graphique), sinon le relief
+        let surface = match (hover_pos, self.game.real_models, &self.game.gpu) {
+            (Some(p), true, Some(g)) => g.lock().ok().and_then(|g| g.probe).filter(|(pp, _)| (pp[0] - p.x).abs() < 2.0 && (pp[1] - p.y).abs() < 2.0).and_then(|(_, d)| self.cam.unproject_depth(p, d)),
+            _ => None,
+        };
+        self.game.surface = surface;
+        if !ctx.wants_keyboard_input() && self.game.world.is_some() {
+            let (kc, kh, alt_scroll) = ctx.input(|i| (i.key_pressed(Key::C) && !i.modifiers.command, i.key_pressed(Key::H) && !i.modifiers.command, if i.modifiers.alt { i.raw_scroll_delta.y } else { 0.0 }));
+            if kc {
+                self.game.cut_on = !self.game.cut_on;
+                self.status = if self.game.cut_on { format!("Coupe activée à {:.1} m au-dessus du centre de la vue (molette + Alt pour la monter ou la descendre).", self.game.cut_h) } else { "Coupe désactivée.".into() };
+            }
+            if alt_scroll != 0.0 && self.game.cut_on && hover_pos.is_some() {
+                self.game.cut_h = (self.game.cut_h + alt_scroll.signum() * 0.5).clamp(-10.0, 60.0);
+                self.status = format!("Coupe à {:.1} m.", self.game.cut_h);
+            }
+            if kh && self.hover.is_some() {
+                let id = self.hover.unwrap_or(0);
+                self.game.hidden_ids.insert(id);
+                let n = self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()).unwrap_or_default();
+                self.selected.retain(|x| *x != id);
+                self.sel_set.remove(&id);
+                self.status = format!("« {n} » caché (pas supprimé). Onglet Jeu : « Tout réafficher ».");
+                self.hover = None;
+            } else if kh {
+                if let Some(ei) = self.game.hover {
+                    self.game.hidden.insert(ei);
+                    let n = self.game.world.as_ref().map(|w| w.name_of(w.ents[ei as usize].arch)).unwrap_or_default();
+                    self.status = format!("« {n} » caché (pas supprimé). Onglet Jeu : « Tout réafficher ».");
+                    self.game.hover = None;
+                }
+            }
+        }
+        self.mouse_ground = hover_pos.and_then(|p| if self.game.world.is_some() { surface.or_else(|| self.game_ground(p)).or_else(|| self.cam.ground_point(p, self.ground_z)) } else { self.cam.ground_point(p, self.ground_z) });
+        if self.game.world.is_some() {
+            // survol : exactement l'objet qu'un clic prendrait (y compris celui de derrière après un reclic)
+            if self.frame % 2 == 0 {
+                let u = if self.tool != Tool::Place { hover_pos.and_then(|p| self.hover_under(p, !(mods.command || mods.shift))) } else { None };
+                self.hover = match u {
+                    Some(crate::game_ui::Under::Proj(id)) if self.tool == Tool::Select => Some(id),
+                    _ => None,
+                };
+                self.game.hover = match u {
+                    Some(crate::game_ui::Under::Game(ei)) => Some(ei),
+                    _ => None,
+                };
+            } else if self.tool != Tool::Select {
+                self.hover = None;
+            }
+        } else {
+            self.hover = if self.tool == Tool::Select && self.frame % 2 == 0 { hover_pos.and_then(|p| self.pick(p)) } else if self.tool == Tool::Select { self.hover } else { None };
+        }
+
+        self.gizmo_hover = if self.tool == Tool::Select && !matches!(self.drag, Drag::Gizmo(_)) { hover_pos.and_then(|p| self.gizmo_pick(p)) } else { None };
+        if self.gizmo_hover.is_some() {
+            self.hover = None;
+            self.game.hover = None;
+        }
+        let ptr = resp.interact_pointer_pos().or(hover_pos);
+        let press_origin = ctx.input(|i| i.pointer.press_origin());
+        match self.tool {
+            Tool::Select | Tool::Rect => self.select_tool(&resp, ptr, press_origin, mods),
+            Tool::Place => {
+                if resp.drag_started_by(PointerButton::Primary) {
+                    let start = press_origin.or(ptr).unwrap_or_default();
+                    if let Some(g) = self.cam.ground_point(start, self.ground_z) {
+                        self.push_undo();
+                        let arch = self.place_arch.clone();
+                        let id = self.place_prop(&arch, g, None);
+                        self.set_selection(vec![id]);
+                        self.drag = Drag::Place(g);
+                    }
+                }
+                if resp.dragged_by(PointerButton::Primary) {
+                    if let (Drag::Place(last), Some(g)) = (&self.drag, self.mouse_ground) {
+                        let last = *last;
+                        let d = g - last;
+                        if d.len() >= self.stroke_spacing {
+                            // les props suivent la direction du trait
+                            let heading = if self.rand_rot { None } else { Some(((-d.x).atan2(d.y).to_degrees() + 90.0).rem_euclid(360.0)) };
+                            let arch = self.place_arch.clone();
+                            let p = last + d.norm() * self.stroke_spacing;
+                            let id = self.place_prop(&arch, p, heading);
+                            self.add_selection([id]);
+                            self.drag = Drag::Place(p);
+                        }
+                    }
+                }
+                if resp.drag_stopped() {
+                    if matches!(self.drag, Drag::Place(_)) {
+                        self.status = format!("{} prop(s) posé(s) le long du trait.", self.selected.len());
+                    }
+                    self.drag = Drag::None;
+                }
+                if resp.clicked_by(PointerButton::Primary) {
+                    if let Some(g) = self.mouse_ground {
+                        self.push_undo();
+                        let arch = self.place_arch.clone();
+                        let id = self.place_prop(&arch, g, None);
+                        self.set_selection(vec![id]);
+                        self.status = format!("« {arch} » posé.");
+                    }
+                }
+            }
+            Tool::Erase => {
+                if resp.drag_started_by(PointerButton::Primary) || resp.clicked_by(PointerButton::Primary) {
+                    self.push_undo();
+                    self.drag = Drag::Erase;
+                    if let Some(g) = self.mouse_ground {
+                        self.erase_at(g);
+                    }
+                }
+                if resp.dragged_by(PointerButton::Primary) {
+                    if let Some(g) = self.mouse_ground {
+                        self.erase_at(g);
+                    }
+                }
+                if resp.drag_stopped() {
+                    self.drag = Drag::None;
+                }
+            }
+        }
+
+        // dessin
+        let painter = ui.painter_at(rect);
+        let mut drawn = std::mem::take(&mut self.game.drawn);
+        let gpu = if self.game.real_models { self.game.gpu.clone().filter(|g| g.lock().map(|g| g.error.is_none()).unwrap_or(false)) } else { None };
+        if let Some(g) = &gpu {
+            if g.lock().map(|g| g.busy()).unwrap_or(false) {
+                ctx.request_repaint();
+            }
+        }
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors });
+        render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
+        drop(gctx);
+        self.game.drawn = drawn;
+        // analyse d'un bâtiment : triangles en couleurs par-dessus la vue
+        if let Some(a) = self.game.analysis.as_ref().filter(|a| a.show) {
+            let cut = self.cut_z();
+            let mut mesh = egui::Mesh::default();
+            for (t, k) in &a.tris {
+                let Some(c) = crate::analyse::kind_color(*k) else { continue };
+                if let Some(cz) = cut {
+                    if t[0].z > cz && t[1].z > cz && t[2].z > cz {
+                        continue;
+                    }
+                }
+                let (Some((p0, _)), Some((p1, _)), Some((p2, _))) = (self.cam.project(t[0]), self.cam.project(t[1]), self.cam.project(t[2])) else { continue };
+                let col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                let base = mesh.vertices.len() as u32;
+                for p in [p0, p1, p2] {
+                    mesh.colored_vertex(p, col);
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                if mesh.vertices.len() > 60000 {
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+        if self.tool == Tool::Select {
+            self.draw_gizmo(&painter, self.gizmo_hover);
+        }
+        // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
+        // MouseRayCollisionVisible quand CtrlPressed) — Ctrl + clic y prend l'objet
+        if (mods.command || std::env::var("DW_TEST_CTRL").is_ok()) && self.tool == Tool::Select {
+            if let (Some(g), Some(hp)) = (self.mouse_ground, hover_pos) {
+                if self.cam.project(g).is_some() {
+                    let col = Color32::from_rgb(255, 200, 60);
+                    painter.circle_stroke(hp, 7.0, Stroke::new(2.0_f32, col));
+                    painter.line_segment([hp - egui::vec2(12.0, 0.0), hp + egui::vec2(12.0, 0.0)], Stroke::new(1.5_f32, col));
+                    painter.line_segment([hp - egui::vec2(0.0, 12.0), hp + egui::vec2(0.0, 12.0)], Stroke::new(1.5_f32, col));
+                    painter.text(hp + egui::vec2(14.0, -18.0), egui::Align2::LEFT_BOTTOM, format!("Ctrl + clic : ajouter · {:.1} {:.1} {:.1}", g.x, g.y, g.z), egui::FontId::proportional(13.0), col);
+                }
+            }
+        }
+        match self.tool {
+            Tool::Place => {
+                if let Some(g) = self.mouse_ground {
+                    let mut e = Entity::new(&self.place_arch, self.snap_pos(g));
+                    e.id = 0;
+                    render::draw_ghost(&painter, &self.cam, &self.proj, &e);
+                    if self.place_into_mlo && self.mlo_at(g).is_some() {
+                        if let Some(p) = hover_pos {
+                            painter.text(p + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, "» dans l'intérieur", egui::FontId::proportional(13.0), Color32::from_rgb(80, 220, 255));
+                        }
+                    }
+                }
+            }
+            Tool::Erase => {
+                if let Some(g) = self.mouse_ground {
+                    render::draw_ground_circle(&painter, &self.cam, g, self.erase_radius, Stroke::new(2.0, Color32::from_rgb(255, 90, 70)));
+                }
+            }
+            Tool::Select | Tool::Rect => {}
+        }
+        if let (Drag::Rect(a), Some(b)) = (&self.drag, ptr) {
+            let r = Rect::from_two_pos(*a, b);
+            painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 200, 60, 30));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
+        }
+        // objet du jeu survolé
+        if let (None, Some(t), Some(p)) = (self.hover, self.game_hover_text(), hover_pos) {
+            let galley = painter.layout_no_wrap(format!("{t}\nclic : le copier dans le projet pour le modifier"), egui::FontId::proportional(13.0), Color32::WHITE);
+            let r = Rect::from_min_size(p + egui::vec2(14.0, 4.0), galley.size() + egui::vec2(8.0, 4.0));
+            painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+            painter.galley(r.min + egui::vec2(4.0, 2.0), galley, Color32::WHITE);
+        }
+        // nom de l'objet survolé
+        if let (Some(id), Some(p)) = (self.hover, hover_pos) {
+            if let Some(e) = self.proj.find_id(id).and_then(|r| self.proj.ent(r)) {
+                let galley = painter.layout_no_wrap(e.archetype.clone(), egui::FontId::proportional(13.0), Color32::WHITE);
+                let r = Rect::from_min_size(p + egui::vec2(14.0, 4.0), galley.size() + egui::vec2(8.0, 4.0));
+                painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+                painter.galley(r.min + egui::vec2(4.0, 2.0), galley, Color32::WHITE);
+            }
+        }
+        // boussole
+        let c = rect.right_top() + egui::vec2(-36.0, 36.0);
+        painter.circle_filled(c, 22.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
+        let ang = if self.cam.map_view { 0.0 } else { self.cam.cur_yaw };
+        let n = egui::vec2(-ang.sin(), -ang.cos());
+        painter.line_segment([c, c + n * 17.0], Stroke::new(3.0, Color32::from_rgb(230, 70, 60)));
+        painter.line_segment([c, c - n * 12.0], Stroke::new(2.0, Color32::from_gray(200)));
+        painter.text(c + n * 29.0, egui::Align2::CENTER_CENTER, "N", egui::FontId::proportional(12.0), Color32::WHITE);
+        // aide
+        let help = match self.tool {
+            Tool::Select => "Sélection : clic = choisir (reclic = celui de derrière) · glisser = déplacer ou rectangle · H = cacher · C = couper le haut · Suppr = supprimer",
+            Tool::Place => "Poser : clic = poser · glisser = poser le long d'un trait",
+            Tool::Erase => "Gomme : glisser pour effacer · Alt + molette = taille du cercle",
+            Tool::Rect => "Rectangle : glisser n'importe où pour sélectionner tout ce qui est dedans · Ctrl ou Maj = ajouter · Suppr = tout supprimer",
+        };
+        let galley = painter.layout_no_wrap(help.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
+        let pos = rect.left_bottom() + egui::vec2(10.0, -10.0 - galley.size().y);
+        painter.rect_filled(Rect::from_min_size(pos - egui::vec2(5.0, 3.0), galley.size() + egui::vec2(10.0, 6.0)), 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 130));
+        painter.galley(pos, galley, Color32::WHITE);
+    }
+
+    /// Sélectionne tout ce qui est dans un rectangle de l'écran (objets du projet et du jeu ; ce qui est caché
+    /// avec H ou au-dessus de la coupe est ignoré). `add` : ajouter à la sélection.
+    pub fn rect_select(&mut self, r: Rect, add: bool) -> usize {
+        let cut = self.cut_z();
+        let mut ids = Vec::new();
+        for it in self.proj.all_items() {
+            if self.sample_hidden(it) {
+                continue;
+            }
+            if let Some(e) = self.proj.world_entity(it) {
+                if self.game.hidden_ids.contains(&e.id) || cut.map(|c| e.pos.z > c).unwrap_or(false) {
+                    continue;
+                }
+                if let Some((sp, _)) = self.cam.project(e.pos) {
+                    if r.contains(sp) {
+                        ids.push(e.id);
+                    }
+                }
+            }
+        }
+        let game_ents: Vec<u32> = self.game_in_rect(r).into_iter().filter(|ei| self.game.world.as_ref().map(|w| cut.map(|c| w.ents[*ei as usize].pos.z <= c).unwrap_or(true)).unwrap_or(true)).collect();
+        if !game_ents.is_empty() {
+            self.push_undo();
+            ids.extend(self.game_ents_to_project(&game_ents));
+        }
+        let n = ids.len();
+        if add {
+            self.add_selection(ids);
+        } else {
+            self.set_selection(ids);
+        }
+        self.status = format!("{n} objet(s) pris dans le rectangle ({} en tout). Suppr pour tout supprimer d'un coup.", self.selected.len());
+        if n > 0 {
+            self.tab = Tab::Selection;
+        }
+        n
+    }
+
+    fn select_tool(&mut self, resp: &egui::Response, ptr: Option<Pos2>, press_origin: Option<Pos2>, mods: Modifiers) {
+        // outil Rectangle, ou Alt + glisser : toujours un rectangle de sélection
+        if resp.drag_started_by(PointerButton::Primary) && (self.tool == Tool::Rect || mods.alt) {
+            self.drag = Drag::Rect(press_origin.or(ptr).unwrap_or_default());
+        } else if resp.drag_started_by(PointerButton::Primary) && self.gizmo_begin(press_origin.or(ptr).unwrap_or_default()) {
+            // glisser d'une poignée : géré plus bas
+        } else if resp.drag_started_by(PointerButton::Primary) {
+            let start = press_origin.or(ptr).unwrap_or_default();
+            match self.pick_for_drag(start) {
+                Some(id) => {
+                    if !self.sel_set.contains(&id) {
+                        if mods.command || mods.shift {
+                            self.add_selection([id]);
+                        } else {
+                            self.set_selection(vec![id]);
+                        }
+                    }
+                    self.push_undo();
+                    let gz = self.proj.find_id(id).and_then(|r| self.proj.world_entity(r)).map(|e| e.pos.z).unwrap_or(self.ground_z);
+                    self.drag = match self.cam.ground_point(start, gz) {
+                        Some(g) => Drag::Move(g),
+                        None => Drag::None,
+                    };
+                }
+                None => self.drag = Drag::Rect(start),
+            }
+        }
+        if resp.dragged_by(PointerButton::Primary) && matches!(self.drag, Drag::Gizmo(_)) {
+            if let Some(p) = ptr {
+                self.gizmo_update(p);
+            }
+        }
+        if resp.dragged_by(PointerButton::Primary) {
+            if let (Drag::Move(last), Some(p)) = (&self.drag, ptr) {
+                let last = *last;
+                if let Some(g) = self.cam.ground_point(p, last.z) {
+                    let mut d = g - last;
+                    d.z = 0.0;
+                    if self.snap && self.snap_size > 0.0 {
+                        let s = self.snap_size;
+                        d = v3((d.x / s).round() * s, (d.y / s).round() * s, 0.0);
+                    }
+                    if d.len() > 0.0 {
+                        self.move_selected(d);
+                        self.drag = Drag::Move(last + d);
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            if let (Drag::Rect(a), Some(b)) = (&self.drag, ptr) {
+                let r = Rect::from_two_pos(*a, b);
+                self.rect_select(r, mods.command || mods.shift);
+            }
+            self.drag = Drag::None;
+        }
+        // clic gauche (ou clic droit sans glisser, comme dans CodeWalker) : choisir
+        let click = resp.clicked_by(PointerButton::Primary) || resp.clicked_by(PointerButton::Secondary);
+        // un clic sur une poignée ne change pas la sélection
+        let click = click && !ptr.map(|p| self.gizmo_pick(p).is_some()).unwrap_or(false);
+        if click {
+            if let Some(p) = ptr {
+                let add = mods.command || mods.shift;
+                match self.pick_any(p, !add) {
+                    Some(id) => {
+                        if add {
+                            // Ctrl + clic : ajoute (ou retire) l'objet sous la souris, comme CodeWalker
+                            let name = self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()).unwrap_or_default();
+                            if self.sel_set.contains(&id) {
+                                self.selected.retain(|x| *x != id);
+                                self.sel_set.remove(&id);
+                                self.status = format!("« {name} » retiré de la sélection ({} objet(s) sélectionné(s)).", self.selected.len());
+                            } else {
+                                self.add_selection([id]);
+                                self.status = format!("« {name} » ajouté : {} objet(s) sélectionné(s). Ctrl + clic pour en ajouter d'autres.", self.selected.len());
+                            }
+                        } else {
+                            self.set_selection(vec![id]);
+                        }
+                        self.tab = Tab::Selection;
+                    }
+                    None => {
+                        if !(mods.command || mods.shift) {
+                            self.set_selection(vec![]);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = ItemRef::Ent(0, 0);
+    }
+
+    pub fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z))) {
+            self.do_undo();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y))) {
+            self.do_redo();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
+            self.save_project(false);
+        }
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::D))) {
+            { let off = self.copy_offset(); self.duplicate_selected(off); }
+        }
+        let k = ctx.input(|i| {
+            [
+                i.key_pressed(Key::Delete),
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::Num1),
+                i.key_pressed(Key::Num2),
+                i.key_pressed(Key::Num3),
+                i.key_pressed(Key::M),
+                i.key_pressed(Key::OpenBracket),
+                i.key_pressed(Key::CloseBracket),
+            ]
+        });
+        // poignées : G déplacer, R tourner, T taille
+        // E comme « Edit Rotation: E » des raccourcis de CodeWalker (W et R y servent aussi, mais déplacent la caméra ici)
+        let gk = ctx.input(|i| [i.key_pressed(Key::G), i.key_pressed(Key::R) || i.key_pressed(Key::E), i.key_pressed(Key::T)]);
+        for (pressed, mode, name) in [(gk[0], crate::gizmo::GizmoMode::Move, "déplacer"), (gk[1], crate::gizmo::GizmoMode::Rotate, "tourner"), (gk[2], crate::gizmo::GizmoMode::Scale, "agrandir")] {
+            if pressed {
+                self.gizmo_mode = mode;
+                self.tool = Tool::Select;
+                self.status = format!("Poignées : {name} (G déplacer · R ou E tourner · T agrandir).");
+            }
+        }
+        if k[0] {
+            self.delete_selected();
+        }
+        if k[1] {
+            self.set_selection(vec![]);
+            self.drag = Drag::None;
+        }
+        if k[2] {
+            self.tool = Tool::Select;
+        }
+        if k[3] {
+            self.tool = Tool::Place;
+        }
+        if k[4] {
+            self.tool = Tool::Erase;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Num4)) {
+            self.tool = Tool::Rect;
+        }
+        if k[5] {
+            self.cam.map_view = !self.cam.map_view;
+        }
+        if self.selected.is_empty() {
+            return;
+        }
+        if k[6] || k[7] {
+            self.push_undo();
+            self.rotate_selected(if k[6] { -15.0 } else { 15.0 });
+        }
+        let step = if ctx.input(|i| i.modifiers.shift) { 10.0 } else { 1.0 };
+        let dirs = ctx.input(|i| [i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)]);
+        let (f, r) = self.cam.flat_axes();
+        let mut d = V3::ZERO;
+        for (pressed, dir) in dirs.iter().zip([f, -f, -r, r]) {
+            if *pressed {
+                d = d + dir;
+            }
+        }
+        if d.len() > 0.0 {
+            self.push_undo();
+            // pas aligné sur les axes du monde
+            let d = if d.x.abs() > d.y.abs() { v3(d.x.signum(), 0.0, 0.0) } else { v3(0.0, d.y.signum(), 0.0) };
+            self.move_selected(d * step);
+        }
+    }
+}
