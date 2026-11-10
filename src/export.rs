@@ -87,6 +87,26 @@ impl DwApp {
             }
         }
         n += self.copy_custom_models(&stream);
+        // terrain de l'éditeur : modèle, collisions, type d'objet, placement (eau et effets compris)
+        for old in ["dw_water.xml", "dw_water.lua"] {
+            let _ = std::fs::remove_file(out.join(old));
+        }
+        let mut terrain_ytyp: Option<String> = None;
+        match self.export_terrain(&stream) {
+            Ok(v) if !v.is_empty() => {
+                n += 4;
+                report.push(v[0].clone());
+                terrain_ytyp = v.get(1).cloned();
+            }
+            Ok(_) => {}
+            Err(e) => report.push(format!("Export du terrain impossible : {e}")),
+        }
+        // bâtiments du jeu copiés : dépendances .ytyp et collisions
+        match self.export_buildings(&stream) {
+            Ok(Some(m)) => report.push(m),
+            Ok(None) => {}
+            Err(e) => report.push(format!("Export des bâtiments copiés impossible : {e}")),
+        }
         // conversion en fichiers binaires du jeu par CodeWalker
         let mut binary_ok = false;
         match &dll {
@@ -121,11 +141,18 @@ impl DwApp {
             for t in &self.proj.ytyps {
                 man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{}.ytyp'\n", t.name);
             }
+            if let Some(t) = &terrain_ytyp {
+                man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{t}.ytyp'\n");
+            }
             for t in std::fs::read_dir(&self.sollumz.dir).into_iter().flatten().flatten() {
                 let n = t.file_name().to_string_lossy().to_lowercase();
                 if let Some(stem) = n.strip_suffix(".ytyp.xml") {
                     man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{stem}.ytyp'\n");
                 }
+            }
+            // eau du terrain : water.xml complet chargé par un script client (native FiveM LoadWaterFromPath)
+            if out.join("dw_water.xml").exists() {
+                man += "\nfiles { 'dw_water.xml' }\nclient_script 'dw_water.lua'\n";
             }
             let _ = std::fs::write(out.join("fxmanifest.lua"), man);
             let readme = if binary_ok {
@@ -139,6 +166,24 @@ impl DwApp {
                  FiveM a besoin des versions binaires : ouvrez-les avec CodeWalker (Importer XML),\n\
                  ou indiquez le dossier de CodeWalker dans l'onglet Jeu et exportez à nouveau.\n"
             };
+            let mut readme = readme.to_string();
+            if let Some(t) = self.proj.terrain.as_ref() {
+                // conseils repris du TEST_FIVEM.md du vaisseau (E:\Blender-Code\vaisseau_mlo), validés en jeu
+                let (mn, mx) = t.bounds();
+                let c = (mn + mx) * 0.5;
+                readme.push_str(&format!(
+                    "\nTerrain : textures dans dw_terrain_txd.ytd, une collision par tuile (dw_terrain_col_*.ybn).\n\
+                     Après chaque nouvel export, videz le cache de FiveM (AppData/Local/FiveM/FiveM.app/data/cache).\n\
+                     Pour y aller : /tp {:.0} {:.0} {:.0} — si vous tombez au travers, attendez 1 à 2 secondes\n\
+                     ou appelez RequestCollisionAtCoord({:.1}, {:.1}, {:.1}) avant de vous téléporter.\n",
+                    c.x,
+                    c.y,
+                    mx.z + 3.0,
+                    c.x,
+                    c.y,
+                    mx.z + 3.0
+                ));
+            }
             let _ = std::fs::write(out.join("LISEZMOI.txt"), readme);
         }
         format!("{n} fichier(s) exporté(s) dans {}. {}", out.display(), report.join(" "))

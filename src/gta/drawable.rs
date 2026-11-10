@@ -437,12 +437,15 @@ pub fn find_texture(r: &Resource, dict: usize, name_hash: u32, max_size: u32) ->
     let w = r.u16(t + 0x50) as u32;
     let h = r.u16(t + 0x52) as u32;
     let stride = r.u16(t + 0x56) as u32;
-    let fmt = match r.u32(t + 0x58) {
+    // formats de texture du jeu, comme DDSIO::GetDXGIFormat (0x0600050e) de CodeWalker ; les formats non
+    // compressés et BC4/BC5 sont convertis en RGBA à la lecture (DDSIO::GetPixels 0x0600050a)
+    let code = r.u32(t + 0x58);
+    let fmt = match code {
         827611204 => TexFmt::Dxt1, // « DXT1 »
         0x3354_5844 => TexFmt::Dxt3,
         0x3554_5844 => TexFmt::Dxt5,
         0x2037_4342 => TexFmt::Bc7,
-        21 => TexFmt::Rgba8,
+        21 | 22 | 25 | 28 | 32 | 50 | 826889281 | 843666497 => TexFmt::Rgba8,
         _ => return None,
     };
     let levels = (r.u8(t + 0x5D) as u32).max(1);
@@ -454,7 +457,7 @@ pub fn find_texture(r: &Resource, dict: usize, name_hash: u32, max_size: u32) ->
         match fmt {
             TexFmt::Dxt1 => (lw.div_ceil(4).max(1) * lh.div_ceil(4).max(1) * 8) as usize,
             TexFmt::Dxt3 | TexFmt::Dxt5 | TexFmt::Bc7 => (lw.div_ceil(4).max(1) * lh.div_ceil(4).max(1) * 16) as usize,
-            TexFmt::Rgba8 => (lw * lh * 4) as usize,
+            TexFmt::Rgba8 => crate::texdecode::raw_size(code, lw as usize, lh as usize),
         }
     };
     let _ = stride;
@@ -471,12 +474,8 @@ pub fn find_texture(r: &Resource, dict: usize, name_hash: u32, max_size: u32) ->
                 out.w = lw;
                 out.h = lh;
             }
-            let mut d = r.data[p..p + sz].to_vec();
-            if fmt == TexFmt::Rgba8 {
-                for px in d.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
-            }
+            let d = r.data[p..p + sz].to_vec();
+            let d = if fmt == TexFmt::Rgba8 { crate::texdecode::raw_to_rgba(code, lw as usize, lh as usize, &d) } else { d };
             out.levels.push(d);
         }
         p += sz;

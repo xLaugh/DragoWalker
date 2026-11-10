@@ -179,6 +179,16 @@ pub struct GameCtx<'a> {
     pub interiors: bool,
     /// objets du projet cachés à la main (touche H)
     pub hidden_ids: &'a std::collections::HashSet<u64>,
+    /// carte vide : rien du jeu n'est dessiné
+    pub empty_map: bool,
+    /// groupes de LOD cachés (niveau, distance arrondie)
+    pub hidden_lod: &'a std::collections::HashSet<(u8, u32)>,
+    /// intérieur vu seul
+    pub isolate: Option<u32>,
+    /// terrain de l'éditeur : (modèle, origine, coins)
+    pub terrain: Option<(u32, V3, V3, V3)>,
+    /// zones d'eau du créateur de terrain (min x, min y, max x, max y, hauteur)
+    pub waters: Vec<[f32; 5]>,
 }
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -277,9 +287,17 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
     };
     let tan = (cam.fov * 0.5).tan();
     let mut cand: Vec<(f32, u32)> = Vec::new();
-    for ei in w.visible_near(eye, cam.target, radius, g.lod_scale) {
+    let near_list = match g.isolate {
+        Some(iso) => vec![iso],
+        None if g.empty_map => Vec::new(),
+        None => w.visible_near(eye, cam.target, radius, g.lod_scale),
+    };
+    for ei in near_list {
         let e = &w.ents[ei as usize];
         if w.hidden_archs.contains(&e.arch) || g.hidden.contains(&ei) {
+            continue;
+        }
+        if !g.hidden_lod.is_empty() && g.hidden_lod.contains(&(e.lod_level.min(5), crate::lists::lod_bucket(e.lod_dist))) {
             continue;
         }
         let (mn, mx) = w.arch_box(e.arch);
@@ -346,8 +364,9 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             bmax: [mx.x, mx.y, mx.z],
         });
     }
-    // objets du projet (posés ou copiés du jeu)
-    for r in proj.all_items() {
+    // objets du projet (posés ou copiés du jeu) — pas pendant qu'un intérieur est vu seul
+    let items = if g.isolate.is_some() { Vec::new() } else { proj.all_items() };
+    for r in items {
         if matches!(r, ItemRef::Ent(y, _) if proj.ymaps[y].sample && !opts.show_sample) {
             continue;
         }
@@ -386,6 +405,16 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             bmax: [mx.x, mx.y, mx.z],
         });
     }
+    // terrain de l'éditeur
+    if let (Some((arch, o, mn, mx)), None) = (g.terrain, g.isolate) {
+        insts.push(Inst {
+            arch,
+            m: model_matrix([o.x, o.y, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
+            color: [0.6, 0.55, 0.45],
+            bmin: [mn.x - o.x, mn.y - o.y, mn.z],
+            bmax: [mx.x - o.x, mx.y - o.y, mx.z],
+        });
+    }
     drop(gl);
     let fd = std::sync::Arc::new(FrameDraw {
         vp: cam.view_proj(),
@@ -395,7 +424,14 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         sea: std::env::var("DW_NOSEA").is_err() && g.cut_z.is_none(),
         probe: g.probe.map(|p| [p.x, p.y]),
         light_vp: if cam.map_view || !g.shadows { None } else { Some(sun_view(cam.target, (cam.cur_dist * 1.2).clamp(60.0, 700.0))) },
-        water: w.water.clone(),
+        // carte vide : seulement une mer plate à 0 m autour du terrain
+        water: if g.isolate.is_some() {
+            std::sync::Arc::new(Vec::new())
+        } else {
+            let mut v: Vec<[f32; 5]> = if g.empty_map { vec![[-9000.0, -9000.0, 9000.0, 9000.0, 0.0]] } else { w.water.as_ref().clone() };
+            v.extend(g.waters.iter().copied());
+            std::sync::Arc::new(v)
+        },
         time: START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(),
         clip_z: g.cut_z.unwrap_or(1.0e9),
     });

@@ -78,6 +78,8 @@ pub struct Arch {
     pub mlo: bool,
     pub group: usize,
     pub prio: u32,
+    /// fichier .ytyp qui le définit (index dans vfs.files)
+    pub ytyp_file: usize,
 }
 
 pub struct GameWorld {
@@ -426,6 +428,7 @@ impl GameWorld {
                     mlo: a.mlo,
                     group: g,
                     prio,
+                    ytyp_file: fi,
                 };
                 match archetypes.get(&a.name) {
                     Some(old) if old.prio > prio => {}

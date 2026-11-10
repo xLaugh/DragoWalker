@@ -319,6 +319,9 @@ pub struct Project {
     pub name: String,
     pub ymaps: Vec<Ymap>,
     pub ytyps: Vec<Ytyp>,
+    /// terrain créé dans l'éditeur de terrain (carte vide)
+    #[serde(default)]
+    pub terrain: Option<crate::terrain::Terrain>,
 }
 
 /// Un élément sélectionnable.

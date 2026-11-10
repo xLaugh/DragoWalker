@@ -53,6 +53,98 @@ pub fn probe(game: &str, cw: &str) {
                     for (d, i) in v.iter().take(12) { let e = &w.ents[*i as usize]; let (a, b) = w.arch_box(e.arch); let s = b - a; println!("   {:>7.0} {:<40} lod {} taille {:.0}x{:.0}x{:.0} ymap {}", d, w.name_of(e.arch), e.lod_level, s.x, s.y, s.z, w.ymaps[e.ymap as usize].name); }
                     let mut by = [0usize; 8]; for (_, i) in &v { by[w.ents[*i as usize].lod_level.min(7) as usize] += 1; } println!("   par niveau {:?}", by);
                 }
+                // DW_YBN=1 : écrit le plus petit fichier de collisions (.ybn) parmi les 300 premiers, pour voir son format
+                if std::env::var("DW_YBN").is_ok() {
+                    let mut best: Option<(usize, Vec<u8>, String)> = None;
+                    for f in w.vfs.files.iter().filter(|f| f.name.ends_with(".ybn")).take(300) {
+                        if let Some(raw) = w.vfs.raw_resource_file(f) {
+                            if raw.len() > 2000 && best.as_ref().map(|b| raw.len() < b.0).unwrap_or(true) {
+                                best = Some((raw.len(), raw, f.name.clone()));
+                            }
+                        }
+                    }
+                    if let Some((n, raw, name)) = best {
+                        let p = std::env::temp_dir().join("dragowalker_cw").join(&name);
+                        let _ = std::fs::create_dir_all(p.parent().unwrap());
+                        let _ = std::fs::write(&p, raw);
+                        println!("ybn : {} ({n} octets) -> {}", name, p.display());
+                    }
+                }
+                // DW_ARCH_GREP="prefixe1,prefixe2" : types d'objets du jeu dont le nom commence ainsi, taille et
+                // nombre de placements sur la carte (pour choisir les arbres / rochers les plus utilisés par le jeu)
+                if let Ok(list) = std::env::var("DW_ARCH_GREP") {
+                    let pre: Vec<String> = list.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+                    let mut uses: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+                    for e in &w.ents {
+                        *uses.entry(e.arch).or_insert(0) += 1;
+                    }
+                    let mut v: Vec<(String, usize, crate::math::V3)> = Vec::new();
+                    for h in w.archetypes.keys() {
+                        let n = w.name_of(*h).to_lowercase();
+                        if pre.iter().any(|p| n.starts_with(p.as_str())) {
+                            let (a, b) = w.arch_box(*h);
+                            v.push((n, uses.get(h).copied().unwrap_or(0), b - a));
+                        }
+                    }
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    println!("types trouvés : {}", v.len());
+                    for (n, u, s) in v.iter().take(400) {
+                        println!("   {n:<36} placé {u:>6} fois  taille {:.1} x {:.1} x {:.1}", s.x, s.y, s.z);
+                    }
+                }
+                // DW_YTYP_FX=1 : types d'objets du jeu qui portent un effet de particules ; écrit les .ytyp qui en
+                // contiennent dans le dossier temporaire (pour les relire en XML avec CodeWalker)
+                if std::env::var("DW_YTYP_FX").is_ok() {
+                    let dir = std::env::temp_dir().join("dragowalker_fx");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    let mut dumped = 0;
+                    for f in w.vfs.files.iter().filter(|f| f.name.ends_with(".ytyp")) {
+                        let Some(r) = w.vfs.read_resource(f, &w.keys) else { continue };
+                        let d = &r.data;
+                        let mut found = false;
+                        let mut i = 0;
+                        while i + 8 < d.len() {
+                            if d[i..].starts_with(b"amb_") && (i == 0 || d[i - 1] == 0) {
+                                let mut j = i;
+                                while j < d.len() && (d[j].is_ascii_alphanumeric() || d[j] == b'_') {
+                                    j += 1;
+                                }
+                                if j - i > 8 && j < d.len() && d[j] == 0 {
+                                    *counts.entry(String::from_utf8_lossy(&d[i..j]).to_string()).or_insert(0) += 1;
+                                    found = true;
+                                }
+                                i = j;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if found && dumped < 400 {
+                            if let Some(raw) = w.vfs.raw_resource_file(f) {
+                                let _ = std::fs::write(dir.join(&f.name), raw);
+                                dumped += 1;
+                            }
+                        }
+                    }
+                    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1));
+                    println!("effets trouvés : {} noms, {dumped} ytyp écrits dans {}", v.len(), dir.display());
+                    for (n, c) in v.iter().take(150) {
+                        println!("   {n:<40} {c}");
+                    }
+                }
+                // DW_SCEN=1 : blocs d'un fichier de scénarios (.ymt)
+                if std::env::var("DW_SCEN").is_ok() {
+                    let files: Vec<&rpf::FileEntry> = w.vfs.files.iter().filter(|f| f.name.ends_with(".ymt") && f.path.to_lowercase().contains("scenario")).collect();
+                    println!("scénarios : {} fichiers .ymt", files.len());
+                    for f in files.iter().take(2) {
+                        if let Some(r) = w.vfs.read_resource(f, &w.keys) {
+                            if let Some(m) = meta::Meta::parse(&r) {
+                                println!("  {} : {:?}", f.path, m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
+                            }
+                        }
+                    }
+                }
                 // DW_MODEL="nom1,nom2" : détail d'un modèle du jeu (parties, triangles, découpe, fichiers)
                 if let Ok(list) = std::env::var("DW_MODEL") {
                     let src = w.model_source();

@@ -572,12 +572,26 @@ pub fn write_dds(t: &TexData) -> Vec<u8> {
 
 /// Écrit un modèle au format XML de CodeWalker (lu par Sollumz) et ses textures .dds dans `dir/<nom>/`.
 pub fn write_ydr_xml(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], textures: &[(u64, TexData)]) -> Result<PathBuf, String> {
+    write_ydr_xml_ex(dir, name, model, part_keys, textures, None)
+}
+
+/// Nom d'une texture dans un dictionnaire partagé (.ytd) : `<dictionnaire>_t<clé>`.
+pub fn shared_tex_name(txd: &str, key: u64) -> String {
+    format!("{}_t{:08x}", txd, key as u32)
+}
+
+/// Comme `write_ydr_xml` ; avec `shared_txd`, les textures ne sont pas écrites à côté du modèle : le modèle
+/// les cherche par leur nom dans ce dictionnaire partagé (.ytd), déclaré dans le type d'objet (ytyp).
+pub fn write_ydr_xml_ex(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], textures: &[(u64, TexData)], shared_txd: Option<&str>) -> Result<PathBuf, String> {
     use std::fmt::Write;
-    let tex_dir = dir.join(name);
-    std::fs::create_dir_all(&tex_dir).map_err(|e| e.to_string())?;
-    let tex_name = |k: u64| format!("{}_t{:08x}", name, k as u32);
-    for (k, t) in textures {
-        std::fs::write(tex_dir.join(format!("{}.dds", tex_name(*k))), write_dds(t)).map_err(|e| e.to_string())?;
+    let prefix = shared_txd.unwrap_or(name).to_string();
+    let tex_name = |k: u64| shared_tex_name(&prefix, k);
+    if shared_txd.is_none() {
+        let tex_dir = dir.join(name);
+        std::fs::create_dir_all(&tex_dir).map_err(|e| e.to_string())?;
+        for (k, t) in textures {
+            std::fs::write(tex_dir.join(format!("{}.dds", tex_name(*k))), write_dds(t)).map_err(|e| e.to_string())?;
+        }
     }
     // un matériau par couple (texture, découpe)
     let mut shaders: Vec<(u64, bool)> = Vec::new();
@@ -626,7 +640,26 @@ pub fn write_ydr_xml(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], 
                 order.len() as u32 - 1
             });
         }
-        let _ = writeln!(s, "    <Item>\n     <ShaderIndex value=\"{}\" />", shader_of[gi]);
+        // boîte de la partie : CodeWalker la lit telle quelle (DrawableGeometry::ReadXml 0x06004a42) et en fait les
+        // boîtes du modèle (DrawableModel::ReadXml 0x06004a17, BoundsData) ; absente, elle vaut 0 et le jeu
+        // cache la partie dès que ce point sort de l'écran (terrain qui disparaît selon où l'on regarde)
+        let (mut gmn, mut gmx) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &i in &order {
+            let p = model.verts[i as usize].pos;
+            for k in 0..3 {
+                gmn[k] = gmn[k].min(p[k]);
+                gmx[k] = gmx[k].max(p[k]);
+            }
+        }
+        if order.is_empty() {
+            gmn = [0.0; 3];
+            gmx = [0.0; 3];
+        }
+        let _ = writeln!(
+            s,
+            "    <Item>\n     <ShaderIndex value=\"{}\" />\n     <BoundingBoxMin x=\"{}\" y=\"{}\" z=\"{}\" />\n     <BoundingBoxMax x=\"{}\" y=\"{}\" z=\"{}\" />",
+            shader_of[gi], gmn[0], gmn[1], gmn[2], gmx[0], gmx[1], gmx[2]
+        );
         let _ = writeln!(s, "     <VertexBuffer>\n      <Flags value=\"0\" />\n      <Layout type=\"GTAV1\">\n       <Position />\n       <Normal />\n       <Colour0 />\n       <TexCoord0 />\n      </Layout>\n      <Data>");
         for &i in &order {
             let v = &model.verts[i as usize];
@@ -641,6 +674,40 @@ pub fn write_ydr_xml(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], 
     }
     let _ = writeln!(s, "   </Geometries>\n  </Item>\n </DrawableModelsHigh>\n</Drawable>");
     let path = dir.join(format!("{name}.ydr.xml"));
+    std::fs::write(&path, s).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Dictionnaire de textures (.ytd) au format XML de CodeWalker : `dir/<nom>.ytd.xml` + les .dds dans
+/// `dir/<nom>/`. Les textures sont directement sous `<TextureDictionary>` : XmlYtd.GetYtd (0x060030db) passe la
+/// racine à TextureDictionary.ReadXmlNode (0x06005980), dont ReadXml (0x0600597e) prend les nœuds « Item »
+/// enfants, lit chacun par Texture.ReadXml (0x06005a11 : Width, Height, MipLevels, Format, puis le .dds
+/// FileName dans le dossier, via DDSIO.GetTexture) et finit par BuildFromTextureList (0x06005984, tri par nom).
+/// Une enveloppe `<Textures>` (comme dans dsrt_shared.ytd.xml) donne un dictionnaire vide.
+pub fn write_ytd_xml(dir: &Path, txd: &str, textures: &[(u64, TexData)]) -> Result<PathBuf, String> {
+    use std::fmt::Write;
+    let tex_dir = dir.join(txd);
+    std::fs::create_dir_all(&tex_dir).map_err(|e| e.to_string())?;
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<TextureDictionary>\n");
+    for (k, t) in textures {
+        let n = shared_tex_name(txd, *k);
+        std::fs::write(tex_dir.join(format!("{n}.dds")), write_dds(t)).map_err(|e| e.to_string())?;
+        let fmt = match t.fmt {
+            TexFmt::Dxt1 => "D3DFMT_DXT1",
+            TexFmt::Dxt3 => "D3DFMT_DXT3",
+            TexFmt::Dxt5 => "D3DFMT_DXT5",
+            _ => "D3DFMT_A8R8G8B8",
+        };
+        let _ = writeln!(
+            s,
+            "  <Item>\n   <Name>{n}</Name>\n   <Unk32 value=\"0\" />\n   <Usage>DIFFUSE</Usage>\n   <UsageFlags />\n   <ExtraFlags value=\"0\" />\n   <Width value=\"{}\" />\n   <Height value=\"{}\" />\n   <MipLevels value=\"{}\" />\n   <Format>{fmt}</Format>\n   <FileName>{n}.dds</FileName>\n  </Item>",
+            t.w,
+            t.h,
+            t.levels.len()
+        );
+    }
+    s.push_str("</TextureDictionary>\n");
+    let path = dir.join(format!("{txd}.ytd.xml"));
     std::fs::write(&path, s).map_err(|e| e.to_string())?;
     Ok(path)
 }

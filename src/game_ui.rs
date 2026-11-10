@@ -29,6 +29,8 @@ pub struct GameState {
     pub cat_filter: String,
     pub cat_source: u8,
     pub cat_props_only: bool,
+    /// catégorie de la bibliothèque (0 = tous), voir library::CATEGORIES
+    pub cat_group: u8,
     pub cat_view: Vec<u32>,
     pub cat_key: String,
     pub preview: Option<Mesh>,
@@ -52,6 +54,12 @@ pub struct GameState {
     pub surface: Option<crate::math::V3>,
     /// objets des intérieurs dessinés (renderinteriors de CodeWalker)
     pub interiors: bool,
+    /// carte vide : la carte du jeu n'est pas dessinée (éditeur de terrain)
+    pub empty_map: bool,
+    /// groupes de LOD cachés : (niveau, distance d'apparition arrondie à 10 m)
+    pub hidden_lod: std::collections::HashSet<(u8, u32)>,
+    /// intérieur vu seul (index de l'objet de carte)
+    pub isolate: Option<u32>,
     /// objets du projet cachés à la main (touche H)
     pub hidden_ids: HashSet<u64>,
     /// analyse d'un bâtiment (vitres, étages, murs)
@@ -78,9 +86,10 @@ impl GameState {
             lod: s["game_lod"].as_f64().unwrap_or(1.0) as f32,
             max_draw: s["game_max_draw"].as_u64().unwrap_or(7000) as usize,
             terrain: true,
-            cat_filter: String::new(),
+            cat_filter: std::env::var("DW_LIB_FILTER").unwrap_or_default(),
             cat_source: 0,
             cat_props_only: true,
+            cat_group: 0,
             cat_view: Vec::new(),
             cat_key: String::from("-"),
             preview: None,
@@ -98,6 +107,9 @@ impl GameState {
             hidden: std::collections::HashSet::new(),
             surface: None,
             interiors: s["interiors"].as_bool().unwrap_or(true) && std::env::var("DW_NO_INTERIORS").is_err(),
+            empty_map: std::env::var("DW_EMPTY").is_ok(),
+            hidden_lod: std::collections::HashSet::new(),
+            isolate: None,
             hidden_ids: HashSet::new(),
             analysis: None,
             click_at: None,
@@ -963,8 +975,12 @@ impl DwApp {
 
     // ------------------------------------------------------------ catalogue de tous les props
 
+    pub fn refresh_catalog_pub(&mut self) {
+        self.refresh_catalog();
+    }
+
     fn refresh_catalog(&mut self) {
-        let key = format!("{}|{}|{}", self.game.cat_filter.to_lowercase(), self.game.cat_source, self.game.cat_props_only);
+        let key = format!("{}|{}|{}|{}", self.game.cat_filter.to_lowercase(), self.game.cat_source, self.game.cat_props_only, self.game.cat_group);
         if key == self.game.cat_key {
             return;
         }
@@ -974,6 +990,7 @@ impl DwApp {
         let words: Vec<&str> = f.split_whitespace().collect();
         let src = self.game.cat_source;
         let props_only = self.game.cat_props_only;
+        let group = crate::library::CATEGORIES.get(self.game.cat_group as usize).map(|c| c.2).unwrap_or(&[]);
         self.game.cat_view = w
             .catalog
             .iter()
@@ -991,7 +1008,7 @@ impl DwApp {
                     3 => g.kind == GroupKind::Dlc || g.kind == GroupKind::Update,
                     _ => true,
                 };
-                ok_src && words.iter().all(|wd| name.contains(wd))
+                ok_src && words.iter().all(|wd| name.contains(wd)) && crate::library::in_category(name, group)
             })
             .collect();
     }
@@ -1044,7 +1061,12 @@ impl DwApp {
             };
         }
         ui.add_space(4.0);
-        self.preview_widget(ui);
+        if self.sollumz.find(&self.place_arch).is_none() {
+            let n = self.place_arch.clone();
+            self.textured_preview(ui, h, &n);
+        } else {
+            self.preview_widget(ui);
+        }
     }
 
     pub fn preview_widget(&mut self, ui: &mut egui::Ui) {

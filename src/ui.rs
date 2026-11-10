@@ -10,84 +10,187 @@ use crate::sample;
 use eframe::egui::{self, Color32, Key, RichText, Sense};
 
 impl DwApp {
+    /// Barre de menus. Raccourcis repris de CodeWalker : WorldForm_KeyDown (0x06000332) — Ctrl+N nouveau,
+    /// Ctrl+O ouvrir, Ctrl+S enregistrer (Ctrl+Maj+S : tout), Ctrl+Z annuler, Ctrl+Y rétablir, Ctrl+C copier,
+    /// Ctrl+V coller, Ctrl+U panneau d'outils, Suppr supprimer, Échap ; menus Édition du ProjectForm
+    /// (InitializeComponent 0x06000e92) : Ctrl+Z, Ctrl+Y, Ctrl+X, Ctrl+C, Ctrl+V, Maj+Suppr.
     pub fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let item = |ui: &mut egui::Ui, enabled: bool, text: &str, keys: &str| ui.add_enabled(enabled, egui::Button::new(text).shortcut_text(keys)).clicked();
         egui::menu::bar(ui, |ui| {
             ui.menu_button("Fichier", |ui| {
-                if ui.button("Nouveau projet").clicked() {
-                    self.push_undo();
-                    self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![] };
-                    self.target_ymap = 1;
-                    self.cur_mlo = None;
-                    self.set_selection(vec![]);
-                    self.project_path = None;
+                if item(ui, true, "Nouveau projet", "Ctrl+N") {
+                    self.new_project();
                     ui.close_menu();
                 }
-                if ui.button("Ouvrir un projet…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Projet DragoWalker", &["dwproj"]).pick_file() {
-                        self.import_file(&p);
-                    }
+                if item(ui, true, "Ouvrir un projet…", "Ctrl+O") {
+                    self.open_project_dialog();
                     ui.close_menu();
                 }
-                if ui.button("Enregistrer le projet  (Ctrl+S)").clicked() {
+                if item(ui, true, "Enregistrer le projet", "Ctrl+S") {
                     self.save_project(false);
                     ui.close_menu();
                 }
-                if ui.button("Enregistrer sous…").clicked() {
+                if item(ui, true, "Enregistrer sous…", "Ctrl+Maj+S") {
                     self.save_project(true);
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Importer ymap / ytyp (XML CodeWalker)…").clicked() {
-                    if let Some(files) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_files() {
-                        for f in files {
-                            self.import_file(&f);
-                        }
-                    }
+                if item(ui, true, "Importer ymap / ytyp (XML CodeWalker)…", "Ctrl+I") {
+                    self.import_dialog();
                     ui.close_menu();
                 }
-                if ui.button("Exporter en XML…").clicked() {
+                if item(ui, true, "Exporter en XML…", "Ctrl+E") {
                     self.export_xml(false);
                     ui.close_menu();
                 }
-                if ui.button("Exporter une ressource FiveM…").clicked() {
+                if item(ui, true, "Exporter une ressource FiveM…", "Ctrl+Maj+E") {
                     self.export_xml(true);
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Quitter").clicked() {
+                if item(ui, true, "Quitter", "Alt+F4") {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
             ui.menu_button("Édition", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Annuler  (Ctrl+Z)")).clicked() {
+                let has_sel = !self.selected.is_empty();
+                if item(ui, !self.undo.is_empty(), "Annuler", "Ctrl+Z") {
                     self.do_undo();
                     ui.close_menu();
                 }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Rétablir  (Ctrl+Y)")).clicked() {
+                if item(ui, !self.redo.is_empty(), "Rétablir", "Ctrl+Y") {
                     self.do_redo();
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Dupliquer la sélection  (Ctrl+D)").clicked() {
-                    { let off = self.copy_offset(); self.duplicate_selected(off); }
-                    ui.close_menu();
-                }
-                if ui.button("Supprimer la sélection  (Suppr)").clicked() {
+                if item(ui, has_sel, "Couper", "Ctrl+X") {
+                    self.copy_selected();
                     self.delete_selected();
                     ui.close_menu();
                 }
-                if ui.button("Tout désélectionner  (Échap)").clicked() {
+                if item(ui, has_sel, "Copier", "Ctrl+C") {
+                    self.copy_selected();
+                    ui.close_menu();
+                }
+                if item(ui, !self.clipboard.is_empty(), "Coller", "Ctrl+V") {
+                    self.paste();
+                    ui.close_menu();
+                }
+                if item(ui, has_sel, "Dupliquer la sélection", "Ctrl+D") {
+                    let off = self.copy_offset();
+                    self.duplicate_selected(off);
+                    ui.close_menu();
+                }
+                if item(ui, has_sel, "Poser au sol", "Maj / Fin") {
+                    let n = self.snap_selected_to_ground(true);
+                    self.status = format!("{n} objet(s) posé(s) au sol.");
+                    ui.close_menu();
+                }
+                if item(ui, has_sel, "Supprimer la sélection", "Suppr") {
+                    self.delete_selected();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if item(ui, true, "Sélection intelligente", "J") {
+                    self.smart_select();
+                    ui.close_menu();
+                }
+                if item(ui, true, "Tout désélectionner", "Échap") {
                     self.set_selection(vec![]);
                     ui.close_menu();
                 }
             });
+            ui.menu_button("Outils", |ui| {
+                for (t, n, k) in [(Tool::Select, "Sélection", "1"), (Tool::Place, "Poser", "2"), (Tool::Erase, "Gomme", "3"), (Tool::Rect, "Rectangle", "4"), (Tool::Terrain, "Terrain", "5")] {
+                    if ui.add(egui::Button::new(n).selected(self.tool == t).shortcut_text(k)).clicked() {
+                        self.tool = t;
+                        if t == Tool::Terrain {
+                            self.tab = Tab::Terrain;
+                        }
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                for (m, n, k) in [(crate::gizmo::GizmoMode::Move, "Poignées : déplacer", "G"), (crate::gizmo::GizmoMode::Rotate, "Poignées : tourner", "R / E"), (crate::gizmo::GizmoMode::Scale, "Poignées : agrandir", "T")] {
+                    if ui.add(egui::Button::new(n).selected(self.gizmo_mode == m).shortcut_text(k)).clicked() {
+                        self.gizmo_mode = m;
+                        self.tool = Tool::Select;
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if item(ui, true, "Bibliothèque de props", "B") {
+                    self.library.open = !self.library.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, "Bibliothèque des intérieurs", "I") {
+                    self.intlib.open = !self.intlib.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, "Bibliothèque des bâtiments", "N") {
+                    self.buildings.open = !self.buildings.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, "Couper les bâtiments (vue en coupe)", "C") {
+                    self.game.cut_on = !self.game.cut_on;
+                    ui.close_menu();
+                }
+                ui.label(RichText::new("H : cacher l'objet du jeu sous la souris").small().weak());
+            });
+            ui.menu_button("Terrain", |ui| {
+                use crate::terrain::Brush;
+                for (s, n) in [(0u8, "Créer / modèles de départ")] {
+                    if item(ui, true, n, "") {
+                        self.terrain_section(s);
+                        self.tool = Tool::Terrain;
+                        self.tab = Tab::Terrain;
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                for (b, n, k) in [
+                    (Brush::Raise, "Monter", "F2"),
+                    (Brush::Lower, "Creuser", "F3"),
+                    (Brush::Flatten, "Pelleteuse", "F4"),
+                    (Brush::Smooth, "Lisser", "F5"),
+                    (Brush::Noise, "Relief naturel", "F6"),
+                    (Brush::Paint, "Peindre", "F7"),
+                    (Brush::Road, "Route", "F8"),
+                    (Brush::Vegetation, "Végétation", "F9"),
+                    (Brush::Water, "Eau", "F10"),
+                    (Brush::Particles, "Effets (particules)", "F11"),
+                ] {
+                    let on = self.tool == Tool::Terrain && self.terrain.brush == b;
+                    if ui.add_enabled(self.proj.terrain.is_some(), egui::Button::new(n).selected(on).shortcut_text(k)).clicked() {
+                        self.set_terrain_brush(b);
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if item(ui, self.terrain.road_pts.len() >= 2, "Construire la route en cours", "Entrée") {
+                    self.finish_road();
+                    ui.close_menu();
+                }
+                if item(ui, !self.terrain.road_pts.is_empty(), "Enlever le dernier point", "Retour arrière") {
+                    self.terrain.road_pts.pop();
+                    ui.close_menu();
+                }
+                ui.label(RichText::new("Rayon du pinceau : + / -  ·  Végétation : Ctrl + pinceau pour retirer").small().weak());
+            });
             ui.menu_button("Affichage", |ui| {
-                if ui.radio(!self.cam.map_view, "Vue 3D").clicked() {
+                if ui.add(egui::Button::new("Vue 3D").selected(!self.cam.map_view).shortcut_text("M")).clicked() {
                     self.cam.map_view = false;
                 }
-                if ui.radio(self.cam.map_view, "Vue carte (de dessus)  (M)").clicked() {
+                if ui.add(egui::Button::new("Vue carte (de dessus)").selected(self.cam.map_view).shortcut_text("M")).clicked() {
                     self.cam.map_view = true;
                 }
+                if item(ui, true, if self.panels_hidden { "Afficher les panneaux" } else { "Cacher les panneaux" }, "Ctrl+U") {
+                    self.panels_hidden = !self.panels_hidden;
+                    ui.close_menu();
+                }
+                ui.checkbox(&mut self.project_open, "Panneau Projet");
+                ui.checkbox(&mut self.toolbox_open, "Boîte à outils");
+                ui.label(RichText::new("Pour déplacer un panneau : attrape son titre et lâche-le contre un bord (rangé) ou ailleurs (fenêtre flottante)").small().weak());
                 ui.separator();
                 ui.checkbox(&mut self.opts.show_grid, "Grille");
                 ui.checkbox(&mut self.opts.show_rooms, "Pièces et portails des intérieurs");
@@ -98,14 +201,131 @@ impl DwApp {
                 ui.label("Clic molette + glisser : déplacer la vue");
                 ui.label("ZQSD / WASD : avancer · Maj : ×5 · Ctrl : ×0.2");
                 ui.label("Page haut / bas : monter / descendre");
-                ui.label("1 Sélection · 2 Poser · 3 Gomme · M vue carte");
-                ui.label("Flèches : bouger la sélection · [ ] : tourner de 15°");
-                ui.label("Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+Z / Ctrl+Y");
+                ui.label("1 Sélection · 2 Poser · 3 Gomme · 4 Rectangle · 5 Terrain · M vue carte");
+                ui.label("G / R / T : poignées · Flèches : bouger la sélection · [ ] : tourner de 15°");
+                ui.label("Ctrl+C / Ctrl+V / Ctrl+X : copier, coller (devant la caméra, comme CodeWalker), couper");
+                ui.label("Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+Z / Ctrl+Y · Ctrl+U : panneaux");
+                ui.label("Terrain : F2–F9 pinceaux · + / - rayon · Entrée : construire la route");
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("DragoWalker").strong().color(Color32::from_rgb(255, 150, 50)));
+                ui.separator();
+                if ui.selectable_label(self.ai_open, RichText::new("Assistant IA").strong()).on_hover_text("Fenêtre de l'assistant : décris ce que tu veux construire").clicked() {
+                    self.ai_open = !self.ai_open;
+                }
+                if ui.selectable_label(self.toolbox_open, RichText::new("Boîte à outils").strong()).on_hover_text("Ouvrir / fermer la boîte à outils").clicked() {
+                    self.toolbox_open = !self.toolbox_open;
+                    self.panels_hidden = false;
+                }
+                if ui.selectable_label(self.project_open, RichText::new("Projet").strong()).on_hover_text("Ouvrir / fermer le panneau Projet").clicked() {
+                    self.project_open = !self.project_open;
+                    self.panels_hidden = false;
+                }
+                if ui.selectable_label(self.terrain_open, RichText::new("Créateur de terrain").strong()).on_hover_text("Fenêtre du créateur de terrain : relief, peinture, routes, végétation, eau, effets (5)").clicked() {
+                    self.terrain_open = !self.terrain_open;
+                    if self.terrain_open {
+                        self.tool = Tool::Terrain;
+                    }
+                }
             });
         });
+    }
+
+    /// Fenêtre de l'assistant IA, en haut à droite de l'écran.
+    pub fn ai_window(&mut self, ctx: &egui::Context) {
+        if self.tab == Tab::Ai {
+            self.ai_open = true;
+            self.tab = Tab::Selection;
+        }
+        if !self.ai_open {
+            return;
+        }
+        let mut open = true;
+        self.show_panel(ctx, "ia", "Assistant IA", crate::docking::Dock::Floating, [400.0, 560.0], &mut open, |s, ui| s.ai_tab(ui));
+        self.ai_open = open;
+    }
+
+    /// Fenêtre du créateur de terrain.
+    pub fn terrain_window(&mut self, ctx: &egui::Context) {
+        if self.tab == Tab::Terrain {
+            self.terrain_open = true;
+            self.tab = Tab::Selection;
+        }
+        if !self.terrain_open {
+            return;
+        }
+        let mut open = true;
+        self.show_panel(ctx, "terrain", "Créateur de terrain", crate::docking::Dock::Floating, [380.0, 600.0], &mut open, |s, ui| {
+            egui::ScrollArea::vertical().id_salt("terrwin").show(ui, |ui| s.terrain_tab(ui));
+        });
+        self.terrain_open = open;
+        if !open && self.tool == Tool::Terrain {
+            self.tool = Tool::Select;
+        }
+    }
+
+    pub fn new_project(&mut self) {
+        self.push_undo();
+        self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None };
+        self.target_ymap = 1;
+        self.cur_mlo = None;
+        self.set_selection(vec![]);
+        self.project_path = None;
+        self.terrain.dirty = true;
+        self.status = "Nouveau projet.".into();
+    }
+
+    pub fn open_project_dialog(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("Projet DragoWalker", &["dwproj"]).pick_file() {
+            self.import_file(&p);
+        }
+    }
+
+    pub fn import_dialog(&mut self) {
+        if let Some(files) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_files() {
+            for f in files {
+                self.import_file(&f);
+            }
+        }
+    }
+
+    /// Copie la sélection (positions dans le monde).
+    pub fn copy_selected(&mut self) {
+        self.clipboard = self.selected.iter().filter_map(|id| self.proj.find_id(*id).and_then(|r| self.proj.world_entity(r))).collect();
+        self.status = format!("{} objet(s) copié(s) · Ctrl+V pour coller.", self.clipboard.len());
+    }
+
+    /// Colle comme CodeWalker : WorldForm::PasteItem (0x06000303) appelle ProjectForm::NewObject(copie,
+    /// copyPosition = sélection multiple, selectNew = vrai) ; un seul objet passe par NewEntity (0x06000d3e) et
+    /// apparaît devant la caméra (GetSpawnPos 0x06000dfb, à 2,5 × son rayon, 5 m au moins) ; plusieurs objets
+    /// gardent leur position d'origine. Les copies sont sélectionnées. Dans la carte de destination.
+    pub fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let off = if self.clipboard.len() == 1 {
+            let e = &self.clipboard[0];
+            self.spawn_pos(&e.archetype) - e.pos
+        } else {
+            V3::ZERO
+        };
+        self.push_undo();
+        let yi = self.ensure_target_ymap();
+        let mut ids = Vec::new();
+        for e in self.clipboard.clone() {
+            let mut e = e;
+            e.id = model::new_id();
+            e.game_index = -1;
+            e.pos = e.pos + off;
+            e.mlo = None;
+            ids.push(e.id);
+            self.proj.ymaps[yi].entities.push(e);
+        }
+        let k = ids.len();
+        self.snap_if_shift(&ids);
+        self.set_selection(ids);
+        self.sync_game_project();
+        self.status = format!("{k} objet(s) collé(s).");
     }
 
     pub fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -114,12 +334,27 @@ impl DwApp {
                 (Tool::Select, "🖱 Sélection", "Clic : choisir · glisser dans le vide : rectangle · glisser un objet : le déplacer (1)"),
                 (Tool::Place, "➕ Poser", "Clic : poser le prop choisi · glisser : en poser le long du trait (2)"),
                 (Tool::Erase, "⭕ Gomme", "Glisser : supprimer tout ce qui passe sous le cercle (3)"),
+                (Tool::Terrain, "Terrain", "Pinceaux de terrain : monter, creuser, pelleteuse, lisser, peindre, routes (5)"),
                 (Tool::Rect, "Rectangle", "Glisser n'importe où : sélectionner tout ce qui est dans le rectangle, objets du jeu compris · Ctrl ou Maj : ajouter à la sélection (4) · avec l'outil Sélection : Alt + glisser"),
             ];
             for (t, label, tip) in tools {
                 if ui.selectable_label(self.tool == t, RichText::new(label).size(15.0)).on_hover_text(tip).clicked() {
                     self.tool = t;
+                    if t == Tool::Terrain {
+                        self.terrain_open = true;
+                    }
                 }
+            }
+            // les bibliothèques ne sont pas des outils : séparées
+            ui.separator();
+            if ui.selectable_label(self.intlib.open, RichText::new("Intérieurs").size(15.0)).on_hover_text("Bibliothèque des intérieurs du jeu : plan, « Aller voir », « Voir isolé »").clicked() {
+                self.intlib.open = !self.intlib.open;
+            }
+            if ui.selectable_label(self.buildings.open, RichText::new("Bâtiments").size(15.0)).on_hover_text("Bâtiments du jeu : les copier pour les poser ailleurs, sur une carte custom (N)").clicked() {
+                self.buildings.open = !self.buildings.open;
+            }
+            if ui.selectable_label(self.library.open, RichText::new("Bibliothèque").size(15.0)).on_hover_text("Tous les props du jeu en images, avec aperçu 3D ; clic pour choisir, double-clic pour poser, glisser sur la carte pour poser à cet endroit (B)").clicked() {
+                self.library.open = !self.library.open;
             }
             ui.separator();
             if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("⟲")).on_hover_text("Annuler (Ctrl+Z)").clicked() {
@@ -157,14 +392,15 @@ impl DwApp {
                 ui.add(egui::DragValue::new(&mut self.snap_size).range(0.1..=50.0).speed(0.1).suffix(" m"));
             }
             ui.separator();
-            ui.label("Destination :");
             let names: Vec<(usize, String)> = self.proj.ymaps.iter().enumerate().filter(|(_, y)| !y.sample).map(|(i, y)| (i, y.name.clone())).collect();
             let cur = self.proj.ymaps.get(self.target_ymap).map(|y| y.name.clone()).unwrap_or_default();
-            egui::ComboBox::from_id_salt("target_ymap").selected_text(format!("{cur}.ymap")).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("target_ymap").selected_text(format!("» {cur}.ymap")).show_ui(ui, |ui| {
                 for (i, n) in names {
                     ui.selectable_value(&mut self.target_ymap, i, format!("{n}.ymap"));
                 }
-            });
+            })
+            .response
+            .on_hover_text("Carte de destination des nouveaux objets");
         });
     }
 
@@ -297,12 +533,21 @@ impl DwApp {
     }
 
     pub fn toolbox(&mut self, ui: &mut egui::Ui) {
+        // l'assistant IA et le créateur de terrain sont maintenant des fenêtres à part
+        if self.tab == Tab::Ai {
+            self.ai_open = true;
+            self.tab = Tab::Selection;
+        }
+        if self.tab == Tab::Terrain {
+            self.terrain_open = true;
+            self.tab = Tab::Selection;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Game, "🗺 Jeu");
             ui.selectable_value(&mut self.tab, Tab::Selection, "Sélection");
             ui.selectable_value(&mut self.tab, Tab::Props, "Props");
             ui.selectable_value(&mut self.tab, Tab::Interior, "Intérieur");
-            ui.selectable_value(&mut self.tab, Tab::Ai, "💬 IA");
+            ui.selectable_value(&mut self.tab, Tab::Lists, "Listes");
             ui.selectable_value(&mut self.tab, Tab::Options, "Options");
         });
         ui.separator();
@@ -319,7 +564,11 @@ impl DwApp {
             Tab::Interior => {
                 egui::ScrollArea::vertical().id_salt("inttab").show(ui, |ui| self.interior_tab(ui));
             }
-            Tab::Ai => self.ai_tab(ui),
+            Tab::Ai => {}
+            Tab::Lists => {
+                egui::ScrollArea::vertical().id_salt("liststab").show(ui, |ui| self.lists_tab(ui));
+            }
+            Tab::Terrain => {}
             Tab::Options => {
                 egui::ScrollArea::vertical().id_salt("opttab").show(ui, |ui| self.options_tab(ui));
             }
@@ -327,6 +576,9 @@ impl DwApp {
     }
 
     fn selection_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.selected.is_empty() && ui.button(RichText::new("Sélection intelligente : tout ce qui va avec (J)").strong()).on_hover_text("Prend tout ce qui est dans ou sur l'objet choisi : props, décalques, intérieurs, versions lointaines… (ex. tout un yacht)").clicked() {
+            self.smart_select();
+        }
         if self.selected.is_empty() {
             ui.label("Rien n'est sélectionné.");
             ui.label(RichText::new("Outil Sélection : clic sur un objet, Ctrl+clic pour en ajouter, ou glisse un rectangle dans le vide pour en prendre plusieurs d'un coup.").weak());
@@ -499,9 +751,10 @@ impl DwApp {
             if ui.button("Centrer la vue").clicked() {
                 self.cam.target = world.pos;
             }
-            if ui.button("Poser au sol").clicked() {
-                self.push_undo();
-                self.proj.set_world_pos(r, v3(world.pos.x, world.pos.y, self.ground_z));
+            if ui.button("Poser au sol").on_hover_text("Pose l'objet sur ce qu'il y a dessous, au bon niveau (Maj seule ou Fin)").clicked() {
+                let _ = (r, &world);
+                let n = self.snap_selected_to_ground(true);
+                self.status = format!("{n} objet(s) posé(s) au sol.");
             }
         });
     }

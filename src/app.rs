@@ -21,6 +21,8 @@ pub enum Tool {
     Erase,
     /// sélection en rectangle : glisser n'importe où trace un rectangle (même sur le sol ou un bâtiment)
     Rect,
+    /// pinceaux de l'éditeur de terrain
+    Terrain,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,8 @@ pub enum Tab {
     Interior,
     Ai,
     Options,
+    Lists,
+    Terrain,
 }
 
 pub enum Drag {
@@ -119,6 +123,41 @@ pub struct DwApp {
     pub gizmo_hover: Option<u8>,
     /// axes de l'objet au lieu de ceux du monde
     pub gizmo_object_space: bool,
+    /// bibliothèque de props (fenêtre)
+    pub library: crate::library::Library,
+    /// listes du jeu (scénarios, intérieurs, LOD, lumières)
+    pub lists: crate::lists::Lists,
+    /// bibliothèque des intérieurs
+    pub intlib: crate::intlib::IntLib,
+    /// éditeur de terrain
+    pub terrain: crate::terrain::TerrainState,
+    pub terrain_last_upload: f64,
+    /// objets copiés (Ctrl+C), dans le monde
+    pub clipboard: Vec<Entity>,
+    /// panneaux de gauche et de droite cachés (Ctrl+U, comme le panneau d'outils de CodeWalker)
+    pub panels_hidden: bool,
+    /// fenêtres à part : Assistant IA, Créateur de terrain
+    pub ai_open: bool,
+    pub terrain_open: bool,
+    /// place de chaque panneau (flottant, à gauche, à droite, en bas)
+    pub docks: std::collections::HashMap<String, crate::docking::Dock>,
+    /// glisser-déposer des panneaux
+    pub dock_drag: Option<crate::docking::DockDrag>,
+    pub float_pos: std::collections::HashMap<&'static str, egui::Pos2>,
+    pub float_rects: std::collections::HashMap<&'static str, egui::Rect>,
+    /// panneaux Projet et Boîte à outils ouverts
+    pub project_open: bool,
+    pub toolbox_open: bool,
+    /// passe d'affichage des panneaux : 0 = ceux rangés en bas, 1 = les autres
+    pub dock_phase: u8,
+    /// poser au sol : modèles gardés pour le lancer de rayon, appui sur Maj seul
+    pub snap_cache: std::collections::HashMap<u32, Option<std::sync::Arc<crate::gta::drawable::Mesh>>>,
+    pub shift_since: Option<f64>,
+    pub shift_tap: bool,
+    /// point de contact au sol de chaque morceau de carte du jeu (relevé à son emplacement d'origine)
+    pub snap_offsets: std::collections::HashMap<u32, Option<f32>>,
+    /// bibliothèque des bâtiments du jeu
+    pub buildings: crate::buildings::BuildingLib,
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -158,6 +197,8 @@ pub fn save_api_key(k: &str) {
 }
 
 fn setup_style(ctx: &egui::Context) {
+    // toujours le thème sombre, même si Windows est en mode clair
+    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
     let mut v = egui::Visuals::dark();
     v.panel_fill = Color32::from_rgb(37, 40, 46);
     v.window_fill = Color32::from_rgb(37, 40, 46);
@@ -176,7 +217,7 @@ fn setup_style(ctx: &egui::Context) {
 impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![] };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -245,6 +286,27 @@ impl DwApp {
             gizmo_mode: crate::gizmo::GizmoMode::Move,
             gizmo_hover: None,
             gizmo_object_space: false,
+            library: crate::library::Library::new(),
+            lists: crate::lists::Lists::default(),
+            intlib: crate::intlib::IntLib { open: std::env::var("DW_INTLIB").is_ok(), filter: std::env::var("DW_INTLIB_FILTER").unwrap_or_default(), chosen: None },
+            terrain: crate::terrain::TerrainState::default(),
+            terrain_last_upload: 0.0,
+            clipboard: Vec::new(),
+            panels_hidden: false,
+            ai_open: std::env::var("DW_AI_WINDOW").is_ok(),
+            terrain_open: std::env::var("DW_TERRAIN_WINDOW").is_ok(),
+            docks: crate::docking::load_docks(),
+            dock_drag: None,
+            float_pos: std::collections::HashMap::new(),
+            float_rects: std::collections::HashMap::new(),
+            project_open: true,
+            toolbox_open: true,
+            dock_phase: 1,
+            snap_cache: std::collections::HashMap::new(),
+            shift_since: None,
+            shift_tap: false,
+            snap_offsets: std::collections::HashMap::new(),
+            buildings: crate::buildings::BuildingLib::new(),
         };
         // moteur d'IA : celui enregistré, sinon Claude Code s'il est installé, sinon la clé API, sinon le local
         app.ai_provider = load_settings()["ai_provider"].as_str().and_then(ai::Provider::from_key).unwrap_or(if app.claude_code.is_some() {
@@ -293,6 +355,7 @@ impl DwApp {
     pub fn do_undo(&mut self) {
         if let Some(p) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.proj, p));
+            self.terrain.dirty = true;
             self.clean_selection();
             self.sync_game_project();
             self.status = "Annulé.".into();
@@ -302,6 +365,7 @@ impl DwApp {
     pub fn do_redo(&mut self) {
         if let Some(p) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.proj, p));
+            self.terrain.dirty = true;
             self.clean_selection();
             self.sync_game_project();
             self.status = "Rétabli.".into();
@@ -1009,6 +1073,148 @@ impl eframe::App for DwApp {
                 None => println!("sol sous le centre : rien"),
             }
         }
+        // mode test : DW_TEST_SPAWN="nom1,nom2" pose ces props comme un double-clic de la bibliothèque
+        static SPAWN_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !SPAWN_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(v) = std::env::var("DW_TEST_SPAWN") {
+                for n in v.split(',') {
+                    let at = self.spawn_pos(n);
+                    self.library_place(n, Some(at));
+                    println!("{n} posé à {:.1} m devant la caméra ({:.1} {:.1} {:.1})", (at - self.cam.eye).len(), at.x, at.y, at.z);
+                }
+            }
+        }
+        // modes test : DW_TEST_LISTS=1 (scénarios + lumières), DW_TEST_SMART="nom" (sélection intelligente),
+        // DW_TEST_TERRAIN=1 (carte vide, terrain, île, route, pelleteuse)
+        static LISTS_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !LISTS_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if std::env::var("DW_TEST_LODS").is_ok() {
+                self.tab = Tab::Lists;
+                self.lists.sub = 2;
+            }
+            if let Ok(n) = std::env::var("DW_TEST_ISOLATE") {
+                let h = crate::gta::crypto::joaat(&n);
+                let pl = self.game.world.as_ref().and_then(|w| (0..w.ents.len() as u32).find(|i| w.ents[*i as usize].arch == h && w.ents[*i as usize].mlo));
+                if let Some(pl) = pl {
+                    let c = self.game.world.as_ref().map(|w| {
+                        let e = &w.ents[pl as usize];
+                        let d = w.mlo_defs.get(&e.arch);
+                        d.filter(|d| !d.children.is_empty()).map(|d| d.children.iter().fold(V3::ZERO, |a, k| a + e.pos + e.rot.rotate(k.pos)) * (1.0 / d.children.len() as f32)).unwrap_or(e.pos)
+                    }).unwrap_or(self.cam.target);
+                    self.cam.target = c;
+                    self.cam.dist = 22.0;
+                    self.game.isolate = Some(pl);
+                    println!("isolé : {n} à {:.0} {:.0} {:.0}", c.x, c.y, c.z);
+                }
+            }
+            if std::env::var("DW_TEST_LISTS").is_ok() {
+                self.lists_test();
+            }
+            if let Ok(n) = std::env::var("DW_TEST_SMART") {
+                let h = crate::gta::crypto::joaat(&n);
+                let ei = self.game.world.as_ref().and_then(|w| (0..w.ents.len() as u32).filter(|i| w.ents[*i as usize].arch == h && w.ymaps[w.ents[*i as usize].ymap as usize].visible).min_by(|a, b| (w.ents[*a as usize].pos - self.cam.target).len().partial_cmp(&(w.ents[*b as usize].pos - self.cam.target).len()).unwrap_or(std::cmp::Ordering::Equal)));
+                if let Some(ei) = ei {
+                    let ids = self.game_ents_to_project(&[ei]);
+                    self.set_selection(ids);
+                    self.smart_select();
+                    println!("{}", self.status);
+                }
+            }
+            if std::env::var("DW_TEST_TERRAIN").is_ok() {
+                self.game.empty_map = true;
+                let c = self.cam.target;
+                self.proj.terrain = Some(crate::terrain::Terrain::new(c, 400.0, -4.0, 0));
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    t.island(c, 110.0, 16.0);
+                    t.road(c + v3(-90.0, -30.0, 0.0), c + v3(80.0, 40.0, 0.0), 10.0);
+                    t.brush(crate::terrain::Brush::Flatten, c + v3(30.0, -40.0, 0.0), 25.0, 20.0, 1.0, 0, 12.0);
+                    t.brush(crate::terrain::Brush::Paint, c + v3(30.0, -40.0, 0.0), 22.0, 1.0, 1.0, 4, 0.0);
+                    let hc = t.height_at(c.x, c.y).unwrap_or(0.0);
+                    let hf = t.height_at(c.x + 30.0, c.y - 40.0).unwrap_or(0.0);
+                    println!("terrain : {}×{} sommets, hauteur au centre {hc:.1} m, dalle aplanie à {hf:.1} m", t.nx, t.ny);
+                }
+                // DW_TEST_TERRAIN_PRESET=n : modèle de départ n ; DW_TEST_ROADS=1 : une route de chaque type ;
+                // DW_TEST_VEG=n : sème l'ensemble de végétation n en quelques coups de pinceau
+                if let Some(p) = std::env::var("DW_TEST_TERRAIN_PRESET").ok().and_then(|v| v.parse::<u8>().ok()) {
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.generate(p, 7, 4.0);
+                        let (mn, mx) = t.bounds();
+                        println!("modèle {} : hauteurs {:.1} .. {:.1} m", crate::terrain::PRESETS[p as usize].0, mn.z, mx.z);
+                    }
+                    self.terrain.preset = p;
+                }
+                if std::env::var("DW_TEST_ROADS").is_ok() {
+                    for k in 0..crate::roads::KINDS.len() {
+                        let y = c.y - 140.0 + k as f32 * 60.0;
+                        self.terrain.road_kind = k as u8;
+                        let h = |x: f32, y: f32| self.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                        self.terrain.road_pts = vec![v3(c.x - 170.0, y, h(c.x - 170.0, y)), v3(c.x - 40.0, y + 25.0, h(c.x - 40.0, y + 25.0)), v3(c.x + 60.0, y - 20.0, h(c.x + 60.0, y - 20.0)), v3(c.x + 170.0, y + 10.0, h(c.x + 170.0, y + 10.0))];
+                        self.finish_road();
+                        println!("{}", self.status);
+                    }
+                }
+                if let Some(vs) = std::env::var("DW_TEST_VEG").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    self.terrain.veg_set = vs.min(crate::vegetation::SETS.len() - 1);
+                    self.terrain.veg_density = 0.6;
+                    let mut n = 0;
+                    for (dx, dy) in [(-120.0, 150.0), (0.0, 160.0), (120.0, 150.0), (-150.0, -170.0), (150.0, -170.0)] {
+                        n += self.veg_paint(c + v3(dx, dy, 0.0), 35.0);
+                    }
+                    println!("végétation {} : {n} objet(s) posé(s), {} au total", crate::vegetation::SETS[self.terrain.veg_set].name, self.veg_count());
+                }
+                // DW_TEST_WATER=1 : un bassin creusé et quelques effets ; DW_TEST_BUILDING=nom : copie d'un bâtiment
+                if std::env::var("DW_TEST_WATER").is_ok() {
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        let (x0, y0, x1, y1) = (c.x + 40.0, c.y - 90.0, c.x + 110.0, c.y - 40.0);
+                        let z = t.height_at(x0, y0).unwrap_or(5.0) + 0.2;
+                        for j in 0..t.ny {
+                            for i in 0..t.nx {
+                                let (x, y) = (t.origin.x + i as f32 * t.cell, t.origin.y + j as f32 * t.cell);
+                                if x > x0 && x < x1 && y > y0 && y < y1 {
+                                    t.h[j * t.nx + i] = z - 2.3;
+                                }
+                            }
+                        }
+                        t.waters.push(crate::scenery::WaterZone { min: [x0, y0], max: [x1, y1], z });
+                        for (k, (dx, dy)) in [(-20.0f32, -60.0f32), (-30.0, -50.0), (-40.0, -60.0)].iter().enumerate() {
+                            let (x, y) = (c.x + dx, c.y + dy);
+                            let zz = t.height_at(x, y).unwrap_or(0.0) + 0.3;
+                            t.emitters.push(crate::scenery::Emitter { pos: v3(x, y, zz), fx: crate::scenery::FX[k * 7].name.to_string(), scale: crate::scenery::FX[k * 7].scale });
+                        }
+                    }
+                    println!("eau et effets ajoutés");
+                }
+                if let Ok(name) = std::env::var("DW_TEST_BUILDING") {
+                    let h = crate::gta::crypto::joaat(&name);
+                    let at = v3(c.x - 60.0, c.y - 40.0, self.proj.terrain.as_ref().and_then(|t| t.height_at(c.x - 60.0, c.y - 40.0)).unwrap_or(0.0));
+                    self.building_place(h, at);
+                    let n = self.game.world.as_ref().map(|w| crate::buildings::build_list(w).len()).unwrap_or(0);
+                    println!("bâtiments du jeu : {n} · {}", self.status);
+                    // DW_TEST_SNAP=1 : monte la copie de 15 m puis la repose au sol
+                    if std::env::var("DW_TEST_SNAP").is_ok() {
+                        self.move_selected(v3(0.0, 0.0, 15.0));
+                        let zb = self.selected.first().and_then(|id| self.proj.find_id(*id)).and_then(|r| self.proj.world_entity(r)).map(|e| e.pos.z).unwrap_or(0.0);
+                        let n = self.snap_selected_to_ground(true);
+                        let za = self.selected.first().and_then(|id| self.proj.find_id(*id)).and_then(|r| self.proj.world_entity(r)).map(|e| e.pos.z).unwrap_or(0.0);
+                        println!("poser au sol : {n} objet(s), z {zb:.2} -> {za:.2} (terrain {:.2})", self.proj.terrain.as_ref().and_then(|t| t.height_at(at.x, at.y)).unwrap_or(0.0));
+                    }
+                }
+                self.terrain.dirty = true;
+                self.tool = Tool::Terrain;
+                self.tab = Tab::Terrain;
+                if let Ok(dir) = std::env::var("DW_TEST_TERRAIN_EXPORT") {
+                    let r = self.export_project(std::path::Path::new(&dir), true);
+                    println!("export : {r}");
+                }
+            }
+        }
+        // mode test : DW_TEST_DOCKDRAG="clé,x,y[,tenir]" : commence à glisser ce panneau (voir dock_overlay)
+        if self.frame == 100 {
+            if let Some(k) = std::env::var("DW_TEST_DOCKDRAG").ok().and_then(|v| v.split(',').next().map(|s| s.trim().to_string())) {
+                let key: &'static str = match k.as_str() { "projet" => "projet", "outils" => "outils", "terrain" => "terrain", "ia" => "ia", "bibliotheque" => "bibliotheque", "batiments" => "batiments", _ => "interieurs" };
+                self.dock_drag = Some(crate::docking::DockDrag { key, title: key.to_string(), floating: false });
+            }
+        }
         // mode test : DW_TEST_RECT="largeur,hauteur" sélectionne un rectangle au centre de la vue avec l'outil Rectangle
         static RECT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if self.frame == 100 && !RECT_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1215,7 +1421,7 @@ impl eframe::App for DwApp {
         }
         // capture : attendre aussi que les vrais modèles visibles soient chargés (au plus ~60 s)
         if self.shot_path.is_some() && self.frame > 60 && self.frame < 120 {
-            let busy = self.pending.is_some() || self.game.gpu.as_ref().map(|g| g.lock().map(|g| g.busy()).unwrap_or(false)).unwrap_or(false);
+            let busy = self.pending.is_some() || self.library.pending > 0 || self.game.gpu.as_ref().map(|g| g.lock().map(|g| g.busy()).unwrap_or(false)).unwrap_or(false);
             if busy && self.shot_wait < 4000 {
                 self.shot_wait += 1;
                 self.frame = 60;
@@ -1269,6 +1475,8 @@ impl eframe::App for DwApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             self.menu_bar(ui, ctx);
         });
+        let now = ctx.input(|i| i.time);
+        self.terrain_tick(now);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
             self.toolbar(ui);
@@ -1291,12 +1499,24 @@ impl eframe::App for DwApp {
                 });
             });
         });
-        egui::SidePanel::left("project").default_width(250.0).resizable(true).show(ctx, |ui| {
-            self.project_panel(ui);
-        });
-        egui::SidePanel::right("toolbox").default_width(340.0).resizable(true).show(ctx, |ui| {
-            self.toolbox(ui);
-        });
+        // panneaux et fenêtres, chacun à sa place (flottant, à gauche, à droite, en bas)
+        for phase in [0u8, 1] {
+            self.dock_phase = phase;
+            if !self.panels_hidden {
+                let mut o = self.project_open;
+                self.show_panel(ctx, "projet", "Projet", crate::docking::Dock::Left, [250.0, 300.0], &mut o, |s, ui| s.project_panel(ui));
+                self.project_open = o;
+                let mut o = self.toolbox_open;
+                self.show_panel(ctx, "outils", "Boîte à outils", crate::docking::Dock::Right, [340.0, 300.0], &mut o, |s, ui| s.toolbox(ui));
+                self.toolbox_open = o;
+            }
+            self.library_window(ctx);
+            self.buildings_window(ctx);
+            self.ai_window(ctx);
+            self.terrain_window(ctx);
+            self.intlib_window(ctx);
+        }
+        self.dock_overlay(ctx);
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {
             self.view(ui, dt);
         });

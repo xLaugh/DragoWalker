@@ -19,11 +19,70 @@ if ($ToBinary) {
         $name = $f.Name.ToLower()
         $fmt = $null
         if ($name.EndsWith('.ymap.xml') -or $name.EndsWith('.ytyp.xml')) { $fmt = 'RSC' }
+        elseif ($name.EndsWith('.ymf.xml')) { $fmt = 'PSO' }
         elseif ($name.EndsWith('.ydr.xml')) { $fmt = 'Ydr' }
         elseif ($name.EndsWith('.ydd.xml')) { $fmt = 'Ydd' }
         elseif ($name.EndsWith('.yft.xml')) { $fmt = 'Yft' }
         elseif ($name.EndsWith('.ytd.xml')) { $fmt = 'Ytd' }
+        elseif ($name.EndsWith('.ybn.xml')) { $fmt = 'Ybn' }
         if (-not $fmt) { continue }
+        if ($fmt -eq 'PSO') {
+            # manifeste de dépendances : comme EditProjectManifestPanel.SaveManifestButton_Click (0x06001196),
+            # XmlPso.GetPso(document) puis PsoFile.Save()
+            try {
+                $doc = [System.Xml.XmlDocument]::new()
+                $doc.Load($f.FullName)
+                $p = New-Object 'object[]' 1
+                $p[0] = $doc.psobject.BaseObject
+                $pso = $asm.GetType('CodeWalker.GameFiles.XmlPso').GetMethod('GetPso', [type[]]@([System.Xml.XmlDocument])).Invoke($null, $p)
+                $data = [byte[]]$pso.Save()
+                $outPath = Join-Path $f.DirectoryName ($f.Name.Substring(0, $f.Name.Length - 4))
+                [IO.File]::WriteAllBytes($outPath, $data)
+                Write-Output ("OK`t" + $f.Name + "`t" + $data.Length)
+            } catch {
+                Write-Output ("ERREUR`t" + $f.Name + "`t" + $_.Exception.GetBaseException().Message)
+            }
+            continue
+        }
+        if ($fmt -eq 'Ytd') {
+            # Dictionnaire de textures : construit comme la map désert (build_ytd_dxt.ps1, validée en jeu) :
+            # DDSIO.GetTexture sur chaque .dds, TextureDictionary.BuildFromTextureList (0x06005984), YtdFile.Save.
+            # Accepte les deux formes de XML (Item directement sous la racine, ce que lit
+            # TextureDictionary.ReadXml 0x0600597e, ou sous <Textures>, qui rendait un fichier vide de 57 octets).
+            try {
+                $doc = [System.Xml.XmlDocument]::new()
+                $doc.Load($f.FullName)
+                $folder = Join-Path $f.DirectoryName ($f.Name.Substring(0, $f.Name.IndexOf('.')))
+                if (-not (Test-Path $folder)) { $folder = $f.DirectoryName }
+                $texType = $asm.GetType('CodeWalker.GameFiles.Texture')
+                $listType = [System.Collections.Generic.List``1].MakeGenericType($texType)
+                $list = [Activator]::CreateInstance($listType)
+                $ddsio = $asm.GetType('CodeWalker.Utils.DDSIO')
+                $jenk = $asm.GetType('CodeWalker.GameFiles.JenkHash')
+                foreach ($it in $doc.SelectNodes('//Item')) {
+                    $fn = $it.SelectSingleNode('FileName')
+                    $nm = $it.SelectSingleNode('Name')
+                    if ($fn -eq $null -or $nm -eq $null) { continue }
+                    $p = New-Object 'object[]' 1
+                    $p[0] = [IO.File]::ReadAllBytes((Join-Path $folder $fn.InnerText))
+                    $tex = $ddsio.GetMethod('GetTexture').Invoke($null, $p)
+                    $tex.Name = $nm.InnerText
+                    try { $q = New-Object 'object[]' 1; $q[0] = [string]$nm.InnerText; $tex.NameHash = $jenk.GetMethod('GenHash', [type[]]@([string])).Invoke($null, $q) } catch {}
+                    $list.Add($tex)
+                }
+                $td = [Activator]::CreateInstance($asm.GetType('CodeWalker.GameFiles.TextureDictionary'))
+                $td.BuildFromTextureList($list)
+                $ytd = [Activator]::CreateInstance($asm.GetType('CodeWalker.GameFiles.YtdFile'))
+                $ytd.TextureDict = $td
+                $data = [byte[]]$ytd.Save()
+                $outPath = Join-Path $f.DirectoryName ($f.Name.Substring(0, $f.Name.Length - 4))
+                [IO.File]::WriteAllBytes($outPath, $data)
+                Write-Output ("OK`t" + $f.Name + "`t" + $data.Length)
+            } catch {
+                Write-Output ("ERREUR`t" + $f.Name + "`t" + $_.Exception.GetBaseException().Message)
+            }
+            continue
+        }
         try {
             $doc = [System.Xml.XmlDocument]::new()
             $doc.Load($f.FullName)

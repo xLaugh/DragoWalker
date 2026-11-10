@@ -157,7 +157,7 @@ impl DwApp {
                 }
             }
         }
-        self.mouse_ground = hover_pos.and_then(|p| if self.game.world.is_some() { surface.or_else(|| self.game_ground(p)).or_else(|| self.cam.ground_point(p, self.ground_z)) } else { self.cam.ground_point(p, self.ground_z) });
+        self.mouse_ground = hover_pos.and_then(|p| if self.proj.terrain.is_some() && (self.game.empty_map || surface.is_none()) { surface.or_else(|| self.terrain_ground(p)).or_else(|| self.cam.ground_point(p, 0.0)) } else if self.game.world.is_some() { surface.or_else(|| self.game_ground(p)).or_else(|| self.cam.ground_point(p, self.ground_z)) } else { self.cam.ground_point(p, self.ground_z) });
         if self.game.world.is_some() {
             // survol : exactement l'objet qu'un clic prendrait (y compris celui de derrière après un reclic)
             if self.frame % 2 == 0 {
@@ -186,6 +186,7 @@ impl DwApp {
         let press_origin = ctx.input(|i| i.pointer.press_origin());
         match self.tool {
             Tool::Select | Tool::Rect => self.select_tool(&resp, ptr, press_origin, mods),
+            Tool::Terrain => self.terrain_tool(&resp, ptr, &ctx),
             Tool::Place => {
                 if resp.drag_started_by(PointerButton::Primary) {
                     let start = press_origin.or(ptr).unwrap_or_default();
@@ -194,6 +195,7 @@ impl DwApp {
                         let arch = self.place_arch.clone();
                         let id = self.place_prop(&arch, g, None);
                         self.set_selection(vec![id]);
+                        self.snap_if_shift(&[id]);
                         self.drag = Drag::Place(g);
                     }
                 }
@@ -208,6 +210,7 @@ impl DwApp {
                             let p = last + d.norm() * self.stroke_spacing;
                             let id = self.place_prop(&arch, p, heading);
                             self.add_selection([id]);
+                            self.snap_if_shift(&[id]);
                             self.drag = Drag::Place(p);
                         }
                     }
@@ -256,7 +259,7 @@ impl DwApp {
                 ctx.request_repaint();
             }
         }
-        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors });
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default() });
         render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
         drop(gctx);
         self.game.drawn = drawn;
@@ -287,6 +290,8 @@ impl DwApp {
         if self.tool == Tool::Select {
             self.draw_gizmo(&painter, self.gizmo_hover);
         }
+        self.draw_lists_overlay(&painter);
+        self.draw_scenery_overlay(&painter, hover_pos);
         // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
         // MouseRayCollisionVisible quand CtrlPressed) — Ctrl + clic y prend l'objet
         if (mods.command || std::env::var("DW_TEST_CTRL").is_ok()) && self.tool == Tool::Select {
@@ -319,6 +324,7 @@ impl DwApp {
                 }
             }
             Tool::Select | Tool::Rect => {}
+            Tool::Terrain => self.draw_terrain_brush(&painter, hover_pos),
         }
         if let (Drag::Rect(a), Some(b)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(*a, b);
@@ -354,6 +360,12 @@ impl DwApp {
             Tool::Select => "Sélection : clic = choisir (reclic = celui de derrière) · glisser = déplacer ou rectangle · H = cacher · C = couper le haut · Suppr = supprimer",
             Tool::Place => "Poser : clic = poser · glisser = poser le long d'un trait",
             Tool::Erase => "Gomme : glisser pour effacer · Alt + molette = taille du cercle",
+            Tool::Terrain => match self.terrain.brush {
+                crate::terrain::Brush::Road => "Route : clic pour poser des points · double-clic ou Entrée pour construire · Retour arrière / Échap",
+                crate::terrain::Brush::Vegetation => "Végétation : glisser pour semer · Ctrl + glisser pour retirer · + / - rayon",
+                crate::terrain::Brush::Paint => "Peindre : glisser pour changer le sol · + / - rayon · F2–F9 autres pinceaux",
+                _ => "Terrain : glisser pour sculpter · + / - rayon · F2–F9 pinceaux (menu Terrain)",
+            },
             Tool::Rect => "Rectangle : glisser n'importe où pour sélectionner tout ce qui est dedans · Ctrl ou Maj = ajouter · Suppr = tout supprimer",
         };
         let galley = painter.layout_no_wrap(help.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
@@ -445,8 +457,15 @@ impl DwApp {
                     if d.len() > 0.0 {
                         self.move_selected(d);
                         self.drag = Drag::Move(last + d);
+                        // Maj maintenue : l'objet suit le sol
+                        if mods.shift {
+                            self.snap_selected_to_ground(false);
+                        }
                     }
                 }
+            }
+            if mods.shift && matches!(self.drag, Drag::Gizmo(_)) && self.gizmo_mode == crate::gizmo::GizmoMode::Move {
+                self.snap_selected_to_ground(false);
             }
         }
         if resp.drag_stopped() {
@@ -499,6 +518,10 @@ impl DwApp {
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y))) {
             self.do_redo();
         }
+        // Ctrl+Maj+S avant Ctrl+S (comme SaveAll / Save dans WorldForm_KeyDown 0x06000332)
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::S))) {
+            self.save_project(true);
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
             self.save_project(false);
         }
@@ -507,6 +530,111 @@ impl DwApp {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::D))) {
             { let off = self.copy_offset(); self.duplicate_selected(off); }
+        }
+        // raccourcis Ctrl de CodeWalker (WorldForm_KeyDown 0x06000332, ProjectForm 0x06000e92)
+        let ck = ctx.input_mut(|i| {
+            let mut c = |m: Modifiers, k: Key| i.consume_shortcut(&KeyboardShortcut::new(m, k));
+            [
+                c(Modifiers::COMMAND, Key::N),
+                c(Modifiers::COMMAND, Key::O),
+                c(Modifiers::COMMAND, Key::C),
+                c(Modifiers::COMMAND, Key::V),
+                c(Modifiers::COMMAND, Key::X),
+                c(Modifiers::COMMAND, Key::U),
+                c(Modifiers::COMMAND, Key::I),
+                c(Modifiers::COMMAND | Modifiers::SHIFT, Key::E),
+                c(Modifiers::COMMAND, Key::E),
+            ]
+        });
+        if ck[0] {
+            self.new_project();
+        }
+        if ck[1] {
+            self.open_project_dialog();
+        }
+        if ck[2] {
+            self.copy_selected();
+        }
+        if ck[3] {
+            self.paste();
+        }
+        if ck[4] && !self.selected.is_empty() {
+            self.copy_selected();
+            self.delete_selected();
+        }
+        if ck[5] {
+            self.panels_hidden = !self.panels_hidden;
+        }
+        if ck[6] {
+            self.import_dialog();
+        }
+        if ck[7] {
+            self.export_xml(true);
+        } else if ck[8] {
+            self.export_xml(false);
+        }
+        // éditeur de terrain : F2–F9 pinceaux, + / - rayon, route en cours (Entrée, Retour arrière, Échap)
+        if self.proj.terrain.is_some() {
+            use crate::terrain::Brush;
+            let fk = ctx.input(|i| [Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8, Key::F9, Key::F10, Key::F11].map(|k| i.key_pressed(k)));
+            let brushes = [Brush::Raise, Brush::Lower, Brush::Flatten, Brush::Smooth, Brush::Noise, Brush::Paint, Brush::Road, Brush::Vegetation, Brush::Water, Brush::Particles];
+            for (p, b) in fk.iter().zip(brushes) {
+                if *p {
+                    self.set_terrain_brush(b);
+                }
+            }
+        }
+        if self.tool == Tool::Terrain {
+            let (plus, minus) = ctx.input(|i| (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals), i.key_pressed(Key::Minus)));
+            if plus || minus {
+                self.terrain.radius = (self.terrain.radius * if plus { 1.25 } else { 0.8 }).clamp(2.0, 120.0);
+                self.status = format!("Rayon du pinceau : {:.0} m", self.terrain.radius);
+            }
+            if !self.terrain.road_pts.is_empty() {
+                let (enter, back, esc) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::NONE, Key::Backspace), i.consume_key(Modifiers::NONE, Key::Escape)));
+                if enter {
+                    self.finish_road();
+                }
+                if back {
+                    self.terrain.road_pts.pop();
+                    self.status = format!("{} point(s) dans la route en cours.", self.terrain.road_pts.len());
+                }
+                if esc {
+                    self.terrain.road_pts.clear();
+                    self.status = "Route annulée.".into();
+                }
+            }
+        }
+        // poser au sol : Maj seule (appuyer puis relâcher sans rien d'autre) ou Fin
+        let (shift, other, now) = ctx.input(|i| (i.modifiers.shift, i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::PointerButton { pressed: true, .. } | egui::Event::MouseWheel { .. })), i.time));
+        match (shift, self.shift_since) {
+            (true, None) => {
+                self.shift_since = Some(now);
+                self.shift_tap = !other;
+            }
+            (true, Some(_)) => {
+                if other {
+                    self.shift_tap = false;
+                }
+            }
+            (false, Some(t0)) => {
+                self.shift_since = None;
+                if self.shift_tap && now - t0 < 0.45 && !self.selected.is_empty() && matches!(self.drag, Drag::None) {
+                    let n = self.snap_selected_to_ground(true);
+                    self.status = format!("{n} objet(s) posé(s) au sol (Maj).");
+                }
+            }
+            (false, None) => {}
+        }
+        if ctx.input(|i| i.key_pressed(Key::End)) && !self.selected.is_empty() {
+            let n = self.snap_selected_to_ground(true);
+            self.status = format!("{n} objet(s) posé(s) au sol (Fin).");
+        }
+        if ctx.input(|i| i.key_pressed(Key::I) && !i.modifiers.command) {
+            self.intlib.open = !self.intlib.open;
+        }
+        if ctx.input(|i| i.key_pressed(Key::N) && !i.modifiers.command) {
+            self.buildings.open = !self.buildings.open;
         }
         let k = ctx.input(|i| {
             [
@@ -534,6 +662,7 @@ impl DwApp {
             self.delete_selected();
         }
         if k[1] {
+            self.game.isolate = None;
             self.set_selection(vec![]);
             self.drag = Drag::None;
         }
@@ -548,6 +677,16 @@ impl DwApp {
         }
         if ctx.input(|i| i.key_pressed(Key::Num4)) {
             self.tool = Tool::Rect;
+        }
+        if ctx.input(|i| i.key_pressed(Key::B)) {
+            self.library.open = !self.library.open;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Num5)) {
+            self.tool = Tool::Terrain;
+            self.tab = Tab::Terrain;
+        }
+        if ctx.input(|i| i.key_pressed(Key::J)) {
+            self.smart_select();
         }
         if k[5] {
             self.cam.map_view = !self.cam.map_view;
