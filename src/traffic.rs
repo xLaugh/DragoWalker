@@ -173,6 +173,15 @@ pub fn lanes(kind: usize) -> u8 {
     }
 }
 
+/// Point dans la grille des points de route, comme SpaceNodeGrid::GetCellForPosition (0x0600036a) : cellule =
+/// (int)((x + 8192) / 512), arrondi vers zéro, gardée si 0 ≤ cellule < 32 (grille de 32 × 32 cellules de 512 m,
+/// constructeur 0x06000368) ; hors de la grille, CodeWalker ne range le point nulle part.
+pub fn in_grid(p: V3) -> bool {
+    let c = |v: f32| ((v + 8192.0) / 512.0) as i32;
+    (0..32).contains(&c(p.x)) && (0..32).contains(&c(p.y))
+}
+
+/// Numéro de carré : y × 32 + x (SpaceNodeGrid::GetCell 0x06000369 : x = id % 32, y = id / 32).
 pub fn area_of(p: V3) -> u32 {
     let cx = (((p.x + 8192.0) / 512.0).floor() as i32).clamp(0, 31);
     let cy = (((p.y + 8192.0) / 512.0).floor() as i32).clamp(0, 31);
@@ -252,18 +261,30 @@ pub fn build_network(t: &Terrain) -> Network {
     Network { nodes, links }
 }
 
-/// Fichiers nodesNNN.ynd.xml (format de CodeWalker, NodeDictionary) écrits dans `stream`. Renvoie le nombre de
-/// carrés de 512 m touchés.
-pub fn export_ynds(t: &Terrain, stream: &std::path::Path) -> Result<usize, String> {
-    let net = build_network(t);
+/// Fichiers nodesNNN.ynd.xml (format de CodeWalker, NodeDictionary) écrits dans `stream`. Renvoie (carrés écrits,
+/// carrés laissés au jeu).
+///
+/// Un nodesNNN.ynd REMPLACE celui du jeu, et les carrés voisins du jeu sont reliés à ses points par leur numéro
+/// (ToAreaID / ToNodeID ; le nodes464.ynd du jeu a 927 points de voiture et 584 de piétons) : un fichier plus court
+/// laisse ces liens pointer dans le vide et fait planter le jeu quand il charge la circulation autour du joueur
+/// (crash GTA5+E93DB6 environ 10 s après l'apparition, ressource exportée avec 8 carrés du centre de Los Santos).
+/// Donc `game_has(carré)` vrai → carré non écrit, et les liens de nos points vers ses points sont retirés.
+pub fn export_ynds(t: &Terrain, stream: &std::path::Path, game_has: &dyn Fn(u32) -> bool) -> Result<(usize, usize), String> {
+    let mut net = build_network(t);
     if net.nodes.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
+    let skipped: std::collections::BTreeSet<u32> = net.nodes.iter().filter(|n| in_grid(n.pos)).map(|n| area_of(n.pos)).filter(|a| game_has(*a)).collect();
+    // points hors de la grille (au-delà de ±8192 m) : aucun fichier ne peut les porter, comme dans CodeWalker
+    let keep = |p: V3| in_grid(p) && !skipped.contains(&area_of(p));
+    net.links.retain(|l| keep(net.nodes[l.0].pos) && keep(net.nodes[l.1].pos));
     // numérotation par carré
     let mut ids: Vec<(u32, u32)> = vec![(0, 0); net.nodes.len()];
     let mut per_area: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (i, n) in net.nodes.iter().enumerate() {
-        per_area.entry(area_of(n.pos)).or_default().push(i);
+        if keep(n.pos) {
+            per_area.entry(area_of(n.pos)).or_default().push(i);
+        }
     }
     for (area, list) in &per_area {
         for (k, i) in list.iter().enumerate() {
@@ -315,5 +336,5 @@ pub fn export_ynds(t: &Terrain, stream: &std::path::Path) -> Result<usize, Strin
         s += " </Nodes>\n <Junctions />\n <JunctionRefs />\n</NodeDictionary>\n";
         std::fs::write(stream.join(format!("nodes{area}.ynd.xml")), s).map_err(|e| e.to_string())?;
     }
-    Ok(per_area.len())
+    Ok((per_area.len(), skipped.len()))
 }

@@ -71,6 +71,8 @@ pub struct Arch {
     pub bb_min: V3,
     pub bb_max: V3,
     pub radius: f32,
+    /// distance des textures détaillées du type (hdTextureDist)
+    pub hd_texture_dist: f32,
     pub lod_dist: f32,
     pub drawable_dict: u32,
     pub texture_dict: u32,
@@ -421,6 +423,7 @@ impl GameWorld {
                     bb_min: v3(a.bb_min[0], a.bb_min[1], a.bb_min[2]),
                     bb_max: v3(a.bb_max[0], a.bb_max[1], a.bb_max[2]),
                     radius: a.bs_radius,
+                    hd_texture_dist: a.hd_texture_dist,
                     lod_dist: a.lod_dist,
                     drawable_dict: a.drawable_dict,
                     texture_dict: a.texture_dict,

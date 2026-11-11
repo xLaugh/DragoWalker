@@ -227,6 +227,7 @@ fn setup_style(ctx: &egui::Context) {
 impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
+        crate::update::start();
         let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
@@ -1351,6 +1352,22 @@ impl eframe::App for DwApp {
                 }
             }
         }
+        // mode test : DW_TEST_READY_EXPORT="dossier" : exporte la ressource FiveM une fois le jeu chargé (projet ouvert
+        // en argument), après le contrôle des MLO
+        if self.game.world.is_some() && !self.shot_sent {
+            if let Ok(dir) = std::env::var("DW_TEST_READY_EXPORT") {
+                if !dir.is_empty() && std::env::var("DW_TEST_READY_DONE").is_err() {
+                    std::env::set_var("DW_TEST_READY_DONE", "1");
+                    self.mlo_tick();
+                    for r in &self.proj.mlo_res {
+                        println!("MLO {} : cartes {:?}, fichiers {}, collisions {}, scripts {:?}, déplacement {:?}", r.name, r.ymaps, r.assets.len(), r.ybns.len(), r.scripts, { let m = self.mlo_move(r); (m.p1 - m.p0, m.q.heading_deg()) });
+                    }
+                    println!("cartes du projet : {:?}, destination {}", self.proj.ymaps.iter().map(|y| (y.name.clone(), y.entities.len())).collect::<Vec<_>>(), self.target_ymap);
+                    let rep = self.export_project(std::path::Path::new(&dir), true);
+                    println!("export : {rep}");
+                }
+            }
+        }
         // mode test : DW_TEST_DOCKDRAG="clé,x,y[,tenir]" : commence à glisser ce panneau (voir dock_overlay)
         if self.frame == 100 {
             if let Some(k) = std::env::var("DW_TEST_DOCKDRAG").ok().and_then(|v| v.split(',').next().map(|s| s.trim().to_string())) {
@@ -1615,6 +1632,7 @@ impl eframe::App for DwApp {
 
         self.shortcuts(ctx);
 
+        crate::update::banner(ctx);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             self.menu_bar(ui, ctx);
         });

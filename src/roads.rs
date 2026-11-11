@@ -947,8 +947,71 @@ pub fn road_textures() -> Vec<(u64, TexData)> {
         .clone()
 }
 
+/// Sommets d'un .ybn : un triangle désigne ses sommets sur 15 bits (le 16e est un drapeau), donc au plus
+/// 32 767 sommets par pièce ; on garde de la marge.
+const MAX_COL_VERTS: usize = 32000;
+const MAX_COL_TRIS: usize = 20000;
+
+/// Prépare un maillage pour la physique : sommets fusionnés (au millimètre ; un modèle d'affichage en a
+/// beaucoup en double, à cause des coutures de textures), triangles plats ou invalides retirés (leur
+/// normale serait NaN pour le moteur physique du jeu).
+fn clean_collision_mesh(verts: &[V3], tris: &[(u32, u32, u32, u8)]) -> (Vec<V3>, Vec<(u32, u32, u32, u8)>) {
+    let mut key_of: std::collections::HashMap<(i64, i64, i64), u32> = std::collections::HashMap::new();
+    let mut out_v: Vec<V3> = Vec::new();
+    let mut weld: Vec<Option<u32>> = vec![None; verts.len()];
+    let mut get = |i: u32, out_v: &mut Vec<V3>| -> Option<u32> {
+        let p = *verts.get(i as usize)?;
+        if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
+            return None;
+        }
+        if let Some(w) = weld[i as usize] {
+            return Some(w);
+        }
+        let k = ((p.x * 1000.0).round() as i64, (p.y * 1000.0).round() as i64, (p.z * 1000.0).round() as i64);
+        let w = *key_of.entry(k).or_insert_with(|| {
+            out_v.push(p);
+            out_v.len() as u32 - 1
+        });
+        weld[i as usize] = Some(w);
+        Some(w)
+    };
+    let mut out_t = Vec::with_capacity(tris.len());
+    for t in tris {
+        let (Some(a), Some(b), Some(c)) = (get(t.0, &mut out_v), get(t.1, &mut out_v), get(t.2, &mut out_v)) else { continue };
+        if a == b || b == c || a == c {
+            continue;
+        }
+        let n = (out_v[b as usize] - out_v[a as usize]).cross(out_v[c as usize] - out_v[a as usize]);
+        if n.len() < 1e-6 {
+            continue;
+        }
+        out_t.push((a, b, c, t.3));
+    }
+    (out_v, out_t)
+}
+
+/// Découpe les triangles en pièces d'au plus MAX_COL_TRIS triangles et MAX_COL_VERTS sommets distincts.
+fn collision_chunks(tris: &[(u32, u32, u32, u8)]) -> Vec<&[(u32, u32, u32, u8)]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (i, t) in tris.iter().enumerate() {
+        let new = [t.0, t.1, t.2].iter().filter(|v| !seen.contains(v)).count();
+        if i > start && (i - start >= MAX_COL_TRIS || seen.len() + new > MAX_COL_VERTS) {
+            out.push(&tris[start..i]);
+            start = i;
+            seen.clear();
+        }
+        seen.extend([t.0, t.1, t.2]);
+    }
+    if start < tris.len() {
+        out.push(&tris[start..]);
+    }
+    out
+}
+
 /// Collisions d'un modèle quelconque (triangles dans le monde) au format XML de CodeWalker : une pièce
-/// GeometryBVH par paquet de 20 000 triangles, sommets relatifs au centre de la pièce (GetVertexPos
+/// GeometryBVH par paquet d'au plus 20 000 triangles et 32 000 sommets, sommets relatifs au centre de la pièce (GetVertexPos
 /// 0x0600410f), marge 0,04, une liste de types de surface `types` (index `m` de chaque triangle).
 pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u32]) -> String {
     use std::fmt::Write;
@@ -957,6 +1020,8 @@ pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u
         let c = (a + b) * 0.5;
         let _ = writeln!(s, "{ind}{}\n{ind}{}\n{ind}{}\n{ind}{}\n{ind}<SphereRadius value=\"{}\" />\n{ind}<Margin value=\"{margin}\" />\n{ind}<Volume value=\"1\" />\n{ind}<Inertia x=\"1\" y=\"1\" z=\"1\" />\n{ind}<MaterialIndex value=\"0\" />\n{ind}<MaterialColourIndex value=\"0\" />\n{ind}<ProceduralID value=\"0\" />\n{ind}<RoomID value=\"0\" />\n{ind}<PedDensity value=\"0\" />\n{ind}<UnkFlags value=\"0\" />\n{ind}<PolyFlags value=\"0\" />\n{ind}<UnkType value=\"1\" />", xyz("BoxMin", a), xyz("BoxMax", b), xyz("BoxCenter", c), xyz("SphereCenter", c), (b - a).len() * 0.5);
     };
+    let (verts, tris) = clean_collision_mesh(verts, tris);
+    let (verts, tris) = (&verts[..], &tris[..]);
     let (mut mn, mut mx) = (v3(f32::MAX, f32::MAX, f32::MAX), v3(f32::MIN, f32::MIN, f32::MIN));
     for t in tris {
         for i in [t.0, t.1, t.2] {
@@ -967,7 +1032,7 @@ pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<BoundsFile>\n <Bounds type=\"Composite\">\n");
     head(&mut s, "  ", mn, mx, 0.0);
     s.push_str("  <Children>\n");
-    for chunk in tris.chunks(20000) {
+    for chunk in collision_chunks(tris) {
         let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut order: Vec<u32> = Vec::new();
         let (mut bmn, mut bmx) = (v3(f32::MAX, f32::MAX, f32::MAX), v3(f32::MIN, f32::MIN, f32::MIN));
@@ -1001,4 +1066,44 @@ pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u
     }
     s.push_str("  </Children>\n </Bounds>\n</BoundsFile>\n");
     s
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::*;
+
+    #[test]
+    fn soudure_triangles_plats_et_limite_de_sommets() {
+        // 30 000 triangles, chacun avec 3 sommets à lui (90 000 sommets) : comme un modèle d'affichage
+        let mut verts = Vec::new();
+        let mut tris = Vec::new();
+        for i in 0..30000u32 {
+            let x = (i % 300) as f32;
+            let y = (i / 300) as f32;
+            let b = verts.len() as u32;
+            verts.extend([v3(x, y, 0.0), v3(x + 0.5, y, 0.0), v3(x, y + 0.5, 0.1)]);
+            tris.push((b, b + 1, b + 2, 0));
+        }
+        // doublons exacts d'un sommet, triangle plat, triangle dégénéré, sommet NaN
+        let b = verts.len() as u32;
+        verts.extend([v3(0.0, 0.0, 0.0), v3(1.0, 0.0, 0.0), v3(2.0, 0.0, 0.0), v3(f32::NAN, 0.0, 0.0)]);
+        tris.push((b, b + 1, b + 2, 0));
+        tris.push((b, b, b + 1, 0));
+        tris.push((b, b + 1, b + 3, 0));
+        let (cv, ct) = clean_collision_mesh(&verts, &tris);
+        assert_eq!(ct.len(), 30000);
+        assert!(cv.len() < verts.len());
+        for c in collision_chunks(&ct) {
+            let n: std::collections::HashSet<u32> = c.iter().flat_map(|t| [t.0, t.1, t.2]).collect();
+            assert!(n.len() <= MAX_COL_VERTS && c.len() <= MAX_COL_TRIS);
+        }
+        let xml = mesh_collision_xml(&verts, &tris, &[1]);
+        assert!(!xml.contains("NaN") && !xml.contains("inf"));
+        for line in xml.lines().filter(|l| l.contains("<Triangle")) {
+            for k in ["v1=\"", "v2=\"", "v3=\""] {
+                let v: u32 = line.split(k).nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                assert!(v < 32768);
+            }
+        }
+    }
 }

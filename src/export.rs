@@ -132,9 +132,23 @@ impl DwApp {
             }
         }
         if let Some(t) = self.proj.terrain.as_ref() {
-            match crate::traffic::export_ynds(t, &stream) {
-                Ok(0) => {}
-                Ok(k) => report.push(format!("Circulation : réseau de points de route écrit pour {k} carré(s) de 512 m (remplace celui du jeu à ces endroits).")),
+            // carrés que le jeu a déjà : jamais remplacés (voir traffic::export_ynds) ; sans le jeu chargé, on ne peut
+            // pas savoir : aucun carré n'est écrit
+            let w = self.game.world.as_deref();
+            let game_has = |a: u32| w.map(|w| w.vfs.files.iter().any(|f| f.name.eq_ignore_ascii_case(&format!("nodes{a}.ynd")))).unwrap_or(true);
+            match crate::traffic::export_ynds(t, &stream, &game_has) {
+                Ok((0, 0)) => {}
+                Ok((k, s)) => {
+                    if k > 0 {
+                        report.push(format!("Circulation : points de route écrits pour {k} carré(s) de 512 m où le jeu n'en a pas."));
+                    }
+                    if s > 0 {
+                        report.push(format!(
+                            "Circulation : {s} carré(s) gardent les points de route du jeu (les remplacer faisait planter le jeu, ses carrés voisins y étant reliés){}.",
+                            if w.is_none() { " — charge le jeu avant d'exporter pour savoir où le jeu n'en a pas" } else { "" }
+                        ));
+                    }
+                }
                 Err(e) => report.push(format!("Export de la circulation impossible : {e}")),
             }
         }

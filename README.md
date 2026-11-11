@@ -12,6 +12,10 @@ Rendez-vous sur la page [Releases](https://github.com/xLaugh/DragoWalker/release
 Au premier lancement, Windows peut afficher « Windows a protégé votre PC » : cliquez sur
 « Informations complémentaires » puis « Exécuter quand même ».
 
+## Mises à jour
+
+À partir de la 0.2.2, DragoWalker prévient au démarrage quand une nouvelle version est disponible et peut la télécharger et l'installer tout seul (version installée ou portable).
+
 ## Nécessaire
 
 - Windows 10 ou 11, 64 bits

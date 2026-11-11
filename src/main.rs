@@ -35,6 +35,7 @@ mod scenery;
 mod sollumz;
 mod texdecode;
 mod traffic;
+mod update;
 mod sollumz_ui;
 mod ui;
 mod view;

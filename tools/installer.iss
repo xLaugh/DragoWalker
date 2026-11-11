@@ -50,6 +50,8 @@ Name: "{autodesktop}\DragoWalker"; Filename: "{app}\DragoWalker.exe"; Tasks: des
 
 [Run]
 Filename: "{app}\DragoWalker.exe"; Description: "{cm:LaunchProgram,DragoWalker}"; Flags: nowait postinstall skipifsilent
+; mise à jour depuis l'app (setup lancé en /SILENT) : on relance DragoWalker
+Filename: "{app}\DragoWalker.exe"; Flags: nowait; Check: WizardSilent
 
 ; Les réglages (%APPDATA%\DragoWalker) et le cache des clés (%LOCALAPPDATA%\DragoWalker)
 ; sont gardés à la désinstallation, comme les projets de l'utilisateur.

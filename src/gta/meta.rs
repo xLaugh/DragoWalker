@@ -183,6 +183,8 @@ pub struct GArchetype {
     pub bb_max: [f32; 3],
     pub bs_centre: [f32; 3],
     pub bs_radius: f32,
+    /// distance des textures détaillées (CBaseArchetypeDef.hdTextureDist, +84 : entre bsRadius +80 et name +88)
+    pub hd_texture_dist: f32,
     pub lod_dist: f32,
     pub flags: u32,
     pub texture_dict: u32,
@@ -240,6 +242,7 @@ pub fn parse_ytyp(r: &Resource) -> Vec<GArchetype> {
                     bb_max: r.v3(a + 48),
                     bs_centre: r.v3(a + 64),
                     bs_radius: r.f32(a + 80),
+                    hd_texture_dist: r.f32(a + 84),
                     name: r.u32(a + 88),
                     texture_dict: r.u32(a + 92),
                     drawable_dict: r.u32(a + 100),
