@@ -187,6 +187,7 @@ impl DwApp {
         match self.tool {
             Tool::Select | Tool::Rect => self.select_tool(&resp, ptr, press_origin, mods),
             Tool::Terrain => self.terrain_tool(&resp, ptr, &ctx),
+            Tool::Life => self.life_tool(&resp, ptr),
             Tool::Place => {
                 if resp.drag_started_by(PointerButton::Primary) {
                     let start = press_origin.or(ptr).unwrap_or_default();
@@ -259,7 +260,7 @@ impl DwApp {
                 ctx.request_repaint();
             }
         }
-        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default() });
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default() });
         render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
         drop(gctx);
         self.game.drawn = drawn;
@@ -292,6 +293,7 @@ impl DwApp {
         }
         self.draw_lists_overlay(&painter);
         self.draw_scenery_overlay(&painter, hover_pos);
+        self.draw_life_overlay(&painter, hover_pos);
         // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
         // MouseRayCollisionVisible quand CtrlPressed) — Ctrl + clic y prend l'objet
         if (mods.command || std::env::var("DW_TEST_CTRL").is_ok()) && self.tool == Tool::Select {
@@ -325,6 +327,14 @@ impl DwApp {
             }
             Tool::Select | Tool::Rect => {}
             Tool::Terrain => self.draw_terrain_brush(&painter, hover_pos),
+            Tool::Life => {
+                // parking en cours de tracé
+                if let (Some(a), Some(g)) = (self.life.drag_start, self.mouse_ground) {
+                    if let (Some((pa, _)), Some((pb, _))) = (self.cam.project(a), self.cam.project(g)) {
+                        painter.line_segment([pa, pb], Stroke::new(2.0_f32, Color32::from_rgb(255, 210, 60)));
+                    }
+                }
+            }
         }
         if let (Drag::Rect(a), Some(b)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(*a, b);
@@ -367,6 +377,12 @@ impl DwApp {
                 _ => "Terrain : glisser pour sculpter · + / - rayon · F2–F9 pinceaux (menu Terrain)",
             },
             Tool::Rect => "Rectangle : glisser n'importe où pour sélectionner tout ce qui est dedans · Ctrl ou Maj = ajouter · Suppr = tout supprimer",
+            Tool::Life => match self.life.tool {
+                crate::life::LifeTool::Car => "Véhicule garé : clic pour en poser un (capot vers l'avant de la caméra)",
+                crate::life::LifeTool::Parking => "Parking : glisser pour tracer une rangée de places",
+                crate::life::LifeTool::Ped => "PNJ : clic pour en poser un (face à la caméra)",
+                crate::life::LifeTool::Route => "Ronde : clic pour les points · double-clic ou Entrée pour créer le PNJ · Échap pour annuler",
+            },
         };
         let galley = painter.layout_no_wrap(help.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
         let pos = rect.left_bottom() + egui::vec2(10.0, -10.0 - galley.size().y);
@@ -626,12 +642,26 @@ impl DwApp {
             }
             (false, None) => {}
         }
+        // Ctrl+H : isoler la sélection (le contraire de H, cacher) ; de nouveau pour revenir
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::H))) {
+            self.toggle_isolate();
+        }
         if ctx.input(|i| i.key_pressed(Key::End)) && !self.selected.is_empty() {
             let n = self.snap_selected_to_ground(true);
             self.status = format!("{n} objet(s) posé(s) au sol (Fin).");
         }
         if ctx.input(|i| i.key_pressed(Key::I) && !i.modifiers.command) {
             self.intlib.open = !self.intlib.open;
+        }
+        // ronde de PNJ en cours : Entrée pour créer, Échap pour annuler
+        if self.tool == Tool::Life && !self.life.route.is_empty() {
+            let (enter, esc) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::NONE, Key::Escape)));
+            if enter {
+                self.finish_ped_route();
+            }
+            if esc {
+                self.life.route.clear();
+            }
         }
         if ctx.input(|i| i.key_pressed(Key::N) && !i.modifiers.command) {
             self.buildings.open = !self.buildings.open;
@@ -663,6 +693,7 @@ impl DwApp {
         }
         if k[1] {
             self.game.isolate = None;
+            self.isolate_sel = None;
             self.set_selection(vec![]);
             self.drag = Drag::None;
         }

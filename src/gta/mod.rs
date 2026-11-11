@@ -81,7 +81,8 @@ pub fn probe(game: &str, cw: &str) {
                     let mut v: Vec<(String, usize, crate::math::V3)> = Vec::new();
                     for h in w.archetypes.keys() {
                         let n = w.name_of(*h).to_lowercase();
-                        if pre.iter().any(|p| n.starts_with(p.as_str())) {
+                        // « *mot » : le nom contient ce mot (sinon : commence par)
+                        if pre.iter().any(|p| match p.strip_prefix('*') { Some(w) => n.contains(w), None => n.starts_with(p.as_str()) }) {
                             let (a, b) = w.arch_box(*h);
                             v.push((n, uses.get(h).copied().unwrap_or(0), b - a));
                         }
@@ -91,6 +92,118 @@ pub fn probe(game: &str, cw: &str) {
                     for (n, u, s) in v.iter().take(400) {
                         println!("   {n:<36} placé {u:>6} fois  taille {:.1} x {:.1} x {:.1}", s.x, s.y, s.z);
                     }
+                }
+                // DW_TRAFFIC_STATS=1 : feux du jeu regroupés par carrefour ; pour chaque feu, le côté où il se tient
+                // (avant / après le centre pour les voitures qu'il regarde) et le sens de son bras
+                if std::env::var("DW_TRAFFIC_STATS").is_ok() {
+                    use crate::math::v3;
+                    let names = ["prop_traffic_01a", "prop_traffic_01b", "prop_traffic_01d", "prop_traffic_03a", "prop_sign_road_01a"];
+                    for nm in names {
+                        let h = crypto::joaat(nm);
+                        let list: Vec<&world::WEnt> = w.ents.iter().filter(|e| e.arch == h).collect();
+                        let lights: Vec<&world::WEnt> = w.ents.iter().filter(|e| [crypto::joaat("prop_traffic_01a"), crypto::joaat("prop_traffic_01b"), crypto::joaat("prop_traffic_01d")].contains(&e.arch)).collect();
+                        let (mut near, mut far, mut arm_in, mut arm_out, mut groups) = (0, 0, 0, 0, 0);
+                        let mut dists = Vec::new();
+                        let mut lat = Vec::new();
+                        for e in &list {
+                            // carrefour : feux à moins de 35 m (centre = moyenne)
+                            let g: Vec<&&world::WEnt> = lights.iter().filter(|o| o.pos.dist2d(e.pos) < 35.0).collect();
+                            if g.len() < 3 {
+                                continue;
+                            }
+                            groups += 1;
+                            let c = g.iter().fold(v3(0.0, 0.0, 0.0), |a, o| a + o.pos) * (1.0 / g.len() as f32);
+                            let f = e.rot.rotate(v3(0.0, -1.0, 0.0));
+                            let arm = e.rot.rotate(v3(-1.0, 0.0, 0.0));
+                            let rel = e.pos - c;
+                            let along = rel.x * f.x + rel.y * f.y;
+                            let side = rel.x * arm.x + rel.y * arm.y;
+                            if along > 0.0 { near += 1 } else { far += 1 }
+                            if side < 0.0 { arm_in += 1 } else { arm_out += 1 }
+                            dists.push(along.abs());
+                            lat.push(side.abs());
+                        }
+                        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let med = |v: &Vec<f32>| v.get(v.len() / 2).copied().unwrap_or(0.0);
+                        println!("{nm} : {} placés, {groups} dans un carrefour ; du côté des voitures regardées (avant le centre) {near}, après le centre {far} ; bras vers le centre {arm_in}, vers l'extérieur {arm_out} ; distance médiane au centre le long {:.1} m, en travers {:.1} m", list.len(), med(&dists), med(&lat));
+                    }
+                }
+                // DW_TXD_GREP="mot1,mot2" : textures des dictionnaires du jeu (.ytd) dont le nom contient un de ces
+                // mots (nom de la texture : pointeur à 0x28 de TextureBase, comme TextureBase::Read de CodeWalker)
+                if let Ok(list) = std::env::var("DW_TXD_GREP") {
+                    let words: Vec<String> = list.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+                    let only = std::env::var("DW_TXD_FILE").unwrap_or_default().to_lowercase();
+                    let mut shown = 0;
+                    for f in w.vfs.files.iter().filter(|f| f.name.ends_with(".ytd") && f.name.contains(only.as_str())) {
+                        let Some(r) = w.vfs.read_resource(f, &w.keys) else { continue };
+                        let Some(texs) = r.ptr(r.u64(0x30)) else { continue };
+                        let n = r.u16(0x28) as usize;
+                        let mut hits = Vec::new();
+                        for i in 0..n.min(4096) {
+                            let Some(t) = r.ptr(r.u64(texs + i * 8)) else { continue };
+                            let Some(np) = r.ptr(r.u64(t + 0x28)) else { continue };
+                            let mut e = np;
+                            while e < r.data.len() && r.data[e] != 0 && e - np < 128 {
+                                e += 1;
+                            }
+                            let name = String::from_utf8_lossy(&r.data[np..e]).to_lowercase();
+                            if words.iter().any(|wd| name.contains(wd.as_str())) {
+                                hits.push(format!("{name} {}x{}", r.u16(t + 0x50), r.u16(t + 0x52)));
+                            }
+                        }
+                        if !hits.is_empty() && shown < 600 {
+                            println!("   {} : {}", f.path, hits.join(", "));
+                            shown += 1;
+                        }
+                    }
+                    println!("dictionnaires affichés : {shown}");
+                }
+                // DW_BLOCK_DUMP="structure,extension,nombre" : écrit les fichiers qui contiennent ce type de bloc
+                if let Ok(v) = std::env::var("DW_BLOCK_DUMP") {
+                    let p: Vec<&str> = v.split(',').collect();
+                    let first = p.first().copied().unwrap_or("1860713439");
+                    let want = first.parse::<u32>().unwrap_or_else(|_| crypto::joaat(&first.to_lowercase()));
+                    let ext = p.get(1).copied().unwrap_or(".ymap");
+                    let max: usize = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+                    let dir = std::env::temp_dir().join("dragowalker_dump2");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut n = 0;
+                    for f in w.vfs.files.iter().filter(|f| f.name.ends_with(ext)) {
+                        if n >= max {
+                            break;
+                        }
+                        let Some(r) = w.vfs.read_resource(f, &w.keys) else { continue };
+                        let Some(m) = meta::Meta::parse(&r) else { continue };
+                        if m.blocks.iter().any(|b| b.0 == want) {
+                            if let Some(raw) = w.vfs.raw_resource_file(f) {
+                                let _ = std::fs::write(dir.join(&f.name), raw);
+                                println!("   {} ", f.path);
+                                n += 1;
+                            }
+                        }
+                    }
+                    println!("fichiers avec ce bloc : {n} dans {}", dir.display());
+                }
+                // DW_FILE_DUMP="extension,mot[,nombre]" : écrit les fichiers du jeu correspondants (ressources brutes)
+                // dans le dossier temporaire, pour les relire en XML avec CodeWalker
+                if let Ok(v) = std::env::var("DW_FILE_DUMP") {
+                    let p: Vec<&str> = v.split(',').collect();
+                    let (ext, word) = (p.first().copied().unwrap_or(".ymap"), p.get(1).copied().unwrap_or(""));
+                    let max: usize = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
+                    let dir = std::env::temp_dir().join("dragowalker_dump");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut n = 0;
+                    for f in w.vfs.files.iter().filter(|f| f.name.ends_with(ext) && f.name.contains(word)) {
+                        if n >= max {
+                            break;
+                        }
+                        if let Some(raw) = w.vfs.raw_resource_file(f) {
+                            let _ = std::fs::write(dir.join(&f.name), raw);
+                            n += 1;
+                        }
+                    }
+                    println!("fichiers écrits : {n} dans {}", dir.display());
                 }
                 // DW_YTYP_FX=1 : types d'objets du jeu qui portent un effet de particules ; écrit les .ytyp qui en
                 // contiennent dans le dossier temporaire (pour les relire en XML avec CodeWalker)
@@ -158,7 +271,18 @@ pub fn probe(game: &str, cw: &str) {
                             Some(m) => {
                                 println!("   {} sommets, {} triangles, {} parties", m.verts.len(), m.idx.len() / 3, m.geoms.len());
                                 for (gi, g) in m.geoms.iter().enumerate() {
-                                    println!("   partie {gi} : {} triangles, texture {} (clé {:x}), découpe {}", g.count / 3, w.name_of(g.tex), l.part_keys.get(gi).copied().unwrap_or(0), g.cutout);
+                                    // centre et normale moyenne de la partie (pour savoir de quel côté regarde un feu, un panneau)
+                                    let (mut c, mut nn, mut k) = ([0f32; 3], [0f32; 3], 0f32);
+                                    for t in (g.first as usize)..((g.first + g.count) as usize).min(m.idx.len()) {
+                                        let v = &m.verts[m.idx[t] as usize];
+                                        for q in 0..3 {
+                                            c[q] += v.pos[q];
+                                            nn[q] += v.nrm[q];
+                                        }
+                                        k += 1.0;
+                                    }
+                                    let k = k.max(1.0);
+                                    println!("   partie {gi} : {} triangles, texture {} (clé {:x}), découpe {}, centre ({:.2} {:.2} {:.2}), normale moyenne ({:.2} {:.2} {:.2})", g.count / 3, w.name_of(g.tex), l.part_keys.get(gi).copied().unwrap_or(0), g.cutout, c[0] / k, c[1] / k, c[2] / k, nn[0] / k, nn[1] / k, nn[2] / k);
                                 }
                             }
                             None => println!("   illisible"),

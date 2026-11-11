@@ -185,6 +185,8 @@ pub struct GameCtx<'a> {
     pub hidden_lod: &'a std::collections::HashSet<(u8, u32)>,
     /// intérieur vu seul
     pub isolate: Option<u32>,
+    /// objets du projet vus seuls (bouton « Isoler »)
+    pub only: Option<&'a std::collections::HashSet<u64>>,
     /// terrain de l'éditeur : (modèle, origine, coins)
     pub terrain: Option<(u32, V3, V3, V3)>,
     /// zones d'eau du créateur de terrain (min x, min y, max x, max y, hauteur)
@@ -289,7 +291,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
     let mut cand: Vec<(f32, u32)> = Vec::new();
     let near_list = match g.isolate {
         Some(iso) => vec![iso],
-        None if g.empty_map => Vec::new(),
+        None if g.empty_map || g.only.is_some() => Vec::new(),
         None => w.visible_near(eye, cam.target, radius, g.lod_scale),
     };
     for ei in near_list {
@@ -371,7 +373,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             continue;
         }
         let Some(e) = proj.world_entity(r) else { continue };
-        if g.hidden_ids.contains(&e.id) {
+        if g.hidden_ids.contains(&e.id) || g.only.map(|o| !o.contains(&e.id)).unwrap_or(false) {
             continue;
         }
         if let Some(m) = &e.mlo {
@@ -406,7 +408,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         });
     }
     // terrain de l'éditeur
-    if let (Some((arch, o, mn, mx)), None) = (g.terrain, g.isolate) {
+    if let (Some((arch, o, mn, mx)), None, None) = (g.terrain, g.isolate, g.only) {
         insts.push(Inst {
             arch,
             m: model_matrix([o.x, o.y, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
@@ -425,7 +427,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         probe: g.probe.map(|p| [p.x, p.y]),
         light_vp: if cam.map_view || !g.shadows { None } else { Some(sun_view(cam.target, (cam.cur_dist * 1.2).clamp(60.0, 700.0))) },
         // carte vide : seulement une mer plate à 0 m autour du terrain
-        water: if g.isolate.is_some() {
+        water: if g.isolate.is_some() || g.only.is_some() {
             std::sync::Arc::new(Vec::new())
         } else {
             let mut v: Vec<[f32; 5]> = if g.empty_map { vec![[-9000.0, -9000.0, 9000.0, 9000.0, 0.0]] } else { w.water.as_ref().clone() };

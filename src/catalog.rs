@@ -125,10 +125,23 @@ pub fn set_custom_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
     }
 }
 
-/// Taille réelle d'un type (modèle personnel d'abord, puis jeu), si connue.
+static MLO_BOXES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
+
+/// Tailles des modèles des ressources MLO importées.
+pub fn set_mlo_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
+    let lock = MLO_BOXES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = lock.write() {
+        *g = m;
+    }
+}
+
+/// Taille réelle d'un type (modèle personnel d'abord, puis MLO importé, puis jeu), si connue.
 pub fn game_box(name: &str) -> Option<(V3, V3)> {
     let n = name.to_ascii_lowercase();
     if let Some(c) = CUSTOM_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
+        return Some(c);
+    }
+    if let Some(c) = MLO_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
         return Some(c);
     }
     let g = GAME_BOXES.get()?.read().ok()?;

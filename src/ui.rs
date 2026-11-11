@@ -39,6 +39,10 @@ impl DwApp {
                     self.import_dialog();
                     ui.close_menu();
                 }
+                if item(ui, true, "Importer une ressource MLO (dossier FiveM)…", "") {
+                    self.import_mlo_dialog();
+                    ui.close_menu();
+                }
                 if item(ui, true, "Exporter en XML…", "Ctrl+E") {
                     self.export_xml(false);
                     ui.close_menu();
@@ -79,6 +83,10 @@ impl DwApp {
                 if item(ui, has_sel, "Dupliquer la sélection", "Ctrl+D") {
                     let off = self.copy_offset();
                     self.duplicate_selected(off);
+                    ui.close_menu();
+                }
+                if item(ui, has_sel || self.isolate_sel.is_some(), if self.isolate_sel.is_some() { "Revenir à tout voir" } else { "Isoler la sélection" }, "Ctrl+H") {
+                    self.toggle_isolate();
                     ui.close_menu();
                 }
                 if item(ui, has_sel, "Poser au sol", "Maj / Fin") {
@@ -213,6 +221,12 @@ impl DwApp {
                 if ui.selectable_label(self.ai_open, RichText::new("Assistant IA").strong()).on_hover_text("Fenêtre de l'assistant : décris ce que tu veux construire").clicked() {
                     self.ai_open = !self.ai_open;
                 }
+                if ui.selectable_label(self.life.open, RichText::new("Vie (PNJ, véhicules)").strong()).on_hover_text("Véhicules garés, parkings, PNJ avec activité ou ronde, circulation sur tes routes").clicked() {
+                    self.life.open = !self.life.open;
+                    if self.life.open {
+                        self.tool = Tool::Life;
+                    }
+                }
                 if ui.selectable_label(self.toolbox_open, RichText::new("Boîte à outils").strong()).on_hover_text("Ouvrir / fermer la boîte à outils").clicked() {
                     self.toolbox_open = !self.toolbox_open;
                     self.panels_hidden = false;
@@ -264,9 +278,92 @@ impl DwApp {
         }
     }
 
+    /// Isoler : seuls les objets choisis restent affichés (ni carte du jeu, ni terrain, ni eau) ; Échap revient.
+    pub fn toggle_isolate(&mut self) {
+        if self.isolate_sel.take().is_some() {
+            self.status = "Tout est de nouveau affiché.".into();
+            return;
+        }
+        if self.selected.is_empty() {
+            self.status = "Choisis d'abord un ou plusieurs objets à isoler.".into();
+            return;
+        }
+        self.isolate_sel = Some(self.sel_set.clone());
+        self.status = format!("{} objet(s) vus seuls · Échap ou Ctrl+H pour revenir.", self.selected.len());
+    }
+
+    /// Bandeau quand une sélection est vue seule.
+    pub fn isolate_banner(&mut self, ctx: &egui::Context) {
+        let Some(n) = self.isolate_sel.as_ref().map(|s| s.len()) else { return };
+        egui::Area::new(egui::Id::new("iso_sel_banner")).fixed_pos(self.cam.rect.center_top() + egui::vec2(-150.0, 8.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Isolé : {n} objet(s)")).strong().color(Color32::from_rgb(255, 200, 90)));
+                    if ui.button("Tout revoir (Échap)").clicked() {
+                        self.isolate_sel = None;
+                    }
+                });
+            });
+        });
+    }
+
+    /// « Visible jusqu'à » : distance d'affichage (lodDist) de toute la sélection, et « Toujours chargé »
+    /// (priorityLevel PRI_REQUIRED ; sinon PRI_OPTIONAL_HIGH, que le jeu peut ne pas charger selon ses réglages).
+    pub fn visible_until_ui(&mut self, ui: &mut egui::Ui) {
+        let refs: Vec<ItemRef> = self.selected.iter().filter_map(|id| self.proj.find_id(*id)).collect();
+        if refs.is_empty() {
+            return;
+        }
+        let dists: Vec<f32> = refs.iter().filter_map(|r| self.proj.ent(*r).map(|e| e.lod_dist)).collect();
+        let (lo, hi) = dists.iter().fold((f32::MAX, 0.0f32), |(a, b), d| (a.min(*d), b.max(*d)));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Visible jusqu'à");
+            ui.label(RichText::new(if (hi - lo).abs() < 0.5 { format!("{lo:.0} m") } else { format!("{lo:.0}–{hi:.0} m") }).strong());
+        });
+        let mut set: Option<Option<f32>> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (n, d, tip) in [
+                ("Proche", 100.0, "100 m : petits objets, détails"),
+                ("Normal", 300.0, "300 m"),
+                ("Loin", 1000.0, "1 000 m : grands bâtiments"),
+                ("Toujours", 3000.0, "3 000 m : repères visibles de partout"),
+            ] {
+                if ui.small_button(n).on_hover_text(tip).clicked() {
+                    set = Some(Some(d));
+                }
+            }
+            if ui.small_button("Comme le jeu").on_hover_text("La distance de ce type d'objet dans GTA V ; les bâtiments du jeu copiés emportent en plus leur version lointaine à l'export").clicked() {
+                set = Some(None);
+            }
+        });
+        if let Some(choice) = set {
+            self.push_undo();
+            let w = self.game.world.as_ref();
+            let mut n = 0;
+            for r in &refs {
+                let game = w.and_then(|w| self.proj.ent(*r).and_then(|e| w.archetypes.get(&crate::gta::crypto::joaat(&e.archetype.to_lowercase()))).map(|a| a.lod_dist)).filter(|d| *d > 0.0);
+                if let Some(e) = self.proj.ent_mut(*r) {
+                    e.lod_dist = choice.or(game).unwrap_or(crate::mech::ENTITY_LOD_DIST);
+                    n += 1;
+                }
+            }
+            self.status = format!("{n} objet(s) : distance d'affichage changée.");
+        }
+        let all_req = refs.iter().all(|r| self.proj.ent(*r).map(|e| e.priority == "PRI_REQUIRED").unwrap_or(true));
+        let mut req = all_req;
+        if ui.checkbox(&mut req, "Toujours chargé").on_hover_text("Le jeu charge toujours ces objets (PRI_REQUIRED) ; sinon il peut les sauter selon ses réglages graphiques (PRI_OPTIONAL_HIGH)").changed() {
+            self.push_undo();
+            for r in &refs {
+                if let Some(e) = self.proj.ent_mut(*r) {
+                    e.priority = if req { "PRI_REQUIRED".into() } else { "PRI_OPTIONAL_HIGH".into() };
+                }
+            }
+        }
+    }
+
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None };
+        self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -426,7 +523,11 @@ impl DwApp {
                     }
                 }
             }
+            if ui.button("Importer un MLO…").on_hover_text("Dossier d'une ressource MLO FiveM (fxmanifest.lua, stream/ avec .ydr, .ytd, .ytyp, .ymap, .ybn) : le bâtiment et son intérieur apparaissent, se déplacent et se tournent ; les collisions suivent à l'export ; l'auteur et la licence sont gardés").clicked() {
+                self.import_mlo_dialog();
+            }
         });
+        self.mlo_list_ui(ui);
         ui.separator();
         let mut remove_ymap = None;
         let mut remove_ytyp = None;
@@ -578,6 +679,16 @@ impl DwApp {
     fn selection_tab(&mut self, ui: &mut egui::Ui) {
         if !self.selected.is_empty() && ui.button(RichText::new("Sélection intelligente : tout ce qui va avec (J)").strong()).on_hover_text("Prend tout ce qui est dans ou sur l'objet choisi : props, décalques, intérieurs, versions lointaines… (ex. tout un yacht)").clicked() {
             self.smart_select();
+        }
+        if !self.selected.is_empty() {
+            ui.horizontal(|ui| {
+                let label = if self.isolate_sel.is_some() { "Tout revoir" } else { "Isoler" };
+                if ui.button(RichText::new(label).strong()).on_hover_text("Ne montrer que la sélection (ni carte du jeu, ni terrain) · Échap ou Ctrl+H pour revenir").clicked() {
+                    self.toggle_isolate();
+                }
+            });
+            self.visible_until_ui(ui);
+            ui.separator();
         }
         if self.selected.is_empty() {
             ui.label("Rien n'est sélectionné.");

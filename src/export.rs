@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 impl DwApp {
     /// Ymaps du projet prêts à exporter, avec ce que le fichier d'origine du jeu contenait en plus.
     fn ymaps_for_export(&self, dll: Option<&Path>, report: &mut Vec<String>) -> Vec<Ymap> {
-        let mut out: Vec<Ymap> = self.proj.ymaps.iter().filter(|y| !y.sample && (!y.entities.is_empty() || y.from_game)).cloned().collect();
+        let mut out: Vec<Ymap> = self.proj.ymaps.iter().filter(|y| !y.sample && (!y.entities.is_empty() || !y.car_gens.is_empty() || y.from_game)).cloned().collect();
         let (Some(dll), Some(w)) = (dll, self.game.world.as_ref()) else {
             if out.iter().any(|y| y.from_game) {
                 report.push("CodeWalker introuvable : les sections d'origine (véhicules, lumières…) des cartes du jeu modifiées ne sont pas reprises.".into());
@@ -76,12 +76,33 @@ impl DwApp {
         let mut report = Vec::new();
         let ymaps = self.ymaps_for_export(dll.as_deref(), &mut report);
         let mut n = 0;
+        // cartes du projet : les bâtiments du jeu copiés emportent leur version lointaine (carte « _lod »)
+        let mut lod_ymaps: Vec<crate::model::Ymap> = Vec::new();
+        let mut lod_n = 0;
         for y in &ymaps {
-            if std::fs::write(stream.join(format!("{}.ymap.xml", y.name)), xmlio::write_ymap(y, &self.proj)).is_ok() {
+            let (hd, lod) = if y.parent.is_empty() {
+                let (h, l, k) = self.lod_split(y);
+                lod_n += k;
+                (h, l)
+            } else {
+                (y.clone(), None)
+            };
+            if std::fs::write(stream.join(format!("{}.ymap.xml", hd.name)), xmlio::write_ymap(&hd, &self.proj)).is_ok() {
                 n += 1;
             }
+            if let Some(l) = lod {
+                if std::fs::write(stream.join(format!("{}.ymap.xml", l.name)), xmlio::write_ymap(&l, &self.proj)).is_ok() {
+                    n += 1;
+                }
+                lod_ymaps.push(l);
+            }
         }
-        for t in &self.proj.ytyps {
+        if lod_n > 0 {
+            report.push(format!("{lod_n} bâtiment(s) copié(s) avec leur version lointaine du jeu (visibles de loin comme dans GTA V)."));
+        }
+        // les intérieurs des MLO importés sont recopiés tels quels (export_mlos), pas réécrits
+        let external = self.mlo_external_ytyps();
+        for t in self.proj.ytyps.iter().filter(|t| !external.contains(&t.name.to_lowercase())) {
             if std::fs::write(stream.join(format!("{}.ytyp.xml", t.name)), xmlio::write_ytyp(t)).is_ok() {
                 n += 1;
             }
@@ -101,12 +122,31 @@ impl DwApp {
             Ok(_) => {}
             Err(e) => report.push(format!("Export du terrain impossible : {e}")),
         }
+        // circulation : points de route générés depuis les routes du terrain (nodesNNN.ynd)
+        if let Ok(rd) = std::fs::read_dir(&stream) {
+            for f in rd.flatten() {
+                let n = f.file_name().to_string_lossy().to_lowercase();
+                if n.starts_with("nodes") && n.contains(".ynd") && f.path().is_file() {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        if let Some(t) = self.proj.terrain.as_ref() {
+            match crate::traffic::export_ynds(t, &stream) {
+                Ok(0) => {}
+                Ok(k) => report.push(format!("Circulation : réseau de points de route écrit pour {k} carré(s) de 512 m (remplace celui du jeu à ces endroits).")),
+                Err(e) => report.push(format!("Export de la circulation impossible : {e}")),
+            }
+        }
         // bâtiments du jeu copiés : dépendances .ytyp et collisions
-        match self.export_buildings(&stream) {
+        match self.export_buildings(&stream, &lod_ymaps) {
             Ok(Some(m)) => report.push(m),
             Ok(None) => {}
             Err(e) => report.push(format!("Export des bâtiments copiés impossible : {e}")),
         }
+        // MLO importés : fichiers du créateur, collisions déplacées, crédits
+        let (mlo_report, mlo_manifest) = self.export_mlos(&out, &stream, dll.as_deref());
+        report.extend(mlo_report);
         // conversion en fichiers binaires du jeu par CodeWalker
         let mut binary_ok = false;
         match &dll {
@@ -144,11 +184,29 @@ impl DwApp {
             if let Some(t) = &terrain_ytyp {
                 man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{t}.ytyp'\n");
             }
+            if !mlo_manifest.is_empty() {
+                man += &format!("\n{mlo_manifest}");
+            }
             for t in std::fs::read_dir(&self.sollumz.dir).into_iter().flatten().flatten() {
                 let n = t.file_name().to_string_lossy().to_lowercase();
                 if let Some(stem) = n.strip_suffix(".ytyp.xml") {
                     man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{stem}.ytyp'\n");
                 }
+            }
+            // voitures de PNJ qui roulent : script client
+            let _ = std::fs::remove_file(out.join("dw_traffic.lua"));
+            if let Some(t) = self.proj.terrain.as_ref() {
+                match crate::traffic::export_npc_script(t, &out) {
+                    Ok(true) => man += "\nclient_script 'dw_traffic.lua'\n",
+                    Ok(false) => {}
+                    Err(e) => report.push(format!("Export des voitures de PNJ impossible : {e}")),
+                }
+            }
+            // PNJ : script client
+            match self.export_peds(&out) {
+                Ok(true) => man += "\nclient_script 'dw_peds.lua'\n",
+                Ok(false) => {}
+                Err(e) => report.push(format!("Export des PNJ impossible : {e}")),
             }
             // eau du terrain : water.xml complet chargé par un script client (native FiveM LoadWaterFromPath)
             if out.join("dw_water.xml").exists() {

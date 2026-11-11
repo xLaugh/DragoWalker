@@ -583,7 +583,6 @@ pub fn shared_tex_name(txd: &str, key: u64) -> String {
 /// Comme `write_ydr_xml` ; avec `shared_txd`, les textures ne sont pas écrites à côté du modèle : le modèle
 /// les cherche par leur nom dans ce dictionnaire partagé (.ytd), déclaré dans le type d'objet (ytyp).
 pub fn write_ydr_xml_ex(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], textures: &[(u64, TexData)], shared_txd: Option<&str>) -> Result<PathBuf, String> {
-    use std::fmt::Write;
     let prefix = shared_txd.unwrap_or(name).to_string();
     let tex_name = |k: u64| shared_tex_name(&prefix, k);
     if shared_txd.is_none() {
@@ -593,11 +592,19 @@ pub fn write_ydr_xml_ex(dir: &Path, name: &str, model: &RModel, part_keys: &[u64
             std::fs::write(tex_dir.join(format!("{}.dds", tex_name(*k))), write_dds(t)).map_err(|e| e.to_string())?;
         }
     }
+    write_ydr_xml_named(dir, name, model, part_keys, &|k| if textures.iter().any(|t| t.0 == k) { Some(tex_name(k)) } else { None })
+}
+
+/// Écrit un modèle au format XML de CodeWalker sans textures à côté : `tex_name` donne le nom de la texture de
+/// chaque clé (None = sans texture). Sert aussi pour les vraies textures du jeu (nom de la texture du jeu,
+/// trouvée par le jeu dans le dictionnaire déclaré par le type d'objet).
+pub fn write_ydr_xml_named(dir: &Path, name: &str, model: &RModel, part_keys: &[u64], tex_name: &dyn Fn(u64) -> Option<String>) -> Result<PathBuf, String> {
+    use std::fmt::Write;
     // un matériau par couple (texture, découpe)
     let mut shaders: Vec<(u64, bool)> = Vec::new();
     let mut shader_of = Vec::new();
     for (g, k) in model.geoms.iter().zip(part_keys.iter()) {
-        let key = (if textures.iter().any(|t| t.0 == *k) { *k } else { 0 }, g.cutout);
+        let key = (if tex_name(*k).is_some() { *k } else { 0 }, g.cutout);
         let i = shaders.iter().position(|s| *s == key).unwrap_or_else(|| {
             shaders.push(key);
             shaders.len() - 1
@@ -623,8 +630,8 @@ pub fn write_ydr_xml_ex(dir: &Path, name: &str, model: &RModel, part_keys: &[u64
     for (k, cut) in &shaders {
         let sh = if *cut { "cutout" } else { "default" };
         let _ = writeln!(s, "   <Item>\n    <Name>{sh}</Name>\n    <FileName>{sh}.sps</FileName>\n    <RenderBucket value=\"{}\" />\n    <Parameters>", if *cut { 3 } else { 0 });
-        if *k != 0 {
-            let _ = writeln!(s, "     <Item name=\"DiffuseSampler\" type=\"Texture\">\n      <Name>{}</Name>\n     </Item>", tex_name(*k));
+        if let Some(tn) = if *k != 0 { tex_name(*k) } else { None } {
+            let _ = writeln!(s, "     <Item name=\"DiffuseSampler\" type=\"Texture\">\n      <Name>{tn}</Name>\n     </Item>");
         }
         let _ = writeln!(s, "    </Parameters>\n   </Item>");
     }

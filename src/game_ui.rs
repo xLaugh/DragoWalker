@@ -281,6 +281,9 @@ impl DwApp {
                     w.archetypes.len()
                 );
                 self.game.gpu = Some(Arc::new(Mutex::new(crate::gpu::Gpu::new(w.model_source()))));
+                // vraies textures du sol (terrain, routes) lues dans les dictionnaires partagés du jeu
+                crate::groundtex::load(&w);
+                self.terrain.dirty = true;
                 self.game.world = Some(Box::new(w));
                 // la ville d'exemple laisse la place à la vraie carte : Legion Square
                 self.opts.show_sample = false;

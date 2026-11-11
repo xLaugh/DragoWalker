@@ -118,6 +118,18 @@ pub fn write_ymap(y: &Ymap, proj: &Project) -> String {
         ("DistantLODLightsSOA", " <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n"),
     ];
     for (tag, def) in defaults {
+        // véhicules garés du projet (avec ceux d'origine d'une carte du jeu copiée)
+        if *tag == "carGenerators" && !y.car_gens.is_empty() {
+            let ours = crate::life::cargens_xml(&y.car_gens);
+            match y.raw_sections.iter().find(|(t, _)| t == tag).map(|(_, r)| r.trim().to_string()).filter(|r| r.contains("</carGenerators>")) {
+                Some(raw) => {
+                    let items = ours.trim().trim_start_matches("<carGenerators>").trim_end_matches("</carGenerators>").to_string();
+                    let _ = writeln!(o, " {}", raw.replacen("</carGenerators>", &format!("{items}</carGenerators>"), 1));
+                }
+                None => o.push_str(&ours),
+            }
+            continue;
+        }
         if let Some((_, raw)) = y.raw_sections.iter().find(|(t, _)| t == tag) {
             let _ = writeln!(o, " {}", raw.trim());
         } else {

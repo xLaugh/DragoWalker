@@ -86,6 +86,127 @@ fn fx_color(cat: &str) -> Color32 {
     }
 }
 
+/// Allure des particules d'un effet (aperçu dans DragoWalker ; le vrai effet est celui du jeu).
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Fire,
+    Smoke,
+    Steam,
+    Fountain,
+    Drips,
+    Leaves,
+    Insects,
+    Dust,
+    Sparks,
+}
+
+fn style_of(name: &str) -> Style {
+    let has = |k: &[&str]| k.iter().any(|w| name.contains(w));
+    if has(&["fire", "campfire", "fireplace"]) {
+        Style::Fire
+    } else if has(&["smoke"]) {
+        Style::Smoke
+    } else if has(&["steam", "haze", "air_vent", "dry_ice", "mist"]) {
+        Style::Steam
+    } else if has(&["fountain", "sprinkler", "waterfall"]) {
+        Style::Fountain
+    } else if has(&["drip", "drain"]) {
+        Style::Drips
+    } else if has(&["leaves"]) {
+        Style::Leaves
+    } else if has(&["butterfl", "fly", "insect", "moth"]) {
+        Style::Insects
+    } else if has(&["dust", "wind"]) {
+        Style::Dust
+    } else {
+        Style::Sparks
+    }
+}
+
+fn h01(i: u32, s: u32) -> f32 {
+    let mut h = i.wrapping_mul(0x9E37_79B9) ^ s.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// Dessine l'effet animé : `base` = point d'émission à l'écran, `px` = pixels par mètre, `t` = temps (s).
+pub fn draw_fx(painter: &egui::Painter, base: Pos2, px: f32, fx: &str, t: f32) {
+    let st = style_of(fx);
+    let pt = |x: f32, y: f32| base + egui::vec2(x * px, -y * px);
+    let rgba = |r: u8, g: u8, b: u8, a: f32| Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8);
+    match st {
+        Style::Fire => {
+            for i in 0..22 {
+                let ph = (t * 1.6 + h01(i, 1)).fract();
+                let x = (h01(i, 2) - 0.5) * 0.7 * (1.0 - ph);
+                let r = (0.28 * (1.0 - ph) + 0.05) * px;
+                let (cr, cg, cb) = if ph < 0.35 { (255, 230, 90) } else if ph < 0.7 { (255, 130, 30) } else { (190, 45, 20) };
+                painter.circle_filled(pt(x, ph * 1.7), r.max(1.0), rgba(cr, cg, cb, 0.9 * (1.0 - ph)));
+            }
+        }
+        Style::Smoke | Style::Steam => {
+            let (g, a, h, sp) = if st == Style::Smoke { (120u8, 0.55, 4.5, 0.35) } else { (235u8, 0.45, 2.8, 0.45) };
+            for i in 0..16 {
+                let ph = (t * sp + h01(i, 3)).fract();
+                let x = (h01(i, 4) - 0.5) * 0.8 + ph * 0.7;
+                let r = (0.25 + ph * 1.1) * px;
+                painter.circle_filled(pt(x, ph * h), r.max(1.5), rgba(g, g, g.saturating_add(5), a * (1.0 - ph)));
+            }
+        }
+        Style::Fountain => {
+            for i in 0..28 {
+                let ph = (t * 0.9 + h01(i, 5)).fract();
+                let vx = (h01(i, 6) - 0.5) * 1.6;
+                let y = (3.0 * ph - 3.0 * ph * ph) * 1.6;
+                painter.circle_filled(pt(vx * ph * 1.3, y), (0.07 * px).max(1.0), rgba(130, 195, 255, 0.85));
+            }
+        }
+        Style::Drips => {
+            for i in 0..12 {
+                let ph = (t * 0.8 + h01(i, 7)).fract();
+                painter.circle_filled(pt((h01(i, 8) - 0.5) * 1.6, 2.0 - ph * 2.0), (0.05 * px).max(1.0), rgba(130, 195, 255, 0.9));
+            }
+        }
+        Style::Leaves => {
+            for i in 0..12 {
+                let ph = (t * 0.22 + h01(i, 9)).fract();
+                let x = (h01(i, 10) - 0.5) * 2.4 + (t * 2.0 + h01(i, 11) * 6.0).sin() * 0.45;
+                let c = if i % 3 == 0 { (150, 110, 50) } else { (110, 160, 60) };
+                painter.circle_filled(pt(x, 3.2 - ph * 3.2), (0.12 * px).max(1.5), rgba(c.0, c.1, c.2, 0.95));
+            }
+        }
+        Style::Insects => {
+            for i in 0..14 {
+                let a = t * (2.0 + h01(i, 12) * 3.0) + h01(i, 13) * 6.3;
+                let rad = 0.4 + h01(i, 14) * 0.7;
+                let col = if fx.contains("butterfl") { (255, 200, 80) } else { (25, 25, 25) };
+                painter.circle_filled(pt(a.cos() * rad, 1.0 + (a * 1.7).sin() * 0.35), (0.05 * px).max(1.2), rgba(col.0, col.1, col.2, 0.95));
+            }
+        }
+        Style::Dust => {
+            for i in 0..20 {
+                let ph = (t * 0.4 + h01(i, 15)).fract();
+                let a = ph * 6.0 + h01(i, 16) * 6.3;
+                let rad = 0.3 + ph * 1.3;
+                painter.circle_filled(pt(a.cos() * rad, ph * 2.2), (0.08 * px).max(1.0), rgba(200, 175, 130, 0.6 * (1.0 - ph)));
+            }
+        }
+        Style::Sparks => {
+            let step = (t * 12.0).floor() as u32;
+            for i in 0..14 {
+                if h01(i, step) < 0.55 {
+                    continue;
+                }
+                let a = h01(i, step + 99) * 6.3;
+                let l = 0.15 + h01(i, step + 7) * 0.35;
+                painter.line_segment([pt(0.0, 0.3), pt(a.cos() * l, 0.3 + a.sin().abs() * l)], egui::Stroke::new(1.5_f32, rgba(255, 245, 170, 0.95)));
+            }
+        }
+    }
+}
+
 /// Nom du type d'objet exporté pour un effet.
 pub fn fx_arch(name: &str) -> String {
     format!("dw_fx_{}", name.trim_start_matches("amb_"))
@@ -161,12 +282,19 @@ impl DwApp {
     /// Effets posés : pastilles de couleur dans la vue (nom au survol de près), zone d'eau en cours de tracé.
     pub fn draw_scenery_overlay(&self, painter: &egui::Painter, hover: Option<Pos2>) {
         let Some(t) = self.proj.terrain.as_ref() else { return };
+        let time = painter.ctx().input(|i| i.time) as f32;
         for e in &t.emitters {
             let Some((q, _)) = self.cam.project(e.pos) else { continue };
             let cat = FX.iter().find(|f| f.name == e.fx).map(|f| f.cat).unwrap_or("");
             let col = fx_color(cat);
-            painter.circle_filled(q, 6.0, col);
-            painter.circle_stroke(q, 9.0, egui::Stroke::new(1.5_f32, col.gamma_multiply(0.6)));
+            // échelle : pixels pour un mètre à cet endroit ; l'effet est animé comme en jeu (aperçu)
+            let px = self.cam.project(e.pos + v3(0.0, 0.0, 1.0)).map(|u| (u.0 - q).length()).unwrap_or(0.0);
+            let base_scale = FX.iter().find(|f| f.name == e.fx).map(|f| f.scale).unwrap_or(1.0).max(1e-3);
+            let k = (e.scale / base_scale).clamp(0.2, 4.0);
+            if px > 0.5 && (e.pos - self.cam.eye).len() < 400.0 {
+                draw_fx(painter, q, px * k, &e.fx, time);
+            }
+            painter.circle_filled(q, 3.5, col);
             if hover.map(|h| h.distance(q) < 40.0).unwrap_or(false) || (e.pos - self.cam.eye).len() < 40.0 {
                 let label = FX.iter().find(|f| f.name == e.fx).map(|f| f.label).unwrap_or(&e.fx);
                 painter.text(q + egui::vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), Color32::WHITE);
@@ -229,18 +357,37 @@ impl DwApp {
 
     pub fn terrain_ui_fx(&mut self, ui: &mut egui::Ui) {
         ui.label("Clic dans la vue : poser l'effet choisi · Ctrl + clic : retirer le plus proche.");
-        let mut cat = "";
-        for (i, f) in FX.iter().enumerate() {
-            if f.cat != cat {
-                cat = f.cat;
-                ui.label(RichText::new(cat).strong().color(fx_color(cat)));
+        let time = ui.ctx().input(|i| i.time) as f32;
+        let cats: Vec<&str> = FX.iter().fold(Vec::new(), |mut v, f| {
+            if !v.contains(&f.cat) {
+                v.push(f.cat);
             }
-            let on = self.terrain.fx == i;
-            if ui.selectable_label(on, format!("   {}", f.label)).on_hover_text(f.name).clicked() {
-                self.terrain.fx = i;
-                self.set_terrain_brush(crate::terrain::Brush::Particles);
-            }
+            v
+        });
+        for cat in cats {
+            ui.label(RichText::new(cat).strong().color(fx_color(cat)));
+            ui.horizontal_wrapped(|ui| {
+                for (i, f) in FX.iter().enumerate().filter(|(_, f)| f.cat == cat) {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(104.0, 98.0), egui::Sense::click());
+                    let on = self.terrain.fx == i;
+                    let p = ui.painter_at(rect);
+                    let img = egui::Rect::from_min_size(rect.min, egui::vec2(104.0, 80.0));
+                    p.rect_filled(img, 6.0, if resp.hovered() { Color32::from_rgb(40, 46, 56) } else { Color32::from_rgb(24, 27, 33) });
+                    // sol + effet animé
+                    p.line_segment([egui::pos2(img.left() + 8.0, img.bottom() - 12.0), egui::pos2(img.right() - 8.0, img.bottom() - 12.0)], egui::Stroke::new(1.0_f32, Color32::from_gray(70)));
+                    draw_fx(&p, egui::pos2(img.center().x, img.bottom() - 12.0), if matches!(style_of(f.name), Style::Fire | Style::Insects | Style::Sparks | Style::Drips) { 24.0 } else { 13.0 }, f.name, time + i as f32);
+                    if on {
+                        p.rect_stroke(img, 6.0, egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 170, 60)), egui::StrokeKind::Inside);
+                    }
+                    p.text(egui::pos2(rect.center().x, img.bottom() + 2.0), egui::Align2::CENTER_TOP, f.label, egui::FontId::proportional(11.0), Color32::from_gray(210));
+                    if resp.on_hover_text(f.name).clicked() {
+                        self.terrain.fx = i;
+                        self.set_terrain_brush(crate::terrain::Brush::Particles);
+                    }
+                }
+            });
         }
+        ui.ctx().request_repaint();
         ui.add(egui::Slider::new(&mut self.terrain.fx_scale, 0.2..=4.0).text("taille"));
         if let Some(t) = self.proj.terrain.as_ref() {
             ui.label(RichText::new(format!("{} effet(s) posé(s)", t.emitters.len())).small().weak());

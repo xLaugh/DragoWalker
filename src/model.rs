@@ -132,6 +132,12 @@ pub struct Ymap {
     /// Copie d'un ymap du jeu (la version du jeu est alors cachée dans la vue).
     #[serde(default)]
     pub from_game: bool,
+    /// véhicules garés (générateurs de véhicules)
+    #[serde(default)]
+    pub car_gens: Vec<crate::life::CarGen>,
+    /// PNJ posés (exportés en script client)
+    #[serde(default)]
+    pub peds: Vec<crate::life::PedSpot>,
 }
 
 impl Ymap {
@@ -146,6 +152,8 @@ impl Ymap {
             sample: false,
             raw_sections: Vec::new(),
             from_game: false,
+            car_gens: Vec::new(),
+            peds: Vec::new(),
         }
     }
 
@@ -204,7 +212,16 @@ impl Ymap {
                 smx = smx.max(w);
             }
         }
-        if self.entities.is_empty() {
+        // véhicules garés, comme YmapFile::CalcExtents (0x06002cd5) : ± perpendicularLength pour les objets,
+        // ± 2 × perpendicularLength pour le chargement
+        for c in &self.car_gens {
+            let w = c.width;
+            emn = emn.min(c.pos - v3(w, w, w));
+            emx = emx.max(c.pos + v3(w, w, w));
+            smn = smn.min(c.pos - v3(2.0 * w, 2.0 * w, 2.0 * w));
+            smx = smx.max(c.pos + v3(2.0 * w, 2.0 * w, 2.0 * w));
+        }
+        if self.entities.is_empty() && self.car_gens.is_empty() {
             return (V3::ZERO, V3::ZERO, V3::ZERO, V3::ZERO);
         }
         (emn, emx, smn, smx)
@@ -322,6 +339,9 @@ pub struct Project {
     /// terrain créé dans l'éditeur de terrain (carte vide)
     #[serde(default)]
     pub terrain: Option<crate::terrain::Terrain>,
+    /// ressources MLO importées (fichiers du créateur, crédits, objet de référence)
+    #[serde(default)]
+    pub mlo_res: Vec<crate::mlo::MloRes>,
 }
 
 /// Un élément sélectionnable.

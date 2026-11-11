@@ -29,12 +29,53 @@ pub struct BuildingLib {
     pub zone: usize,
     pub list: Option<Vec<Building>>,
     pub chosen: Option<u32>,
+    /// liste affichée : morceaux de route du jeu au lieu des bâtiments
+    pub roads: bool,
+    pub road_list: Option<Vec<Building>>,
 }
 
 impl BuildingLib {
     pub fn new() -> BuildingLib {
-        BuildingLib { open: std::env::var("DW_BUILDINGS").is_ok(), filter: std::env::var("DW_BUILDINGS_FILTER").unwrap_or_default(), zone: 0, list: None, chosen: None }
+        BuildingLib { open: std::env::var("DW_BUILDINGS").is_ok(), filter: std::env::var("DW_BUILDINGS_FILTER").unwrap_or_default(), zone: 0, list: None, chosen: None, roads: std::env::var("DW_ROAD_PIECES").is_ok(), road_list: None }
     }
+}
+
+/// Mots des noms de modèles de route du jeu (ss1_rd1_…, id2_rd_r4_03, …) — relevés par la sonde DW_ARCH_GREP.
+const ROAD_TOKENS: [&str; 4] = ["_rd", "rd_", "road", "_junc"];
+/// Morceaux portant ces mots qui ne sont pas des chaussées (versions lointaines, câbles, décors…).
+const NOT_ROAD: [&str; 24] = ["_lod", "slod", "proxy", "decal", "detail", "_dtl", "emissive", "shadow", "occl", "cable", "banner", "wire", "_alpha", "logo", "sign", "bakedfur", "props", "_ovly", "overlay", "_weed", "light", "railing", "billboard", "armco"];
+
+/// Morceaux de route du jeu : objets HD de la carte (pas des props) dont le nom parle de route, plats (moins
+/// de 10 m de haut) et d'au moins 10 m de long — **estimé**. Les routes de GTA V sont modelées par quartier :
+/// ce sont des morceaux de vraies rues (carrefours, virages, lignes droites), pas des pièces standard.
+pub fn build_road_list(w: &crate::gta::world::GameWorld) -> Vec<Building> {
+    let mut map: std::collections::HashMap<u32, Building> = std::collections::HashMap::new();
+    for e in &w.ents {
+        if e.lod_level != 0 || e.mlo {
+            continue;
+        }
+        if let Some(b) = map.get_mut(&e.arch) {
+            b.count += 1;
+            continue;
+        }
+        let Some(a) = w.archetypes.get(&e.arch) else { continue };
+        if a.mlo {
+            continue;
+        }
+        let s = a.bb_max - a.bb_min;
+        if s.x.max(s.y) < 10.0 || s.z > 10.0 {
+            continue;
+        }
+        let name = w.name_of(e.arch);
+        if is_prop_name(&name) || name.starts_with("hash_") || !ROAD_TOKENS.iter().any(|k| name.contains(k)) || NOT_ROAD.iter().any(|k| name.contains(k)) {
+            continue;
+        }
+        let zone = zone_of(&name);
+        map.insert(e.arch, Building { arch: e.arch, name, size: s, pos: e.pos, count: 1, zone });
+    }
+    let mut v: Vec<Building> = map.into_values().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
 }
 
 /// Quartiers, d'après le début du nom des modèles de la carte (dt1_…, hw1_…) — **estimé**.
@@ -124,6 +165,39 @@ impl DwApp {
         self.status = format!("Bâtiment « {name} » copié à {:.0} {:.0} {:.0} (visible jusqu'à {lod:.0} m). À l'export : dépendance vers son .ytyp et collision générée.", at.x, at.y, at.z);
     }
 
+    /// Pose un morceau (de route) du jeu au bout de l'objet sélectionné : même orientation, le long du plus grand
+    /// côté de l'objet sélectionné, le bord de départ du nouveau contre le bord d'arrivée de l'ancien (boîtes des
+    /// types d'objets du jeu).
+    pub fn place_after_selected(&mut self, h: u32) {
+        let Some(sel) = self.selected.first().and_then(|id| self.proj.find_id(*id)).and_then(|r| self.proj.world_entity(r)) else {
+            self.status = "Sélectionne d'abord le morceau de route au bout duquel poser le suivant.".into();
+            return;
+        };
+        let Some(w) = self.game.world.as_ref() else { return };
+        let name = w.name_of(h);
+        let (smn, smx) = sel.local_box(&self.proj);
+        let (nmn, nmx) = w.arch_box(h);
+        let along_x = (smx.x - smn.x) >= (smx.y - smn.y);
+        // décalage local : bord max de l'ancien contre bord min du nouveau sur l'axe long, centres alignés sur l'autre
+        let off = if along_x {
+            v3(smx.x - nmn.x, (smn.y + smx.y) * 0.5 - (nmn.y + nmx.y) * 0.5, smn.z - nmn.z)
+        } else {
+            v3((smn.x + smx.x) * 0.5 - (nmn.x + nmx.x) * 0.5, smx.y - nmn.y, smn.z - nmn.z)
+        };
+        let at = sel.pos + sel.rot.rotate(off.mulv(sel.scale()));
+        let lod = w.archetypes.get(&h).map(|a| a.lod_dist).unwrap_or(300.0).max(150.0);
+        self.push_undo();
+        let yi = self.ensure_target_ymap();
+        let mut e = crate::model::Entity::new(&name, at);
+        e.rot = sel.rot;
+        e.lod_dist = lod;
+        let id = e.id;
+        self.proj.ymaps[yi].entities.push(e);
+        self.set_selection(vec![id]);
+        self.sync_game_project();
+        self.status = format!("« {name} » posé au bout de « {} ». Sélectionné : « Poser à la suite » continue la route.", sel.archetype);
+    }
+
     /// Fenêtre « Bibliothèque des bâtiments ».
     pub fn buildings_window(&mut self, ctx: &egui::Context) {
         if !self.buildings.open {
@@ -131,13 +205,29 @@ impl DwApp {
         }
         let mut open = true;
         let mut place: Option<(u32, Option<V3>)> = None;
+        let mut place_next: Option<u32> = None;
         let mut goto: Option<(V3, f32)> = None;
         self.show_panel(ctx, "batiments", "Bibliothèque des bâtiments", crate::docking::Dock::Floating, [860.0, 600.0], &mut open, |s, ui| {
                 let Some(w) = s.game.world.as_ref() else {
                     ui.label("Charge d'abord le jeu (onglet Jeu).");
                     return;
                 };
-                if s.buildings.list.is_none() {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!s.buildings.roads, RichText::new("Bâtiments").strong()).clicked() {
+                        s.buildings.roads = false;
+                        s.buildings.chosen = None;
+                    }
+                    if ui.selectable_label(s.buildings.roads, RichText::new("Morceaux de route du jeu").strong()).on_hover_text("Chaussées, carrefours et virages modelés par Rockstar, à copier et poser bout à bout").clicked() {
+                        s.buildings.roads = true;
+                        s.buildings.chosen = None;
+                    }
+                });
+                if s.buildings.roads {
+                    if s.buildings.road_list.is_none() {
+                        s.buildings.road_list = Some(build_road_list(w));
+                    }
+                    ui.label(RichText::new("Les routes de GTA V sont modelées quartier par quartier : ce sont des morceaux de vraies rues (lignes droites, virages, carrefours), pas des pièces standard. « Poser à la suite » aligne le morceau choisi au bout de celui qui est sélectionné ; les bords ne se raccordent pas toujours parfaitement.").small().weak());
+                } else if s.buildings.list.is_none() {
                     s.buildings.list = Some(build_list(w));
                 }
                 ui.horizontal_wrapped(|ui| {
@@ -154,9 +244,10 @@ impl DwApp {
                 let f = s.buildings.filter.to_lowercase();
                 let zone = s.buildings.zone;
                 // la liste est sortie le temps de dessiner (l'aperçu a besoin de toute l'application)
-                let list = s.buildings.list.take().unwrap_or_default();
+                let roads = s.buildings.roads;
+                let list = if roads { s.buildings.road_list.take() } else { s.buildings.list.take() }.unwrap_or_default();
                 let idx: Vec<usize> = (0..list.len()).filter(|&i| (zone == 0 || list[i].zone == zone) && (f.is_empty() || list[i].name.contains(&f))).collect();
-                ui.label(RichText::new(format!("{} bâtiments · clic : voir · double-clic : poser devant la caméra", idx.len())).small().weak());
+                ui.label(RichText::new(format!("{} {} · clic : voir · double-clic : poser devant la caméra", idx.len(), if roads { "morceaux de route" } else { "bâtiments" })).small().weak());
                 ui.separator();
                 let mut chosen = s.buildings.chosen;
                 ui.horizontal_top(|ui| {
@@ -196,14 +287,24 @@ impl DwApp {
                             if ui.button("Aller voir l'original").clicked() {
                                 goto = Some((pos, size.x.max(size.y).max(size.z) * 1.6 + 20.0));
                             }
+                            if roads && ui.add_enabled(s.selected.len() == 1, egui::Button::new("Poser à la suite")).on_hover_text("Au bout du morceau sélectionné, dans le même sens (le long de son plus grand côté)").clicked() {
+                                place_next = Some(h);
+                            }
                         });
                         ui.label(RichText::new("La copie utilise le modèle et les textures du jeu ; à l'export, DragoWalker déclare son .ytyp d'origine et génère sa collision.").small().weak());
                     });
                 });
                 s.buildings.chosen = chosen;
-                s.buildings.list = Some(list);
+                if roads {
+                    s.buildings.road_list = Some(list);
+                } else {
+                    s.buildings.list = Some(list);
+                }
             });
         self.buildings.open = open;
+        if let Some(h) = place_next {
+            self.place_after_selected(h);
+        }
         if let Some((h, at)) = place {
             let name = self.game.world.as_ref().map(|w| w.name_of(h)).unwrap_or_default();
             let p = at.unwrap_or_else(|| {
@@ -221,7 +322,7 @@ impl DwApp {
     }
 
     /// Export : manifeste des dépendances (_manifest.ymf) du projet et collisions des bâtiments du jeu copiés.
-    pub fn export_buildings(&self, stream: &std::path::Path) -> Result<Option<String>, String> {
+    pub fn export_buildings(&self, stream: &std::path::Path, lod_ymaps: &[crate::model::Ymap]) -> Result<Option<String>, String> {
         // fichiers d'un export précédent
         if let Ok(rd) = std::fs::read_dir(stream) {
             for f in rd.flatten() {
@@ -243,7 +344,9 @@ impl DwApp {
                 }
             }
             let w = w?;
-            let a = w.archetypes.get(&crate::gta::crypto::joaat(&low))?;
+            // « hash_XXXXXXXX » : type dont le nom n'est pas connu, écrit par son code
+            let h = low.strip_prefix("hash_").and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| crate::gta::crypto::joaat(&low));
+            let a = w.archetypes.get(&h)?;
             Some(w.vfs.files[a.ytyp_file].name.trim_end_matches(".ytyp").to_string())
         };
         // comme EditProjectManifestPanel::GenerateProjectManifest (0x06001194) :
@@ -252,7 +355,7 @@ impl DwApp {
         // les intérieurs sont listés dans <Interiors> (Name, Bounds = leur nom)
         let mut imaps: Vec<(String, bool, Vec<String>)> = Vec::new();
         let mut ncol = 0;
-        for y in self.proj.ymaps.iter().filter(|y| !y.sample) {
+        for y in self.proj.ymaps.iter().filter(|y| !y.sample).chain(lod_ymaps.iter()) {
             let mut itypes: Vec<String> = Vec::new();
             let mut interior = false;
             for e in &y.entities {
@@ -264,8 +367,11 @@ impl DwApp {
                         itypes.push(yt);
                     }
                 }
-                // bâtiment du jeu copié : collision depuis son modèle, dans le monde
+                // bâtiment du jeu copié : collision depuis son modèle, dans le monde (pas pour une version lointaine)
                 let Some(w) = w else { continue };
+                if e.lod_level == "LODTYPES_DEPTH_LOD" {
+                    continue;
+                }
                 let h = crate::gta::crypto::joaat(&e.archetype.to_lowercase());
                 let Some(a) = w.archetypes.get(&h) else { continue };
                 if is_prop_name(&e.archetype.to_lowercase()) || a.mlo || e.archetype.starts_with("dw_") {

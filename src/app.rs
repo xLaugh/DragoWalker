@@ -23,6 +23,8 @@ pub enum Tool {
     Rect,
     /// pinceaux de l'éditeur de terrain
     Terrain,
+    /// véhicules garés, PNJ, rondes
+    Life,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +120,8 @@ pub struct DwApp {
     pub sollumz: crate::sollumz::SollumzState,
     /// génération des modèles personnels déjà envoyés à la carte graphique
     pub sollumz_sent: u64,
+    /// modèles des ressources MLO importées
+    pub mlo_state: crate::mlo::MloState,
     /// poignées : mode et poignée sous la souris
     pub gizmo_mode: crate::gizmo::GizmoMode,
     pub gizmo_hover: Option<u8>,
@@ -150,6 +154,12 @@ pub struct DwApp {
     pub toolbox_open: bool,
     /// passe d'affichage des panneaux : 0 = ceux rangés en bas, 1 = les autres
     pub dock_phase: u8,
+    /// vie de la carte : véhicules garés, PNJ, circulation
+    pub life: crate::life::LifeState,
+    /// sélection vue seule (bouton « Isoler »)
+    pub isolate_sel: Option<std::collections::HashSet<u64>>,
+    /// aperçus des types de route
+    pub road_thumbs: std::collections::HashMap<u8, egui::TextureHandle>,
     /// poser au sol : modèles gardés pour le lancer de rayon, appui sur Maj seul
     pub snap_cache: std::collections::HashMap<u32, Option<std::sync::Arc<crate::gta::drawable::Mesh>>>,
     pub shift_since: Option<f64>,
@@ -217,7 +227,7 @@ fn setup_style(ctx: &egui::Context) {
 impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -283,6 +293,7 @@ impl DwApp {
             game: crate::game_ui::GameState::new(),
             sollumz: crate::sollumz::SollumzState::new(),
             sollumz_sent: 0,
+            mlo_state: Default::default(),
             gizmo_mode: crate::gizmo::GizmoMode::Move,
             gizmo_hover: None,
             gizmo_object_space: false,
@@ -302,6 +313,9 @@ impl DwApp {
             project_open: true,
             toolbox_open: true,
             dock_phase: 1,
+            road_thumbs: std::collections::HashMap::new(),
+            isolate_sel: None,
+            life: crate::life::LifeState::default(),
             snap_cache: std::collections::HashMap::new(),
             shift_since: None,
             shift_tap: false,
@@ -466,6 +480,12 @@ impl DwApp {
         // avec le jeu chargé, le prop se pose à la hauteur réelle du sol
         let z = if self.game.world.is_some() { p.z } else { self.ground_z };
         let mut e = Entity::new(arch, v3(p.x, p.y, z));
+        // distance d'affichage du type dans le jeu (CBaseArchetypeDef.lodDist), comme le jeu le pose
+        if let Some(a) = self.game.world.as_ref().and_then(|w| w.archetypes.get(&crate::gta::crypto::joaat(&arch.to_lowercase()))) {
+            if a.lod_dist > 0.0 {
+                e.lod_dist = a.lod_dist;
+            }
+        }
         e.rot = Quat::from_z(heading.to_radians());
         e.scale_xy = scale;
         e.scale_z = scale;
@@ -1055,6 +1075,7 @@ impl eframe::App for DwApp {
         let dt = ctx.input(|i| i.stable_dt).min(mech::MAX_FRAME_STEP);
         self.poll_game_load(ctx);
         self.sollumz_tick(ctx);
+        self.mlo_tick();
         // capture automatique : attendre la fin du chargement du jeu (au plus ~90 s)
         if self.shot_path.is_some() && self.game.loading.is_some() && self.frame > 2 && self.frame < 6000 {
             self.frame = 2;
@@ -1153,6 +1174,81 @@ impl eframe::App for DwApp {
                         println!("{}", self.status);
                     }
                 }
+                // DW_TEST_CROSS=k : deux routes du type k qui se croisent au centre (feux, stops)
+                if let Some(k) = std::env::var("DW_TEST_CROSS").ok().and_then(|v| v.parse::<u8>().ok()) {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    for (a, b) in [(v3(c.x - 90.0, c.y + 5.0, 0.0), v3(c.x + 90.0, c.y - 5.0, 0.0)), (v3(c.x - 4.0, c.y - 90.0, 0.0), v3(c.x + 4.0, c.y + 90.0, 0.0))] {
+                        self.terrain.road_kind = k;
+                        self.terrain.road_pts = vec![v3(a.x, a.y, h(self, a.x, a.y)), v3(b.x, b.y, h(self, b.x, b.y))];
+                        self.finish_road();
+                        println!("{}", self.status);
+                    }
+                    let (l, s) = self.signals_count();
+                    println!("signalisation : {l} feu(x), {s} stop(s)");
+                    if let Some(j) = self.proj.terrain.as_ref().and_then(|t| t.junctions.first()).cloned() {
+                        println!("   branches {:?} -> {:?}", j.arms.iter().map(|a| (a.hw, a.total, a.len)).collect::<Vec<_>>(), crate::signals::arm_controls(&j));
+                        for (n, p, q) in crate::signals::junction_props(&j) {
+                            println!("      {n} à ({:.1}, {:.1}, {:.2}) cap {:.0}°", p.x - j.pos[0], p.y - j.pos[1], p.z, q.heading_deg());
+                        }
+                        self.goto(v3(j.pos[0], j.pos[1], j.pos[2]), 55.0);
+                        self.cam.target.z = j.pos[2];
+                        self.cam.snap();
+                    }
+                }
+                // DW_TEST_ROADJOIN=1 : une avenue qui croise toutes les routes, une rue qui finit en T sur la première
+                if std::env::var("DW_TEST_ROADJOIN").is_ok() {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    self.terrain.road_kind = 1;
+                    let (x0, y0, y1) = (c.x + 100.0, c.y - 175.0, c.y + 175.0);
+                    self.terrain.road_pts = vec![v3(x0, y0, h(self, x0, y0)), v3(x0 + 10.0, c.y, h(self, x0 + 10.0, c.y)), v3(x0, y1, h(self, x0, y1))];
+                    self.finish_road();
+                    println!("{}", self.status);
+                    self.terrain.road_kind = 0;
+                    let start = v3(c.x - 60.0, c.y - 190.0, 0.0);
+                    let end = self.proj.terrain.as_ref().and_then(|t| t.roads.first()).map(|r| { let s = r.samples[r.samples.len() / 3]; v3(s[0], s[1], s[2]) }).unwrap_or(start);
+                    let start = v3(end.x - 20.0, end.y - 60.0, 0.0);
+                    self.terrain.road_pts = vec![v3(start.x, start.y, h(self, start.x, start.y)), end];
+                    self.finish_road();
+                    println!("{}", self.status);
+                    let (l, s) = self.signals_count();
+                    println!("signalisation : {l} feu(x), {s} stop(s)");
+                    if let Some(t) = self.proj.terrain.as_ref() {
+                        for (i, j) in t.junctions.iter().enumerate() {
+                            println!("   carrefour {i} à {:?} : branches {:?} -> {:?}", j.pos, j.arms.iter().map(|a| a.hw).collect::<Vec<_>>(), crate::signals::arm_controls(j));
+                            for (n, p, q) in crate::signals::junction_props(j) {
+                                println!("      {n} à ({:.1}, {:.1}, {:.2}) cap {:.0}°", p.x, p.y, p.z, q.heading_deg());
+                            }
+                        }
+                    }
+                    // DW_TEST_JOIN_LOOK=n : la caméra va sur le carrefour n
+                    if let Some(n) = std::env::var("DW_TEST_JOIN_LOOK").ok().and_then(|v| v.parse::<usize>().ok()) {
+                        if let Some(j) = self.proj.terrain.as_ref().and_then(|t| t.junctions.get(n)).cloned() {
+                            self.goto(v3(j.pos[0], j.pos[1], j.pos[2]), 45.0);
+                            self.cam.target.z = j.pos[2];
+                            self.cam.snap();
+                        }
+                    }
+                }
+                // DW_TEST_LIFE=1 : une rangée de parking, un PNJ qui fume, un PNJ qui fait une ronde
+                if std::env::var("DW_TEST_LIFE").is_ok() {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    let yi = self.ensure_target_ymap();
+                    for i in 0..6 {
+                        let (x, y) = (c.x - 30.0 + i as f32 * crate::life::CARGEN_WIDTH, c.y + 20.0);
+                        let z = h(self, x, y);
+                        self.proj.ymaps[yi].car_gens.push(crate::life::CarGen::new(v3(x, y, z + 0.1), 90.0, ""));
+                    }
+                    let z = h(self, c.x + 5.0, c.y + 25.0);
+                    self.proj.ymaps[yi].peds.push(crate::life::PedSpot { pos: v3(c.x + 5.0, c.y + 25.0, z), heading: 180.0, model: "a_m_y_business_01".into(), scenario: "WORLD_HUMAN_SMOKING".into(), route: Vec::new(), wait: 0.0 });
+                    let route: Vec<V3> = [(c.x + 15.0, c.y + 15.0), (c.x + 35.0, c.y + 15.0), (c.x + 35.0, c.y + 35.0)].iter().map(|(x, y)| v3(*x, *y, h(self, *x, *y))).collect();
+                    self.proj.ymaps[yi].peds.push(crate::life::PedSpot { pos: route[0], heading: 0.0, model: "s_m_m_security_01".into(), scenario: "WORLD_HUMAN_GUARD_STAND".into(), route, wait: 5.0 });
+                    self.life.open = true;
+                    self.tool = Tool::Life;
+                    println!("vie : 6 véhicules garés, 2 PNJ");
+                }
+                if let Some(sec) = std::env::var("DW_TERRAIN_SECTION").ok().and_then(|v| v.parse::<u8>().ok()) {
+                    self.terrain_section(sec);
+                }
                 if let Some(vs) = std::env::var("DW_TEST_VEG").ok().and_then(|v| v.parse::<usize>().ok()) {
                     self.terrain.veg_set = vs.min(crate::vegetation::SETS.len() - 1);
                     self.terrain.veg_density = 0.6;
@@ -1184,6 +1280,24 @@ impl eframe::App for DwApp {
                     }
                     println!("eau et effets ajoutés");
                 }
+                // DW_TEST_ROADPIECE=nom : liste des morceaux de route du jeu, en pose un puis deux à la suite
+                if let Ok(name) = std::env::var("DW_TEST_ROADPIECE") {
+                    if let Some(w) = self.game.world.as_ref() {
+                        let l = crate::buildings::build_road_list(w);
+                        println!("morceaux de route du jeu : {} (ex. {:?})", l.len(), l.iter().step_by((l.len() / 12).max(1)).take(12).map(|b| format!("{} {:.0}x{:.0}x{:.1}", b.name, b.size.x, b.size.y, b.size.z)).collect::<Vec<_>>());
+                    }
+                    let h = crate::gta::crypto::joaat(&name);
+                    let at = v3(c.x, c.y + 120.0, self.proj.terrain.as_ref().and_then(|t| t.height_at(c.x, c.y + 120.0)).unwrap_or(0.0));
+                    self.building_place(h, at);
+                    for _ in 0..2 {
+                        self.place_after_selected(h);
+                    }
+                    let ps: Vec<V3> = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).filter(|e| e.archetype == name).map(|e| e.pos).collect();
+                    println!("posés : {ps:?} · {}", self.status);
+                    if let Some(p) = ps.get(1) {
+                        self.goto(*p, 90.0);
+                    }
+                }
                 if let Ok(name) = std::env::var("DW_TEST_BUILDING") {
                     let h = crate::gta::crypto::joaat(&name);
                     let at = v3(c.x - 60.0, c.y - 40.0, self.proj.terrain.as_ref().and_then(|t| t.height_at(c.x - 60.0, c.y - 40.0)).unwrap_or(0.0));
@@ -1205,6 +1319,35 @@ impl eframe::App for DwApp {
                 if let Ok(dir) = std::env::var("DW_TEST_TERRAIN_EXPORT") {
                     let r = self.export_project(std::path::Path::new(&dir), true);
                     println!("export : {r}");
+                }
+            }
+        }
+        // mode test : DW_TEST_MLO="dossier" importe une ressource MLO ; DW_TEST_MLO_MOVE="dx,dy,dz,degrés" la
+        // déplace et la tourne (tous ses objets autour de l'objet de référence) ; DW_TEST_MLO_EXPORT="dossier" exporte
+        if self.frame == 40 {
+            if let Ok(dir) = std::env::var("DW_TEST_MLO") {
+                let msg = self.import_mlo(std::path::Path::new(&dir));
+                println!("import MLO : {msg}");
+                if let Some(r) = self.proj.mlo_res.last().cloned() {
+                    println!("   auteur {:?}, crédits {:?}, fichiers {:?}, collisions {:?}, ytyp {:?}, cartes {:?}, data {:?}, illisibles {:?}", r.author, r.credit_files, r.assets.len(), r.ybns.len(), r.ytyp_files, r.ymaps, r.data_files, r.unreadable);
+                    println!("   modèles lus : {} ({} triangles), référence {:?}", self.mlo_state.models.len(), self.mlo_state.models.iter().map(|m| m.1.idx.len() / 3).sum::<usize>(), r.ref_pos);
+                    if let Ok(mv) = std::env::var("DW_TEST_MLO_MOVE") {
+                        let v: Vec<f32> = mv.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                        let (d, deg) = (v3(v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0), v.get(2).copied().unwrap_or(0.0)), v.get(3).copied().unwrap_or(0.0));
+                        let q = crate::math::Quat::from_z(deg.to_radians());
+                        for y in self.proj.ymaps.iter_mut().filter(|y| r.ymaps.contains(&y.name)) {
+                            for e in y.entities.iter_mut() {
+                                e.pos = q.rotate(e.pos - r.ref_pos) + r.ref_pos + d;
+                                e.rot = q.mul(e.rot).normalized();
+                            }
+                        }
+                        let m = self.mlo_move(&r);
+                        println!("   déplacé : {:?} -> {:?}, cap {:.1}°", m.p0, m.p1, m.q.heading_deg());
+                    }
+                }
+                if let Ok(out) = std::env::var("DW_TEST_MLO_EXPORT") {
+                    let rep = self.export_project(std::path::Path::new(&out), true);
+                    println!("export : {rep}");
                 }
             }
         }
@@ -1515,8 +1658,10 @@ impl eframe::App for DwApp {
             self.ai_window(ctx);
             self.terrain_window(ctx);
             self.intlib_window(ctx);
+            self.life_window(ctx);
         }
         self.dock_overlay(ctx);
+        self.isolate_banner(ctx);
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {
             self.view(ui, dt);
         });

@@ -675,6 +675,25 @@ impl GameWorld {
         }
     }
 
+    /// Parent (version lointaine) d'un objet : l'objet `parentIndex` de la carte nommée par `CMapData.parent`.
+    pub fn lod_parent(&self, ei: usize) -> Option<usize> {
+        let e = &self.ents[ei];
+        if e.parent < 0 {
+            return None;
+        }
+        let y = &self.ymaps[e.ymap as usize];
+        if y.parent == 0 {
+            return None;
+        }
+        let py = self
+            .ymaps
+            .iter()
+            .filter(|q| super::crypto::joaat(&q.name) == y.parent)
+            .max_by_key(|q| (q.visible as u8, q.prio))?;
+        let p = py.first + e.parent as usize;
+        (p < py.first + py.count).then_some(p)
+    }
+
     fn children(&self, ei: usize) -> &[u32] {
         if ei + 1 >= self.kid_start.len() {
             return &[];

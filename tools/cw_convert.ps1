@@ -25,6 +25,7 @@ if ($ToBinary) {
         elseif ($name.EndsWith('.yft.xml')) { $fmt = 'Yft' }
         elseif ($name.EndsWith('.ytd.xml')) { $fmt = 'Ytd' }
         elseif ($name.EndsWith('.ybn.xml')) { $fmt = 'Ybn' }
+        elseif ($name.EndsWith('.ynd.xml')) { $fmt = 'Ynd' }
         if (-not $fmt) { continue }
         if ($fmt -eq 'PSO') {
             # manifeste de dépendances : comme EditProjectManifestPanel.SaveManifestButton_Click (0x06001196),
@@ -111,7 +112,9 @@ if ($ToXmlList) {
         try {
             $bytes = [IO.File]::ReadAllBytes($inp)
             $fname = [IO.Path]::GetFileName($inp)
-            $tname = if ($fname.ToLower().EndsWith('.ytyp')) { 'CodeWalker.GameFiles.YtypFile' } else { 'CodeWalker.GameFiles.YmapFile' }
+            # type de fichier selon l'extension (collisions .ybn : MetaXml.GetXml(YbnFile, out filename) -> YbnXml.GetXml)
+            $low = $fname.ToLower()
+            $tname = if ($low.EndsWith('.ytyp')) { 'CodeWalker.GameFiles.YtypFile' } elseif ($low.EndsWith('.ybn')) { 'CodeWalker.GameFiles.YbnFile' } elseif ($low.EndsWith('.ynd')) { 'CodeWalker.GameFiles.YndFile' } else { 'CodeWalker.GameFiles.YmapFile' }
             $ftype = $asm.GetType($tname)
             $g = $rpfFile.GetMethod('GetResourceFile').MakeGenericMethod($ftype)
             $p = New-Object 'object[]' 1

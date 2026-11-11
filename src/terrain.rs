@@ -48,6 +48,15 @@ pub struct Terrain {
     /// routes tracées sur le terrain
     #[serde(default)]
     pub roads: Vec<crate::roads::Road>,
+    /// carrefours entre routes
+    #[serde(default)]
+    pub junctions: Vec<crate::roads::Junction>,
+    /// voitures de PNJ qui roulent sur les routes (script)
+    #[serde(default)]
+    pub npc_traffic: crate::traffic::NpcTraffic,
+    /// feux rouges et stops posés tout seuls aux carrefours (signals.rs)
+    #[serde(default = "crate::signals::yes")]
+    pub auto_signals: bool,
     /// zones d'eau (comme les WaterQuads du jeu)
     #[serde(default)]
     pub waters: Vec<crate::scenery::WaterZone>,
@@ -180,7 +189,7 @@ impl Terrain {
         let cell = if size > 600.0 { 4.0 } else { 2.0 };
         let n = ((size / cell).round() as usize + 1).clamp(16, 400);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: vec![base_h; n * n], mat: vec![mat; (n - 1) * (n - 1)], roads: Vec::new(), waters: Vec::new(), emitters: Vec::new() }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: vec![base_h; n * n], mat: vec![mat; (n - 1) * (n - 1)], roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
@@ -336,7 +345,7 @@ impl Terrain {
         for j in j0..j1 {
             mat.extend_from_slice(&self.mat[j * (self.nx - 1) + i0..j * (self.nx - 1) + i1]);
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h, mat, roads: Vec::new(), waters: Vec::new(), emitters: Vec::new() }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true }
     }
 
     fn vpos(&self, i: usize, j: usize) -> V3 {
@@ -553,7 +562,13 @@ impl Terrain {
                 let (pos, uv, parts) = r.mesh(self.origin);
                 append_mesh(&mut verts, &mut idx, &mut geoms, &mut keys, &texs, &pos, &uv, &parts);
             }
+            for j in &self.junctions {
+                let (pos, uv, parts) = crate::roads::junction_mesh(j, self.origin);
+                append_mesh(&mut verts, &mut idx, &mut geoms, &mut keys, &texs, &pos, &uv, &parts);
+            }
         }
+        // vraies textures du jeu à la place de celles de DragoWalker (si le jeu est chargé et le réglage actif)
+        crate::groundtex::apply(&mut texs);
         (RModel { verts, idx, geoms, embedded_dict: None }, keys, texs)
     }
 }
@@ -589,6 +604,11 @@ pub fn append_mesh(verts: &mut Vec<RVert>, idx: &mut Vec<u32>, geoms: &mut Vec<R
 
 /// Taille des textures du terrain (carrées, qui se répètent sans couture tous les 6 m).
 const TEX_SIZE: u32 = 256;
+
+/// Texture d'un matériau, pour les aperçus.
+pub fn material_preview_texture(m: usize) -> TexData {
+    material_texture(m.min(MATERIALS.len() - 1))
+}
 
 /// Texture d'un matériau (gardée en mémoire : la même pour la vue et pour l'export).
 fn material_texture(m: usize) -> TexData {
@@ -736,6 +756,17 @@ impl DwApp {
             }
             if resp.clicked_by(PointerButton::Primary) {
                 if let Some(p) = g {
+                    let p = self.road_snap(p).map(|s| s.0).unwrap_or(p);
+                    // comme les liens entre nœuds de route du jeu : longueur gardée sur un octet, 255 m au plus
+                    // (YndLink::UpdateLength 0x06002f24) ; plus loin, CodeWalker refuse la liaison
+                    // (WorldForm::TryCreateNodeLink 0x06000326 : « nodes are likely too far away »)
+                    if let Some(last) = self.terrain.road_pts.last() {
+                        let d = ((p.x - last.x).powi(2) + (p.y - last.y).powi(2)).sqrt();
+                        if d > crate::roads::MAX_LINK {
+                            self.status = format!("Point trop loin du précédent ({d:.0} m) : {:.0} m au plus entre deux points d'une route, comme les liens de route du jeu.", crate::roads::MAX_LINK);
+                            return;
+                        }
+                    }
                     self.terrain.road_pts.push(p);
                     let n = self.terrain.road_pts.len();
                     self.status = if n == 1 {
@@ -797,6 +828,31 @@ impl DwApp {
         ctx.request_repaint();
     }
 
+    /// Accroche un point à une route existante : son extrémité (à moins de 8 m), sinon son axe s'il est sur la
+    /// route. Renvoie le point et vrai pour une extrémité.
+    pub fn road_snap(&self, p: V3) -> Option<(V3, bool)> {
+        let t = self.proj.terrain.as_ref()?;
+        let mut best: Option<(f32, V3, bool)> = None;
+        for r in &t.roads {
+            for s in [r.samples.first()?, r.samples.last()?] {
+                let d = ((s[0] - p.x).powi(2) + (s[1] - p.y).powi(2)).sqrt();
+                if d < crate::roads::SNAP_END.max(r.kind().width * 0.5) && best.map(|b| d < b.0).unwrap_or(true) {
+                    best = Some((d, v3(s[0], s[1], s[2]), true));
+                }
+            }
+        }
+        if best.is_none() {
+            for r in &t.roads {
+                if let Some((d, q, _, _)) = r.nearest_point(p.x, p.y) {
+                    if d <= r.kind().width * 0.5 && best.map(|b| d < b.0).unwrap_or(true) {
+                        best = Some((d, q, false));
+                    }
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
+    }
+
     /// Construit la route en cours (au moins 2 points) : courbe, pente douce, terrain aplani dessous.
     pub fn finish_road(&mut self) {
         let pts = std::mem::take(&mut self.terrain.road_pts);
@@ -807,15 +863,28 @@ impl DwApp {
         }
         let kind = self.terrain.road_kind;
         let Some(t) = self.proj.terrain.as_ref() else { return };
-        let Some(r) = crate::roads::Road::build(kind, &pts, |x, y| t.height_at(x, y)) else { return };
+        let Some(mut r) = crate::roads::Road::build(kind, &pts, |x, y| t.height_at(x, y)) else { return };
         self.push_undo();
         let len = r.length();
+        let mut nj = 0;
         if let Some(t) = self.proj.terrain.as_mut() {
+            // reliée aux routes existantes : hauteur raccordée, trottoirs ouverts, carrefours
+            let js = r.attach(&mut t.roads);
+            nj = js.len();
             t.apply_road(&r);
             t.roads.push(r);
+            t.junctions.extend(js);
+        }
+        // feux et stops des carrefours (reposés pour tous : une nouvelle branche change la signalisation)
+        if nj > 0 {
+            self.refresh_signals();
         }
         self.terrain.dirty = true;
-        self.status = format!("{} de {:.0} m construite (terrain aplani dessous, pente limitée à 12 %).", crate::roads::KINDS[kind as usize].name, len);
+        self.status = if nj > 0 {
+            format!("{} de {:.0} m construite et reliée : {nj} carrefour(s).", crate::roads::KINDS[kind as usize].name, len)
+        } else {
+            format!("{} de {:.0} m construite (terrain aplani dessous, pente limitée à 12 %).", crate::roads::KINDS[kind as usize].name, len)
+        };
     }
 
     fn push_undo_terrain(&mut self) {
@@ -859,6 +928,14 @@ impl DwApp {
         let Some(c) = self.terrain_ground(p) else { return };
         if self.terrain.brush == Brush::Road {
             // aperçu : courbe passant par les points cliqués et la souris, à la largeur de la route
+            let snap = self.road_snap(c);
+            let c = snap.map(|s| s.0).unwrap_or(c);
+            if let Some((q, end)) = snap {
+                if let Some((sp, _)) = self.cam.project(q + v3(0.0, 0.0, 0.4)) {
+                    painter.circle_stroke(sp, 9.0, egui::Stroke::new(2.5_f32, if end { Color32::from_rgb(90, 220, 255) } else { Color32::from_rgb(120, 255, 140) }));
+                    painter.text(sp + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, if end { "relier au bout" } else { "carrefour" }, egui::FontId::proportional(12.0), Color32::WHITE);
+                }
+            }
             let mut pts: Vec<[f32; 2]> = self.terrain.road_pts.iter().map(|p| [p.x, p.y]).collect();
             pts.push([c.x, c.y]);
             let hw = crate::roads::KINDS[self.terrain.road_kind as usize].width * 0.5;
@@ -1115,6 +1192,7 @@ impl DwApp {
             }
         });
         self.brush_sliders(ui, false);
+        self.game_textures_toggle(ui);
         if ui.button("Peindre tout selon le relief").clicked() {
             self.push_undo();
             let style = PRESETS[self.terrain.preset as usize].2;
@@ -1125,18 +1203,45 @@ impl DwApp {
         }
     }
 
+    /// Case « Vraies textures du jeu » (terrain et routes).
+    pub fn game_textures_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut on = crate::groundtex::enabled();
+        let tip = "Sable, terre, herbe, roche, béton, goudron et trottoirs avec les textures de GTA V (dictionnaires globalroads, globaldesertterrain, globalcanyonterrain). À l'export, rien n'est copié : le jeu les charge lui-même. Les marquages et passages piétons restent ceux de DragoWalker.";
+        if ui.checkbox(&mut on, "Vraies textures du jeu").on_hover_text(tip).changed() {
+            crate::groundtex::set_enabled(on);
+            self.terrain.dirty = true;
+        }
+        if on && !crate::groundtex::loaded() {
+            ui.label(RichText::new("Charge le jeu (onglet Jeu) pour les voir dans l'éditeur ; l'export les utilise déjà.").small().weak());
+        }
+    }
+
     fn terrain_ui_roads(&mut self, ui: &mut egui::Ui) {
+        // galerie : chaque type de route vu de dessus
         for (i, k) in crate::roads::KINDS.iter().enumerate() {
             let on = self.terrain.road_kind == i as u8;
-            let r = ui.selectable_label(on, RichText::new(format!("{}  ·  {:.0} m", k.name, k.width + 2.0 * k.sidewalk.max(k.shoulder))).strong());
-            if r.on_hover_text(k.tip).clicked() {
+            let tex = self
+                .road_thumbs
+                .entry(i as u8)
+                .or_insert_with(|| ui.ctx().load_texture(format!("dw_road_preview_{i}"), crate::roads::preview_image(i), egui::TextureOptions::LINEAR))
+                .clone();
+            let fill = if on { Color32::from_rgb(70, 52, 30) } else { Color32::from_rgb(30, 33, 39) };
+            let r = egui::Frame::new().fill(fill).corner_radius(6.0).inner_margin(4.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(160.0, 56.0)).corner_radius(4.0));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(k.name).strong().color(if on { Color32::from_rgb(255, 190, 90) } else { Color32::from_gray(225) }));
+                        ui.label(RichText::new(format!("{:.0} m de large", k.width + 2.0 * k.sidewalk.max(k.shoulder))).small());
+                        ui.label(RichText::new(k.tip).small().weak());
+                    });
+                });
+            });
+            if ui.interact(r.response.rect, egui::Id::new(("road_card", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.terrain.road_kind = i as u8;
                 self.set_terrain_brush(Brush::Road);
             }
-            if on {
-                ui.label(RichText::new(k.tip).small().weak());
-            }
         }
+        ui.label(RichText::new("Relier : un point posé près du bout d'une route s'y accroche (cercle bleu) ; sur une route, il fait un carrefour (cercle vert). Une route qui en croise une autre fait aussi un carrefour.").small());
         ui.add_space(4.0);
         ui.label(RichText::new("Clic : poser un point · double-clic ou Entrée : construire · Retour arrière : enlever le dernier point · Échap : annuler").small());
         let n = self.terrain.road_pts.len();
@@ -1154,7 +1259,22 @@ impl DwApp {
             ui.label(RichText::new("Routes du terrain").strong());
             let mut del: Option<usize> = None;
             let mut goto: Option<V3> = None;
+            let mut traffic_edit: Option<(usize, crate::roads::RoadTraffic)> = None;
             for (i, r) in t.roads.iter().enumerate() {
+                egui::CollapsingHeader::new(RichText::new("Circulation").small()).id_salt(("road_traffic", i)).show(ui, |ui| {
+                    let mut tr = r.traffic.clone();
+                    let mut ch = ui.checkbox(&mut tr.enabled, "Voitures sur cette route").changed();
+                    ch |= ui.add(egui::Slider::new(&mut tr.density, 0..=15).text("densité")).changed();
+                    egui::ComboBox::from_id_salt(("road_speed", i)).selected_text(["Lente", "Normale", "Rapide", "Très rapide"][tr.speed.min(3) as usize]).show_ui(ui, |ui| {
+                        for (k, n) in ["Lente", "Normale", "Rapide", "Très rapide"].iter().enumerate() {
+                            ch |= ui.selectable_value(&mut tr.speed, k as u8, *n).changed();
+                        }
+                    });
+                    ch |= ui.checkbox(&mut tr.no_big, "Pas de gros véhicules").changed();
+                    if ch {
+                        traffic_edit = Some((i, tr));
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label(format!("{} · {:.0} m", r.kind().name, r.length()));
                     if ui.small_button("Aller voir").clicked() {
@@ -1166,10 +1286,29 @@ impl DwApp {
                     }
                 });
             }
+            if let Some((i, tr)) = traffic_edit {
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    t.roads[i].traffic = tr;
+                }
+            }
             if let Some(i) = del {
                 self.push_undo();
+                let mut gone: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 if let Some(t) = self.proj.terrain.as_mut() {
-                    t.roads.remove(i);
+                    let r = t.roads.remove(i);
+                    t.junctions.retain(|j| {
+                        let keep = r.nearest(j.pos[0], j.pos[1]).map(|(d, _)| d > 1.0).unwrap_or(true);
+                        if !keep {
+                            gone.extend(j.props.iter().copied());
+                        }
+                        keep
+                    });
+                }
+                // les feux et panneaux de ses carrefours partent avec elle
+                if !gone.is_empty() {
+                    self.proj.delete_ids(&gone);
+                    self.clean_selection();
+                    self.sync_game_project();
                 }
                 self.terrain.dirty = true;
             }
@@ -1177,6 +1316,71 @@ impl DwApp {
                 self.cam.target = p;
                 self.cam.dist = self.cam.dist.min(120.0);
             }
+        }
+        self.terrain_ui_signals(ui);
+        ui.separator();
+        if ui.button("Morceaux de route du jeu…").on_hover_text("Bibliothèque des chaussées, virages et carrefours modelés par Rockstar, à poser bout à bout").clicked() {
+            self.buildings.open = true;
+            self.buildings.roads = true;
+            self.buildings.chosen = None;
+        }
+    }
+
+    /// Feux rouges et stops des carrefours : automatiques, ou choisis carrefour par carrefour.
+    fn terrain_ui_signals(&mut self, ui: &mut egui::Ui) {
+        let Some(t) = self.proj.terrain.as_ref() else { return };
+        if t.junctions.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.label(RichText::new("Feux et stops").strong());
+        let mut auto = t.auto_signals;
+        let mut changed = false;
+        if ui.checkbox(&mut auto, "Poser les feux et les stops aux carrefours").on_hover_text("Vrais objets du jeu : feux à bras (prop_traffic_01a / 01b) après le carrefour, bras au-dessus des voies, comme dans GTA V ; panneaux stop (prop_sign_road_01a) avant le carrefour. Les points de route disent aux voitures de s'arrêter au feu ou au stop. Chaque feu ou panneau reste un objet normal : tu peux le déplacer, le supprimer ou en ajouter d'autres depuis la bibliothèque de props.").changed() {
+            changed = true;
+        }
+        let (l, s) = self.signals_count();
+        ui.label(RichText::new(format!("{l} feu(x), {s} stop(s) posés · automatique : feux entre routes de même taille en ville, stops sur la plus petite route quand une rue rejoint une avenue, stops partout à la campagne")).small().weak());
+        let mut set: Option<(usize, u8)> = None;
+        let mut goto: Option<V3> = None;
+        for (i, j) in t.junctions.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let ctl = crate::signals::arm_controls(j);
+                let what = match (ctl.iter().filter(|c| **c == 1).count(), ctl.iter().filter(|c| **c == 2).count()) {
+                    (0, 0) => "rien".to_string(),
+                    (a, 0) => format!("{a} feux"),
+                    (0, b) => format!("{b} stops"),
+                    (a, b) => format!("{a} feux, {b} stops"),
+                };
+                ui.label(format!("Carrefour {} ({} branches) : {what}", i + 1, j.arms.len()));
+                let mut c = j.control.min(3);
+                egui::ComboBox::from_id_salt(("junction_ctl", i)).width(110.0).selected_text(crate::signals::CONTROL_NAMES[c as usize]).show_ui(ui, |ui| {
+                    for (k, n) in crate::signals::CONTROL_NAMES.iter().enumerate() {
+                        if ui.selectable_value(&mut c, k as u8, *n).changed() {
+                            set = Some((i, c));
+                        }
+                    }
+                });
+                if ui.small_button("Aller voir").clicked() {
+                    goto = Some(v3(j.pos[0], j.pos[1], j.pos[2]));
+                }
+            });
+        }
+        if changed || set.is_some() {
+            self.push_undo();
+            if let Some(t) = self.proj.terrain.as_mut() {
+                t.auto_signals = auto;
+                if let Some((i, c)) = set {
+                    t.junctions[i].control = c;
+                }
+            }
+            self.refresh_signals();
+            let (l, s) = self.signals_count();
+            self.status = format!("Signalisation des carrefours : {l} feu(x), {s} stop(s).");
+        }
+        if let Some(p) = goto {
+            self.cam.target = p;
+            self.cam.dist = self.cam.dist.min(60.0);
         }
     }
 
@@ -1265,6 +1469,57 @@ pub fn material_names(w: Option<&crate::gta::world::GameWorld>) -> Vec<String> {
         .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
         .filter(|n| n.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
         .collect()
+}
+
+/// Type d'objet (CBaseArchetypeDef) d'un morceau du terrain exporté : boîte dans le repère du morceau,
+/// dictionnaire de textures `txd` (celui de DragoWalker ou un dictionnaire du jeu).
+fn arch_xml(name: &str, txd: &str, lmn: V3, lmx: V3, lod: f32) -> String {
+    let c = (lmn + lmx) * 0.5;
+    let r = (lmx - lmn).len() * 0.5;
+    format!(
+        "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{lod}\" />\n   <flags value=\"{TERRAIN_ARCH_FLAGS}\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{r}\" />\n   <hdTextureDist value=\"200\" />\n   <name>{name}</name>\n   <textureDictionary>{txd}</textureDictionary>\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{name}</assetName>\n   <extensions />\n  </Item>",
+        lmn.x, lmn.y, lmn.z, lmx.x, lmx.y, lmx.z, c.x, c.y, c.z
+    )
+}
+
+/// Placement (CEntityDef) d'un morceau du terrain exporté, au point (x, y, 0).
+fn ent_xml(name: &str, guid: u32, x: f32, y: f32, lod: f32) -> String {
+    format!(
+        "  <Item type=\"CEntityDef\">\n   <archetypeName>{name}</archetypeName>\n   <flags value=\"{TERRAIN_ENTITY_FLAGS}\" />\n   <guid value=\"{guid}\" />\n   <position x=\"{x}\" y=\"{y}\" z=\"0\" />\n   <rotation x=\"0\" y=\"0\" z=\"0\" w=\"1\" />\n   <scaleXY value=\"1\" />\n   <scaleZ value=\"1\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>LODTYPES_DEPTH_HD</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n"
+    )
+}
+
+/// Écrit un modèle exporté, coupé selon le dictionnaire de ses textures : les parties à textures DragoWalker
+/// gardent le nom `name` et le dictionnaire `own_txd` ; celles qui utilisent une vraie texture du jeu vont dans
+/// `name_gN` (N = dictionnaire du jeu dans groundtex::TXDS), dont les matériaux nomment la texture du jeu.
+/// Un type d'objet n'a qu'un dictionnaire de textures : d'où un modèle par dictionnaire, posé au même endroit.
+/// Rend (nom du modèle, dictionnaire) de chaque modèle écrit.
+fn write_split(stream: &std::path::Path, name: &str, m: &RModel, keys: &[u64], texs: &[(u64, TexData)], own_txd: &str) -> Result<Vec<(String, String)>, String> {
+    let group = |k: u64| crate::groundtex::game_ref(k).and_then(|g| crate::groundtex::TXDS.iter().position(|t| *t == g.txd));
+    let mut out = Vec::new();
+    let mut groups: Vec<Option<usize>> = keys.iter().map(|k| group(*k)).collect();
+    groups.sort();
+    groups.dedup();
+    for g in groups {
+        let sel: Vec<usize> = (0..m.geoms.len()).filter(|&i| group(keys.get(i).copied().unwrap_or(0)) == g).collect();
+        if sel.is_empty() {
+            continue;
+        }
+        let sub = RModel { verts: m.verts.clone(), idx: m.idx.clone(), geoms: sel.iter().map(|&i| m.geoms[i].clone()).collect(), embedded_dict: None };
+        let sub_keys: Vec<u64> = sel.iter().map(|&i| keys[i]).collect();
+        match g {
+            None => {
+                crate::sollumz::write_ydr_xml_ex(stream, name, &sub, &sub_keys, texs, Some(own_txd))?;
+                out.push((name.to_string(), own_txd.to_string()));
+            }
+            Some(gi) => {
+                let pn = format!("{name}_g{gi}");
+                crate::sollumz::write_ydr_xml_named(stream, &pn, &sub, &sub_keys, &|k| crate::groundtex::game_ref(k).map(|t| t.tex.to_string()))?;
+                out.push((pn, crate::groundtex::TXDS[gi].to_string()));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn xyz(tag: &str, v: V3) -> String {
@@ -1383,6 +1638,8 @@ impl DwApp {
         let (mut emn, mut emx) = (v3(big, big, big), v3(-big, -big, -big));
         let (mut smn, mut smx) = (emn, emx);
         let mut tiles = 0;
+        // numéros d'objet à part de ceux des effets (export_scenery compte avec `tiles`)
+        let mut guid_n = 0x8000u32;
         let block = 100usize;
         let mut j0 = 0;
         let mut row = 0;
@@ -1401,31 +1658,29 @@ impl DwApp {
                     if !t.roads.is_empty() {
                         all.extend(crate::roads::road_textures());
                     }
+                    // les vraies textures du jeu ne sont pas copiées : le jeu les a déjà (voir groundtex.rs) ;
+                    // le dictionnaire garde au moins une texture pour exister
+                    // (ni les anciennes chaussées à marquages peints, qui ne servent plus qu'aux aperçus)
+                    let game = crate::groundtex::enabled();
+                    all.retain(|(k, _)| crate::groundtex::game_ref(*k).is_none() && (!game || (0..crate::roads::KINDS.len()).all(|i| crate::roads::road_tex_key(i) != *k)));
+                    if all.is_empty() {
+                        all = crate::roads::road_textures().into_iter().filter(|(k, _)| *k == crate::roads::LINE_WHITE_KEY).collect();
+                    }
                     crate::sollumz::write_ytd_xml(stream, txd, &all)?;
                     written_tex = true;
                 }
-                crate::sollumz::write_ydr_xml_ex(stream, &name, &m, &k, &tx, Some(txd))?;
+                let pieces = write_split(stream, &name, &m, &k, &tx, txd)?;
                 std::fs::write(stream.join(format!("dw_terrain_col_r{row}c{col}.ybn.xml")), tile.collision_xml(types)).map_err(|e| e.to_string())?;
                 // type d'objet : boîte du modèle (repère de la tuile : x, y depuis son coin, z absolu)
                 let (mn, mx) = tile.bounds();
                 let lmn = v3(0.0, 0.0, mn.z);
                 let lmx = v3(mx.x - mn.x, mx.y - mn.y, mx.z);
-                let c = (lmn + lmx) * 0.5;
-                let r = (lmx - lmn).len() * 0.5;
-                archs.push(format!(
-                    "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{lod}\" />\n   <flags value=\"{TERRAIN_ARCH_FLAGS}\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{r}\" />\n   <hdTextureDist value=\"200\" />\n   <name>{name}</name>\n   <textureDictionary>{txd}</textureDictionary>\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{name}</assetName>\n   <extensions />\n  </Item>",
-                    lmn.x, lmn.y, lmn.z, lmx.x, lmx.y, lmx.z, c.x, c.y, c.z
-                ));
                 tiles += 1;
-                let _ = std::fmt::Write::write_fmt(
-                    &mut ents,
-                    format_args!(
-                        "  <Item type=\"CEntityDef\">\n   <archetypeName>{name}</archetypeName>\n   <flags value=\"{TERRAIN_ENTITY_FLAGS}\" />\n   <guid value=\"{}\" />\n   <position x=\"{}\" y=\"{}\" z=\"0\" />\n   <rotation x=\"0\" y=\"0\" z=\"0\" w=\"1\" />\n   <scaleXY value=\"1\" />\n   <scaleZ value=\"1\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>LODTYPES_DEPTH_HD</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
-                        0x0D77_0000u32 + tiles,
-                        tile.origin.x,
-                        tile.origin.y
-                    ),
-                );
+                for (pn, ptxd) in &pieces {
+                    archs.push(arch_xml(pn, ptxd, lmn, lmx, lod));
+                    guid_n += 1;
+                    ents.push_str(&ent_xml(pn, 0x0D77_0000u32 + guid_n, tile.origin.x, tile.origin.y, lod));
+                }
                 emn = emn.min(mn);
                 emx = emx.max(mx);
                 smn = smn.min(mn - v3(lod, lod, lod));
@@ -1439,25 +1694,53 @@ impl DwApp {
         // routes : un modèle et une collision par route, placés à leur premier point
         let names = material_names(self.game.world.as_deref());
         let mut road_n = 0;
-        for (ri, r) in t.roads.iter().enumerate() {
-            if r.samples.len() < 2 {
-                continue;
-            }
-            let k = r.kind();
-            let anchor = v3(r.samples[0][0].floor(), r.samples[0][1].floor(), 0.0);
-            let (pos, uv, parts) = r.mesh(anchor);
+        // les carrefours forment une « route » de plus (modèle + collision)
+        let mut all_roads: Vec<(String, Option<&crate::roads::Road>)> = t.roads.iter().enumerate().map(|(i, r)| (format!("dw_road_{i}"), Some(r))).collect();
+        if !t.junctions.is_empty() {
+            all_roads.push(("dw_road_junctions".into(), None));
+        }
+        for (ri, (name, rr)) in all_roads.iter().enumerate() {
+            let (anchor, pos, uv, parts, ctypes) = match rr {
+                Some(r) => {
+                    if r.samples.len() < 2 {
+                        continue;
+                    }
+                    let k = r.kind();
+                    let anchor = v3(r.samples[0][0].floor(), r.samples[0][1].floor(), 0.0);
+                    let (pos, uv, parts) = r.mesh(anchor);
+                    // collision : chaussée, trottoirs, accotements (types de surface lus dans materials.dat)
+                    let shoulder = COLL_NAMES[(k.shoulder_mat as usize).min(COLL_NAMES.len() - 1)];
+                    let ctypes = [coll_type(&names, k.coll, if k.dirt { 35 } else { 4 }), coll_type(&names, "PAVING_SLAB", coll_type(&names, "CONCRETE", 1)), coll_type(&names, shoulder, 1)];
+                    (anchor, pos, uv, parts, ctypes)
+                }
+                None => {
+                    let anchor = v3(t.junctions[0].pos[0].floor(), t.junctions[0].pos[1].floor(), 0.0);
+                    let (mut pos, mut uv, mut parts): (Vec<V3>, Vec<[f32; 2]>, Vec<(u64, Vec<u32>, u8)>) = (Vec::new(), Vec::new(), Vec::new());
+                    for j in &t.junctions {
+                        let (p, u, pa) = crate::roads::junction_mesh(j, anchor);
+                        let base = pos.len() as u32;
+                        pos.extend(p);
+                        uv.extend(u);
+                        for (k, idx, m) in pa {
+                            parts.push((k, idx.into_iter().map(|i| i + base).collect(), m));
+                        }
+                    }
+                    let tar = coll_type(&names, "TARMAC", 4);
+                    (anchor, pos, uv, parts, [tar, tar, tar])
+                }
+            };
             let texs: Vec<(u64, TexData)> = (0..MATERIALS.len()).map(|m| (material_key(m), material_texture(m))).chain(crate::roads::road_textures()).collect();
             let (mut verts, mut idx, mut geoms, mut keys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             append_mesh(&mut verts, &mut idx, &mut geoms, &mut keys, &texs, &pos, &uv, &parts);
             let model = RModel { verts, idx, geoms, embedded_dict: None };
-            let name = format!("dw_road_{ri}");
-            crate::sollumz::write_ydr_xml_ex(stream, &name, &model, &keys, &texs, Some(txd))?;
-            // collision : chaussée, trottoirs, accotements (types de surface lus dans materials.dat)
-            let shoulder = COLL_NAMES[(k.shoulder_mat as usize).min(COLL_NAMES.len() - 1)];
-            let ctypes = [coll_type(&names, k.coll, if k.dirt { 35 } else { 4 }), coll_type(&names, "PAVING_SLAB", coll_type(&names, "CONCRETE", 1)), coll_type(&names, shoulder, 1)];
+            let pieces = write_split(stream, name, &model, &keys, &texs, txd)?;
             let world: Vec<V3> = pos.iter().map(|p| *p + anchor).collect();
             let mut tris = Vec::new();
             for (_, list, m) in &parts {
+                // marquages : pas de collision (la chaussée dessous a la sienne)
+                if *m == crate::roads::NO_COLLISION {
+                    continue;
+                }
                 for c in list.chunks_exact(3) {
                     tris.push((c[0], c[1], c[2], *m));
                 }
@@ -1468,22 +1751,12 @@ impl DwApp {
                 lmn = lmn.min(*p);
                 lmx = lmx.max(*p);
             }
-            let c = (lmn + lmx) * 0.5;
-            let rad = (lmx - lmn).len() * 0.5;
-            archs.push(format!(
-                "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{lod}\" />\n   <flags value=\"{TERRAIN_ARCH_FLAGS}\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{rad}\" />\n   <hdTextureDist value=\"200\" />\n   <name>{name}</name>\n   <textureDictionary>{txd}</textureDictionary>\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{name}</assetName>\n   <extensions />\n  </Item>",
-                lmn.x, lmn.y, lmn.z, lmx.x, lmx.y, lmx.z, c.x, c.y, c.z
-            ));
             tiles += 1;
-            let _ = std::fmt::Write::write_fmt(
-                &mut ents,
-                format_args!(
-                    "  <Item type=\"CEntityDef\">\n   <archetypeName>{name}</archetypeName>\n   <flags value=\"{TERRAIN_ENTITY_FLAGS}\" />\n   <guid value=\"{}\" />\n   <position x=\"{}\" y=\"{}\" z=\"0\" />\n   <rotation x=\"0\" y=\"0\" z=\"0\" w=\"1\" />\n   <scaleXY value=\"1\" />\n   <scaleZ value=\"1\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>LODTYPES_DEPTH_HD</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
-                    0x0D77_0000u32 + tiles,
-                    anchor.x,
-                    anchor.y
-                ),
-            );
+            for (pn, ptxd) in &pieces {
+                archs.push(arch_xml(pn, ptxd, lmn, lmx, lod));
+                guid_n += 1;
+                ents.push_str(&ent_xml(pn, 0x0D77_0000u32 + guid_n, anchor.x, anchor.y, lod));
+            }
             let (wmn, wmx) = (lmn + anchor, lmx + anchor);
             emn = emn.min(wmn);
             emx = emx.max(wmx);

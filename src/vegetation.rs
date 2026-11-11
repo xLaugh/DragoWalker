@@ -157,7 +157,8 @@ impl DwApp {
             let sc = self.rng.range(0.85, 1.2);
             e.scale_xy = sc;
             e.scale_z = sc;
-            e.lod_dist = s.lod_dist;
+            // distance du type dans le jeu, sinon celle de l'ensemble
+            e.lod_dist = self.game.world.as_ref().and_then(|w| w.archetypes.get(&crate::gta::crypto::joaat(props[k]))).map(|a| a.lod_dist).filter(|d| *d > 0.0).unwrap_or(s.lod_dist);
             near.push(e.pos);
             new.push(e);
         }
