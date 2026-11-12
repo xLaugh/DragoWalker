@@ -150,6 +150,78 @@ impl DwApp {
         out
     }
 
+    /// Contrôle du contenu du projet (hors intérieurs) : modèles inconnus, doublons, PNJ et circulation.
+    pub fn project_checks(&self) -> Vec<(Level, String)> {
+        let mut out: Vec<(Level, String)> = Vec::new();
+        let ymaps: Vec<&crate::model::Ymap> = self.proj.ymaps.iter().filter(|y| !y.sample).collect();
+        // --- modèles inconnus : ni dans le jeu, ni dans un .ytyp du projet
+        if let Some(w) = self.game.world.as_deref() {
+            let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for t in &self.proj.ytyps {
+                for m in &t.mlos {
+                    known.insert(m.name.to_lowercase());
+                }
+                for r in &t.raw_archetypes {
+                    let mut rest = r.as_str();
+                    while let Some(p) = rest.to_lowercase().find("<name>") {
+                        let after = &rest[p + 6..];
+                        let Some(e) = after.to_lowercase().find("</name>") else { break };
+                        known.insert(after[..e].trim().to_lowercase());
+                        rest = &after[e..];
+                    }
+                }
+            }
+            let mut unknown: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for y in &ymaps {
+                for e in &y.entities {
+                    let low = e.archetype.to_lowercase();
+                    // « dw_… » : modèles fabriqués par DragoWalker à l'export ; « hash_XXXXXXXX » : nom inconnu, écrit par son code
+                    if low.starts_with("dw_") || low.is_empty() || known.contains(&low) {
+                        continue;
+                    }
+                    let h = low.strip_prefix("hash_").and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| crate::gta::crypto::joaat(&low));
+                    if !w.archetypes.contains_key(&h) {
+                        *unknown.entry(e.archetype.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            if unknown.is_empty() {
+                out.push((Level::Ok, "Tous les modèles posés existent dans le jeu ou dans un .ytyp du projet.".into()));
+            } else {
+                let ex: Vec<String> = unknown.iter().take(5).map(|(n, c)| format!("{n} ({c})")).collect();
+                out.push((Level::Warning, format!("{} modèle(s) inconnu(s) du jeu et du projet : {}{} — ils n'apparaîtront pas en jeu.", unknown.len(), ex.join(", "), if unknown.len() > 5 { "…" } else { "" })));
+            }
+        }
+        // --- deux .ytyp du projet qui déclarent le même intérieur
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for t in &self.proj.ytyps {
+            for m in &t.mlos {
+                if let Some(other) = seen.insert(m.name.to_lowercase(), t.name.clone()) {
+                    out.push((Level::Error, format!("L'intérieur « {} » est déclaré dans deux .ytyp du projet ({other} et {}) : le jeu garde un seul des deux.", m.name, t.name)));
+                }
+            }
+        }
+        // --- PNJ : la réserve des PNJ a 256 places, partagée avec ceux que le jeu fait apparaître
+        let peds: Vec<crate::math::V3> = ymaps.iter().flat_map(|y| y.peds.iter().map(|p| p.pos)).collect();
+        if !peds.is_empty() {
+            let near = max_in_radius(&peds, 150.0);
+            let (lvl, msg) = if near >= 200 {
+                (Level::Error, format!("{near} PNJ dans un même cercle de 150 m : la réserve des PNJ (256 places, partagée avec la population du jeu) sera pleine, le jeu plante (« Pool Full »)."))
+            } else if near > 50 {
+                (Level::Warning, format!("{near} PNJ dans un même cercle de 150 m : risque de réserve des PNJ pleine (256 places, partagée avec la population du jeu) — **estimé**, à tester."))
+            } else {
+                (Level::Ok, format!("PNJ : {} posé(s), au plus {near} dans un cercle de 150 m.", peds.len()))
+            };
+            out.push((lvl, msg));
+        }
+        if let Some(t) = &self.proj.terrain {
+            if t.npc_traffic.enabled && t.npc_traffic.count > 30 {
+                out.push((Level::Warning, format!("Circulation : {} voitures de PNJ en même temps — chacune a son conducteur dans la réserve des PNJ (256 places) : risque de « Pool Full ».", t.npc_traffic.count)));
+            }
+        }
+        out
+    }
+
     /// Compteur de performance : (libellé, valeur, réserve du jeu concernée et sa taille, alerte).
     pub fn perf_stats(&self) -> Vec<(String, usize, Option<(String, u32)>, bool)> {
         let pools = game_pools(self.game.world.as_deref());
@@ -178,6 +250,11 @@ impl DwApp {
     /// Lignes de compte rendu pour l'export : erreurs et alertes du contrôle, alertes du compteur.
     pub fn check_report(&self) -> Vec<String> {
         let mut out = Vec::new();
+        for (lvl, msg) in self.project_checks() {
+            if lvl != Level::Ok {
+                out.push(format!("Contrôle du projet : {msg}"));
+            }
+        }
         let checks = self.mlo_checks();
         let (e, w) = (checks.iter().filter(|c| c.0 == Level::Error).count(), checks.iter().filter(|c| c.0 == Level::Warning).count());
         if e + w > 0 {
@@ -204,7 +281,23 @@ impl DwApp {
         let mut open = true;
         let checks = self.mlo_checks();
         let stats = self.perf_stats();
+        let proj_checks = self.project_checks();
+        let folder_report = self.check_folder_report.clone();
+        let mut pick_folder = false;
         self.show_panel(ctx, "controle", "Contrôle avant l'export", crate::docking::Dock::Floating, [560.0, 520.0], &mut open, |_s, ui| {
+            ui.label(RichText::new("Projet").strong());
+            for (lvl, msg) in &proj_checks {
+                let (mark, col) = match lvl {
+                    Level::Error => ("✖", Color32::from_rgb(255, 100, 90)),
+                    Level::Warning => ("⚠", Color32::from_rgb(255, 200, 80)),
+                    Level::Ok => ("✔", Color32::from_rgb(120, 220, 120)),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(mark).color(col));
+                    ui.label(RichText::new(msg).color(col));
+                });
+            }
+            ui.separator();
             ui.label(RichText::new("Intérieurs (MLO)").strong());
             if checks.is_empty() {
                 ui.label(RichText::new("Aucun intérieur créé dans le projet.").weak());
@@ -233,9 +326,149 @@ impl DwApp {
                 }
             });
             ui.label(RichText::new("Tailles des réserves lues dans gameconfig.xml du jeu ; la carte du jeu en occupe déjà une part : orange au-delà de la moitié.").small().weak());
+            ui.separator();
+            ui.label(RichText::new("Dossier de ressource FiveM").strong());
+            if ui.button("Contrôler un dossier…").on_hover_text("Vérifie une ressource déjà exportée (la tienne ou une autre) : fichiers .xml ou .zip oubliés dans stream/, fichiers vides, fichiers déclarés absents").clicked() {
+                pick_folder = true;
+            }
+            for (lvl, msg) in &folder_report {
+                let (mark, col) = match lvl {
+                    Level::Error => ("✖", Color32::from_rgb(255, 100, 90)),
+                    Level::Warning => ("⚠", Color32::from_rgb(255, 200, 80)),
+                    Level::Ok => ("✔", Color32::from_rgb(120, 220, 120)),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(mark).color(col));
+                    ui.label(RichText::new(msg).color(col));
+                });
+            }
             let _ = V3::ZERO;
             let _ = POOLS;
         });
         self.check_open = open;
+        if pick_folder {
+            if let Some(d) = rfd::FileDialog::new().set_title("Dossier d'une ressource FiveM (avec fxmanifest.lua)").pick_folder() {
+                self.check_folder_report = scan_resource_dir(&d);
+            }
+        }
+    }
+}
+
+/// Plus grand nombre de points dans un même cercle de rayon `r` centré sur l'un d'eux (plan XY).
+pub fn max_in_radius(pts: &[V3], r: f32) -> usize {
+    let r2 = r * r;
+    pts.iter().map(|a| pts.iter().filter(|b| (b.x - a.x).powi(2) + (b.y - a.y).powi(2) <= r2).count()).max().unwrap_or(0)
+}
+
+/// Contrôle d'un dossier de ressource FiveM exporté (ce que le jeu ne pourra pas charger).
+pub fn scan_resource_dir(dir: &std::path::Path) -> Vec<(Level, String)> {
+    let mut out: Vec<(Level, String)> = Vec::new();
+    let manifest = dir.join("fxmanifest.lua");
+    let man_text = std::fs::read_to_string(&manifest).or_else(|_| std::fs::read_to_string(dir.join("__resource.lua")));
+    let Ok(man) = man_text else {
+        out.push((Level::Error, format!("Pas de fxmanifest.lua dans {} : FiveM ne reconnaît pas ce dossier comme une ressource.", dir.display())));
+        return out;
+    };
+    // fichiers du dossier stream/
+    let stream = dir.join("stream");
+    let mut xml: Vec<String> = Vec::new();
+    let mut archives: Vec<String> = Vec::new();
+    let mut empty: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut stack = vec![stream.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            total += 1;
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let rel = p.strip_prefix(&stream).unwrap_or(&p).display().to_string();
+            if name.ends_with(".xml") {
+                xml.push(rel.clone());
+            } else if name.ends_with(".zip") || name.ends_with(".rar") || name.ends_with(".7z") {
+                archives.push(rel.clone());
+            }
+            if e.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+                empty.push(rel);
+            }
+        }
+    }
+    let list = |v: &Vec<String>| v.iter().take(4).cloned().collect::<Vec<_>>().join(", ") + if v.len() > 4 { "…" } else { "" };
+    if !stream.is_dir() {
+        out.push((Level::Warning, "Pas de dossier stream/ : cette ressource ne diffuse aucun fichier de carte ou de modèle.".into()));
+    }
+    if !xml.is_empty() {
+        out.push((Level::Error, format!("{} fichier(s) .xml dans stream/ ({}) : le jeu ne les charge pas. Il faut les convertir en fichiers binaires (CodeWalker / Sollumz) ; c'est ce qui arrive quand CodeWalker est introuvable pendant l'export.", xml.len(), list(&xml))));
+    }
+    if !archives.is_empty() {
+        out.push((Level::Error, format!("{} archive(s) dans stream/ ({}) : FiveM ne les ouvre pas. Décompresse-les.", archives.len(), list(&archives))));
+    }
+    if !empty.is_empty() {
+        out.push((Level::Error, format!("{} fichier(s) vide(s) dans stream/ ({}) : le jeu peut planter en les lisant.", empty.len(), list(&empty))));
+    }
+    // fichiers .ytyp déclarés par data_file mais absents
+    let mut missing: Vec<String> = Vec::new();
+    for line in man.lines() {
+        if line.contains("data_file") {
+            let parts: Vec<&str> = line.split(['\'', '"']).filter(|s| !s.trim().is_empty() && !s.contains("data_file")).collect();
+            if let Some(f) = parts.get(1) {
+                if f.contains('/') && !f.contains('*') && !dir.join(f).is_file() {
+                    missing.push(f.to_string());
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        out.push((Level::Error, format!("Le fxmanifest.lua déclare {} fichier(s) absent(s) : {}.", missing.len(), list(&missing))));
+    }
+    if out.is_empty() {
+        out.push((Level::Ok, format!("Rien d'anormal dans « {} » ({total} fichier(s) dans stream/).", dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::v3;
+
+    #[test]
+    fn cercle_le_plus_peuple() {
+        let mut pts: Vec<V3> = (0..60).map(|i| v3(i as f32, 0.0, 0.0)).collect(); // 60 PNJ sur 60 m
+        pts.push(v3(5000.0, 0.0, 0.0));
+        assert_eq!(max_in_radius(&pts, 150.0), 60);
+        assert_eq!(max_in_radius(&[], 150.0), 0);
+    }
+
+    #[test]
+    fn dossier_de_ressource() {
+        let d = std::env::temp_dir().join(format!("dw_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("stream")).unwrap();
+        // pas de manifeste
+        assert!(scan_resource_dir(&d).iter().any(|r| r.0 == Level::Error && r.1.contains("fxmanifest")));
+        std::fs::write(d.join("fxmanifest.lua"), "fx_version 'cerulean'\nfiles { 'stream/*.ytyp' }\ndata_file 'DLC_ITYP_REQUEST' 'stream/a.ytyp'\ndata_file 'DLC_ITYP_REQUEST' 'stream/absent.ytyp'\n").unwrap();
+        std::fs::write(d.join("stream").join("a.ytyp"), b"RSC7data").unwrap();
+        std::fs::write(d.join("stream").join("prop.yft.xml"), b"<x/>").unwrap();
+        std::fs::write(d.join("stream").join("pack.zip"), b"PK").unwrap();
+        std::fs::write(d.join("stream").join("vide.ybn"), b"").unwrap();
+        let r = scan_resource_dir(&d);
+        assert!(r.iter().any(|x| x.1.contains("1 fichier(s) .xml") && x.1.contains("prop.yft.xml")));
+        assert!(r.iter().any(|x| x.1.contains("archive") && x.1.contains("pack.zip")));
+        assert!(r.iter().any(|x| x.1.contains("vide") && x.1.contains("vide.ybn")));
+        assert!(r.iter().any(|x| x.1.contains("absent.ytyp")), "{r:?}");
+        assert!(!r.iter().any(|x| x.1.contains("a.ytyp,")));
+        // dossier propre
+        std::fs::remove_file(d.join("stream").join("prop.yft.xml")).unwrap();
+        std::fs::remove_file(d.join("stream").join("pack.zip")).unwrap();
+        std::fs::remove_file(d.join("stream").join("vide.ybn")).unwrap();
+        std::fs::write(d.join("stream").join("absent.ytyp"), b"RSC7data").unwrap();
+        let ok = scan_resource_dir(&d);
+        assert!(ok.len() == 1 && ok[0].0 == Level::Ok, "{ok:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

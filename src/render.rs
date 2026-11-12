@@ -155,6 +155,8 @@ pub struct ViewOpts {
     pub show_grid: bool,
     pub show_rooms: bool,
     pub show_sample: bool,
+    /// compteur de performance en haut à gauche de la vue
+    pub show_perf: bool,
 }
 
 /// Ce qu'il faut pour dessiner le monde du jeu.
@@ -591,7 +593,7 @@ fn push_game(faces: &mut Vec<Face>, painter: &Painter, cam: &Camera, g: &GameCtx
         cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         cand.truncate(g.max_draw);
     }
-    let mlo_stroke = Stroke::new(1.2, Color32::from_rgb(80, 220, 255));
+    let mlo_stroke = Stroke::new(1.2_f32, Color32::from_rgb(80, 220, 255));
     for (_, ei) in cand {
         let e = &w.ents[ei as usize];
         let corners = w.corners(ei);
@@ -701,7 +703,7 @@ pub fn draw_scene(
         let n = 20;
         let cx = (cam.target.x / step).round() * step;
         let cy = (cam.target.y / step).round() * step;
-        let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+        let stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
         for i in -n..=n {
             let o = i as f32 * step;
             line3(painter, cam, v3(cx + o, cy - n as f32 * step, 0.05), v3(cx + o, cy + n as f32 * step, 0.05), stroke);
@@ -776,7 +778,7 @@ pub fn draw_scene(
     }
     faces.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
     let mut mesh = Mesh::default();
-    let outline = Stroke::new(0.6, Color32::from_rgba_unmultiplied(20, 20, 25, 70));
+    let outline = Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(20, 20, 25, 70));
     for f in &faces {
         fill_poly(&mut mesh, cam, &f.pts, f.col);
         if mesh.vertices.len() > 60000 {
@@ -795,7 +797,7 @@ pub fn draw_scene(
             for (mi, m) in t.mlos.iter().enumerate() {
                 let (p, q) = proj.mlo_placement(&m.name).unwrap_or((V3::ZERO, crate::math::Quat::IDENTITY));
                 let current = cur_mlo == Some((ti, mi));
-                let room_stroke = Stroke::new(if current { 2.0 } else { 1.2 }, Color32::from_rgb(80, 220, 255));
+                let room_stroke = Stroke::new(if current { 2.0 } else { 1.2_f32 }, Color32::from_rgb(80, 220, 255));
                 let mut floor = Mesh::default();
                 for (ri, r) in m.rooms.iter().enumerate().skip(1) {
                     let mut w = [V3::ZERO; 8];
@@ -826,7 +828,7 @@ pub fn draw_scene(
                     fill_poly(&mut pm, cam, &clip_near(&cp, cam.near), col);
                     painter.add(EShape::mesh(pm));
                     for i in 0..4 {
-                        line3(painter, cam, wc[i], wc[(i + 1) % 4], Stroke::new(1.5, col.to_opaque()));
+                        line3(painter, cam, wc[i], wc[(i + 1) % 4], Stroke::new(1.5_f32, col.to_opaque()));
                     }
                 }
             }
@@ -835,19 +837,19 @@ pub fn draw_scene(
 
     // intérieurs du jeu (vrais modèles) : leur volume en fil
     for w in &gpu_mlo {
-        draw_box_edges(painter, cam, w, Stroke::new(1.2, Color32::from_rgb(80, 220, 255)));
+        draw_box_edges(painter, cam, w, Stroke::new(1.2_f32, Color32::from_rgb(80, 220, 255)));
     }
     // objet du jeu survolé
     if let Some(g) = game {
         if let Some(h) = g.hover {
             if (h as usize) < g.world.ents.len() {
-                draw_box_edges(painter, cam, &g.world.corners(h), Stroke::new(1.5, Color32::WHITE));
+                draw_box_edges(painter, cam, &g.world.corners(h), Stroke::new(1.5_f32, Color32::WHITE));
             }
         }
     }
     // sélection et survol
     for (id, w) in &drawn_boxes {
-        let stroke = if selected.contains(id) { Stroke::new(2.0, Color32::from_rgb(255, 214, 40)) } else { Stroke::new(1.5, Color32::WHITE) };
+        let stroke = if selected.contains(id) { Stroke::new(2.0_f32, Color32::from_rgb(255, 214, 40)) } else { Stroke::new(1.5_f32, Color32::WHITE) };
         draw_box_edges(painter, cam, w, stroke);
     }
 }
@@ -855,9 +857,10 @@ pub fn draw_scene(
 /// Dessine un cadre de prévisualisation (prop à poser).
 pub fn draw_ghost(painter: &Painter, cam: &Camera, proj: &Project, e: &Entity) {
     let w = e.corners(proj);
-    draw_box_edges(painter, cam, &w, Stroke::new(1.5, Color32::from_rgb(120, 255, 140)));
+    draw_box_edges(painter, cam, &w, Stroke::new(1.5_f32, Color32::from_rgb(120, 255, 140)));
 }
 
+#[allow(dead_code)]
 pub fn screen_rect_contains(r: Rect, p: Pos2) -> bool {
     r.contains(p)
 }

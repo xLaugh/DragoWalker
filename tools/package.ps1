@@ -57,3 +57,9 @@ if (-not $iscc) {
 & $iscc /Q "/DAppVersion=$version" "/DSrcDir=$out" (Join-Path $PSScriptRoot 'installer.iss')
 if ($LASTEXITCODE -ne 0) { throw "La création de l'installeur a échoué." }
 Write-Host "Installeur : $(Join-Path $dist "DragoWalker-$version-setup.exe")"
+
+# Empreintes SHA-256 des fichiers à publier (l'app les vérifie avant d'installer une mise à jour)
+$setup = Join-Path $dist "DragoWalker-$version-setup.exe"
+$lines = foreach ($f in @($setup, $zip)) { if (Test-Path $f) { "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), (Split-Path $f -Leaf) } }
+$lines | Out-File -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
+Write-Host "Empreintes : $(Join-Path $dist 'SHA256SUMS.txt')"

@@ -127,11 +127,14 @@ pub struct RVert {
     pub pos: [f32; 3],
     pub nrm: [f32; 3],
     pub uv: [f32; 2],
+    /// couleur du sommet ; pour un sol à 4 couches : (Colour1.b, Colour1.g, Colour0.a, 255), les poids du mélange
     pub col: [u8; 4],
+    /// deuxième coordonnée de texture (TexCoord1) : carte de mélange des sols à 4 couches (lookupSampler)
+    pub uv1: [f32; 2],
 }
 
 /// Une partie d'objet avec son matériau (texture de couleur).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RGeom {
     pub first: u32,
     pub count: u32,
@@ -144,6 +147,37 @@ pub struct RGeom {
     pub blend: u8,
     /// matériau de verre (vitres) : shader glass*.sps ou vehicle_vehglass*.sps
     pub glass: bool,
+    /// sol à 4 couches (terrain_cb_w_4lyr*.sps) : textures TextureSampler_layer0..3 (hachages des noms)
+    pub layers: [u32; 4],
+    /// carte de mélange (lookupSampler), 0 si aucune
+    pub mask: u32,
+    /// 0 : pas un sol à couches ; 1 : poids = carte de mélange et couleur de sommet (selon Colour0.a) ;
+    /// 2 : version lointaine (_lod) : couleur de sommet seule ; 3 : variantes _cm : carte de mélange seule
+    pub terrain: u8,
+}
+
+/// Matériau d'une partie : texture de couleur, genre (0 opaque…), et pour un sol à 4 couches ses textures.
+#[derive(Clone, Copy, Default)]
+pub struct ShaderTex {
+    pub tex: u32,
+    pub kind: u8,
+    pub layers: [u32; 4],
+    pub mask: u32,
+    pub terrain: u8,
+}
+
+/// Mode de mélange d'un sol à 4 couches d'après le fichier du shader (TerrainPS.hlsl de CodeWalker :
+/// terrain_cb_w_4lyr_lod → couleur de sommet seule ; variantes _cm → carte de mélange seule ; sinon les deux).
+fn terrain_mode(file_hash: u32) -> u8 {
+    let j = super::crypto::joaat;
+    if ["terrain_cb_w_4lyr_lod.sps", "terrain_cb_4lyr_lod.sps"].iter().any(|n| j(n) == file_hash) {
+        return 2;
+    }
+    let cm = ["terrain_cb_w_4lyr_cm.sps", "terrain_cb_w_4lyr_cm_tnt.sps", "terrain_cb_w_4lyr_cm_pxm.sps", "terrain_cb_w_4lyr_cm_pxm_tnt.sps", "terrain_cb_4lyr_cm.sps", "terrain_cb_4lyr_cm_tnt.sps", "terrain_cb_4lyr_cm_pxm.sps", "terrain_cb_4lyr_cm_pxm_tnt.sps"];
+    if cm.iter().any(|n| j(n) == file_hash) {
+        return 3;
+    }
+    1
 }
 
 #[derive(Clone)]
@@ -248,14 +282,17 @@ pub const GLASS_SHADERS: [u32; 16] = [
 ];
 
 /// Texture de couleur et genre de chaque matériau : 0 opaque, 1 découpe, 2 décalque, 3 transparent, 4 verre.
-fn shader_textures(r: &Resource, sg: usize) -> Vec<(u32, u8)> {
+fn shader_textures(r: &Resource, sg: usize) -> Vec<ShaderTex> {
     let diffuse = super::crypto::joaat("diffusesampler");
+    let layer_h = [super::crypto::joaat("texturesampler_layer0"), super::crypto::joaat("texturesampler_layer1"), super::crypto::joaat("texturesampler_layer2"), super::crypto::joaat("texturesampler_layer3")];
+    let lookup_h = super::crypto::joaat("lookupsampler");
     let mut out = Vec::new();
     let Some(arr) = r.ptr(r.u64(sg + 0x10)) else { return out };
     let n = r.u16(sg + 0x18) as usize;
     for i in 0..n.min(256) {
         let mut tex = 0u32;
         let mut cutout = 0u8;
+        let (mut layers, mut mask, mut terrain) = ([0u32; 4], 0u32, 0u8);
         if let Some(fx) = r.ptr(r.u64(arr + i * 8)) {
             // RenderBucket (ShaderFX +0x11) : 0 opaque, 1 transparent, 2 décalque, 3 découpe
             cutout = match r.u8(fx + 0x11) {
@@ -291,9 +328,16 @@ fn shader_textures(r: &Resource, sg: usize) -> Vec<(u32, u8)> {
                     // ou DistanceMapSampler ; à défaut FlowSampler / FoamSampler / 0x991CB1BE — jamais « la première
                     // texture venue » (elle prenait des cartes de relief violettes, ex. le verre de l'abri du métro)
                     let ph = r.u32(hashes + k * 4);
-                    if ph == diffuse || ph == 0x5002_2388 || ph == 0x605F_CC60 {
+                    if let Some(li) = layer_h.iter().position(|x| *x == ph) {
+                        layers[li] = h;
+                        continue;
+                    }
+                    if ph == lookup_h {
+                        mask = h;
+                        continue;
+                    }
+                    if tex == 0 && (ph == diffuse || ph == 0x5002_2388 || ph == 0x605F_CC60) {
                         tex = h;
-                        break;
                     }
                     if first_tex == 0 && matches!(ph, 0x485F_22B0 | 0xC2B0_8918 | 0x991E_CEBE) {
                         first_tex = h;
@@ -302,14 +346,43 @@ fn shader_textures(r: &Resource, sg: usize) -> Vec<(u32, u8)> {
                 if tex == 0 {
                     tex = first_tex;
                 }
+                if layers.iter().any(|x| *x != 0) {
+                    terrain = terrain_mode(r.u32(fx + 0x18));
+                }
+                // sonde (DW_SHADER_DEBUG) : matériau sans texture de couleur → ses paramètres
+                if tex == 0 && std::env::var_os("DW_SHADER_DEBUG").is_some() {
+                    let names = ["diffusesampler", "texturesampler_layer0", "texturesampler_layer1", "texturesampler_layer2", "texturesampler_layer3", "bumpsampler_layer0", "bumpsampler_layer1", "bumpsampler_layer2", "bumpsampler_layer3", "lookupsampler", "bumpsampler", "specsampler", "heightmapsamplerlayer0", "heightmapsamplerlayer1", "heightmapsamplerlayer2", "heightmapsamplerlayer3", "detailsampler", "diffusesampler2", "texturegrasssampler", "distancemapsampler", "tintpalettesampler", "snowsampler", "dirtsampler", "environmentsampler", "diffuseextrasampler", "noisesampler", "diffusehfsampler", "texturesamp", "heightsampler", "flowsampler", "foamsampler"];
+                    let sh = ["terrain_cb_w_4lyr.sps", "terrain_cb_w_4lyr_lod.sps", "terrain_cb_w_4lyr_spec.sps", "terrain_cb_w_4lyr_2tex.sps", "terrain_cb_w_4lyr_2tex_blend.sps", "terrain_cb_w_4lyr_2tex_blend_lod.sps", "terrain_cb_w_4lyr_cm.sps", "terrain_cb_w_4lyr_cm_tnt.sps", "terrain_cb_w_4lyr_cm_pxm.sps", "terrain_cb_w_4lyr_cm_pxm_tnt.sps", "terrain_cb_w_4lyr_pxm.sps", "terrain_cb_w_4lyr_pxm_spm.sps", "terrain_cb_w_4lyr_spec_pxm.sps", "terrain_cb_w_4lyr_spec_int.sps", "terrain_cb_w_4lyr_spec_int_pxm.sps", "terrain_cb_w_4lyr_2tex_pxm.sps", "terrain_cb_4lyr.sps", "terrain_cb_4lyr_lod.sps", "terrain_cb_4lyr_2tex.sps", "terrain_cb_4lyr_2tex_blend.sps", "terrain_cb_4lyr_2tex_blend_lod.sps", "terrain_cb_4lyr_cm.sps", "terrain_cb_4lyr_cm_tnt.sps", "terrain_cb_4lyr_pxm.sps", "terrain_cb_4lyr_spec.sps", "grass_batch.sps", "grass.sps", "default.sps", "normal.sps", "normal_spec.sps", "decal.sps", "water_terrainfoam.sps", "water_shallow.sps"];
+                    let file = r.u32(fx + 0x18);
+                    let fname = sh.iter().find(|n| super::crypto::joaat(n) == file).map(|s| s.to_string()).unwrap_or(format!("{file:08x}"));
+                    let mut ps = Vec::new();
+                    for k in 0..count.min(64) {
+                        let p = params + k * 16;
+                        let ph = r.u32(hashes + k * 4);
+                        let pname = names.iter().find(|n| super::crypto::joaat(n) == ph).map(|s| s.to_string()).unwrap_or(format!("{ph:08x}"));
+                        let tn = if r.u8(p) == 0 {
+                            r.ptr(r.u64(p + 8)).and_then(|t| r.ptr(r.u64(t + 0x28))).map(|np| {
+                                let end = r.data[np..].iter().take(128).position(|&b| b == 0).unwrap_or(0);
+                                String::from_utf8_lossy(&r.data[np..np + end]).to_string()
+                            }).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        if r.u8(p) == 0 {
+                            ps.push(format!("{pname}={tn}"));
+                        }
+                    }
+                    println!("   sans texture de couleur : shader {fname} ; textures : {}", ps.join(", "));
+                }
             }
         }
-        out.push((tex, cutout));
+        out.push(ShaderTex { tex, kind: cutout, layers, mask, terrain });
     }
     out
 }
 
-fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, tex: u32, kind: u8, max_tris: usize) {
+fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, st: ShaderTex, max_tris: usize) {
+    let (tex, kind) = (st.tex, st.kind);
     let glass = kind == 4;
     let (cutout, blend) = (kind == 1, match kind {
         2 => 1u8,
@@ -331,7 +404,7 @@ fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, tex: u32, ki
     let has_nrm = decl[3];
     for i in 0..vcount {
         let v = vdata + i * stride;
-        let mut rv = RVert { pos: read_vec3(r, v + pos_off, pos_t), nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255, 255, 255, 255] };
+        let mut rv = RVert { pos: read_vec3(r, v + pos_off, pos_t), nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255, 255, 255, 255], uv1: [0.0, 0.0] };
         if let Some((o, t)) = has_nrm {
             rv.nrm = read_vec3(r, v + o, t);
         }
@@ -341,6 +414,22 @@ fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, tex: u32, ki
         if let Some((o, 9)) = decl[4] {
             // couleur de sommet (B, G, R, A en mémoire)
             rv.col = [r.u8(v + o + 2), r.u8(v + o + 1), r.u8(v + o), r.u8(v + o + 3)];
+        }
+        if st.terrain != 0 {
+            // sol à 4 couches : poids du mélange = Colour1.b et Colour1.g, et Colour0.a dose la carte de mélange
+            // contre la couleur de sommet (TerrainPS.hlsl de CodeWalker)
+            let a0 = match decl[4] {
+                Some((o, 9)) => r.u8(v + o + 3),
+                _ => 255,
+            };
+            let (b1, g1) = match decl[5] {
+                Some((o, 9)) => (r.u8(v + o), r.u8(v + o + 1)),
+                _ => (0, 0),
+            };
+            rv.col = [b1, g1, a0, 255];
+            if let Some((o, t)) = decl[7] {
+                rv.uv1 = read_uv(r, v + o, t);
+            }
         }
         model.verts.push(rv);
     }
@@ -380,7 +469,7 @@ fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, tex: u32, ki
     }
     let count = model.idx.len() as u32 - first;
     if count > 0 {
-        model.geoms.push(RGeom { first, count, tex, cutout, blend, glass });
+        model.geoms.push(RGeom { first, count, tex, cutout, blend, glass, layers: st.layers, mask: st.mask, terrain: st.terrain });
     }
 }
 
@@ -398,9 +487,9 @@ pub fn read_render_drawable(r: &Resource, d: usize, max_tris: usize) -> Option<R
             let map = r.ptr(r.u64(m + 0x20));
             for gi in 0..gn.min(512) {
                 let sidx = map.map(|p| r.u16(p + gi * 2) as usize).unwrap_or(usize::MAX);
-                let (tex, cutout) = shader_tex.get(sidx).copied().unwrap_or((0, 0));
+                let st = shader_tex.get(sidx).copied().unwrap_or_default();
                 if let Some(g) = r.ptr(r.u64(garr + gi * 8)) {
-                    read_render_geometry(r, g, &mut model, tex, cutout, max_tris);
+                    read_render_geometry(r, g, &mut model, st, max_tris);
                 }
             }
         }
@@ -501,6 +590,7 @@ pub fn find_texture(r: &Resource, dict: usize, name_hash: u32, max_size: u32) ->
 /// DrawableBase, 0xA8 octets, et le nom ; Drawable::get_BlockLength 0x06004b9e = 0xD0).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GameLight {
+    #[allow(dead_code)]
     pub pos: [f32; 3],
     pub color: [u8; 3],
     pub flashiness: u8,

@@ -710,7 +710,7 @@ impl DwApp {
         }
         let sz = [m.max[0] - m.min[0], m.max[1] - m.min[1], m.max[2] - m.min[2]];
         painter.text(rect.left_bottom() + egui::vec2(8.0, -6.0), egui::Align2::LEFT_BOTTOM, format!("{name}  ·  {:.2} × {:.2} × {:.2} m  ·  {} triangles", sz[0], sz[1], sz[2], m.tris.len()), egui::FontId::proportional(11.5), Color32::from_gray(220));
-        painter.rect_stroke(rect, 6.0, Stroke::new(1.0, Color32::from_gray(70)), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, Color32::from_gray(70)), egui::StrokeKind::Inside);
         let hidden = m.outside.iter().filter(|v| !**v).count();
         if hidden > 0 {
             ui.checkbox(&mut self.game.preview_inside, format!("Voir aussi l'intérieur ({hidden} triangles cachés derrière la façade)"));

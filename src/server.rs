@@ -115,6 +115,9 @@ pub struct ServerState {
     pub command: String,
     /// nom de la ressource de la map (dossier exporté)
     pub resource: String,
+    /// test en jeu en cours : un plantage de FiveM écrit après cet instant ouvre l'analyse
+    pub watch: Option<std::time::SystemTime>,
+    pub watch_at: f64,
 }
 
 impl ServerState {
@@ -140,6 +143,8 @@ impl ServerState {
             console: Arc::new(Mutex::new(Vec::new())),
             command: String::new(),
             resource: String::new(),
+            watch: None,
+            watch_at: 0.0,
         }
     }
 
@@ -166,13 +171,13 @@ impl ServerState {
 
     /// Télécharge et décompresse le serveur officiel (dans un fil à part).
     pub fn install(&self) {
-        if *self.installing.lock().unwrap() {
+        if *self.installing.lock().unwrap_or_else(|e| e.into_inner()) {
             return;
         }
-        *self.installing.lock().unwrap() = true;
+        *self.installing.lock().unwrap_or_else(|e| e.into_inner()) = true;
         let (msg, busy, dir) = (self.install_msg.clone(), self.installing.clone(), PathBuf::from(&self.dir));
         std::thread::spawn(move || {
-            let set = |m: String| *msg.lock().unwrap() = m;
+            let set = |m: String| *msg.lock().unwrap_or_else(|e| e.into_inner()) = m;
             let r = (|| -> Result<String, String> {
                 set("Recherche de la version recommandée du serveur FiveM…".into());
                 let v: serde_json::Value = ureq::get(VERSIONS_URL).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
@@ -223,7 +228,7 @@ impl ServerState {
                 Ok(m) => m,
                 Err(e) => format!("Installation impossible : {e}"),
             });
-            *busy.lock().unwrap() = false;
+            *busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
         });
     }
 
@@ -240,15 +245,15 @@ impl ServerState {
     /// sans les parties inutiles ; un stream/stream.zip est décompressé dans stream/ (FiveM ne lit pas les .zip).
     pub fn install_addon(&self, key: &'static str) {
         let Some(a) = ADDONS.iter().find(|a| a.key == key) else { return };
-        if *self.addon_busy.lock().unwrap() {
+        if *self.addon_busy.lock().unwrap_or_else(|e| e.into_inner()) {
             return;
         }
-        *self.addon_busy.lock().unwrap() = true;
+        *self.addon_busy.lock().unwrap_or_else(|e| e.into_inner()) = true;
         let (msg, busy) = (self.addon_msg.clone(), self.addon_busy.clone());
         let dest = self.data().join("resources").join(a.key);
         let (repo, branch, sub, skip, label) = (a.repo, a.branch, a.sub, a.skip, a.label);
         std::thread::spawn(move || {
-            let set = |m: String| *msg.lock().unwrap() = m;
+            let set = |m: String| *msg.lock().unwrap_or_else(|e| e.into_inner()) = m;
             let r = (|| -> Result<usize, String> {
                 set(format!("Téléchargement de {repo}…"));
                 let url = format!("https://codeload.github.com/{repo}/zip/refs/heads/{branch}");
@@ -314,7 +319,7 @@ impl ServerState {
                 Ok(n) => format!("{label} installé ({n} fichiers, depuis github.com/{repo}).", ),
                 Err(e) => format!("Téléchargement de {repo} impossible : {e}"),
             });
-            *busy.lock().unwrap() = false;
+            *busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
         });
     }
 
@@ -476,7 +481,7 @@ impl DwApp {
                 let s2 = slot.clone();
                 std::thread::spawn(move || {
                     let r = crate::export::convert_and_tidy(&dll, &stream, &out);
-                    *s2.lock().unwrap() = Some(r);
+                    *s2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
                 });
                 self.server.job = Some((slot, then, std::time::Instant::now()));
             }
@@ -487,7 +492,15 @@ impl DwApp {
 
     /// Fin de la conversion : démarre le serveur ou recharge la map.
     fn server_after(&mut self, then: After, rep: Vec<String>) {
-        let rep = rep.join(" ");
+        let mut rep = rep.join(" ");
+        // contrôle du dossier exporté : ce que le jeu ne pourra pas charger
+        let scan = crate::check::scan_resource_dir(&self.server.data().join("resources").join(&self.server.resource));
+        let problems: Vec<String> = scan.iter().filter(|r| r.0 == crate::check::Level::Error).map(|r| r.1.clone()).collect();
+        if !problems.is_empty() {
+            rep += &format!(" ⚠ Contrôle de l'export : {}", problems.join(" · "));
+        }
+        self.check_folder_report = scan;
+        self.server.watch = Some(std::time::SystemTime::now());
         match then {
             After::Reload => {
                 let r = self.server.resource.clone();
@@ -515,8 +528,25 @@ impl DwApp {
 
     /// À chaque image : conversion finie → suite (démarrage ou rechargement).
     pub fn server_tick(&mut self, ctx: &egui::Context) {
+        // test en jeu : FiveM a-t-il planté ?
+        if let Some(since) = self.server.watch {
+            let now = ctx.input(|i| i.time);
+            if now - self.server.watch_at > 4.0 {
+                self.server.watch_at = now;
+                if let Some(log) = crate::crashlog::crashed_since(since) {
+                    self.server.watch = None;
+                    if let Ok(a) = crate::crashlog::analyse_folder(log.parent().unwrap_or(std::path::Path::new("."))) {
+                        self.crash.analysis = Some(a);
+                        self.crash.error.clear();
+                        self.crash.open = true;
+                        self.status = "FiveM a planté pendant le test : l'analyse est ouverte.".into();
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(4));
+        }
         let Some((slot, then, t0)) = self.server.job.as_ref().map(|j| (j.0.clone(), j.1, j.2)) else { return };
-        let done = slot.lock().unwrap().take();
+        let done = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
         match done {
             Some((_, rep)) => {
                 self.server.job = None;
@@ -557,6 +587,7 @@ impl DwApp {
     }
 
     /// Recharge la map sans déconnecter le joueur (même chemin que « Tester en jeu » quand le serveur tourne).
+    #[allow(dead_code)]
     pub fn server_reload(&mut self) {
         self.server_test();
     }
@@ -582,13 +613,13 @@ impl DwApp {
                 ui.label(RichText::new("✔ Serveur FiveM installé").color(Color32::from_rgb(140, 210, 140)));
             } else {
                 ui.horizontal(|ui| {
-                    let busy = *s.server.installing.lock().unwrap();
+                    let busy = *s.server.installing.lock().unwrap_or_else(|e| e.into_inner());
                     if ui.add_enabled(!busy, egui::Button::new(RichText::new("Installer le serveur (≈ 100 Mo)").strong())).on_hover_text("Télécharge la version recommandée du serveur officiel FiveM pour Windows").clicked() {
                         act = Some("install");
                     }
                 });
             }
-            let m = s.server.install_msg.lock().unwrap().clone();
+            let m = s.server.install_msg.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if !m.is_empty() {
                 ui.label(RichText::new(m).small());
             }
@@ -604,7 +635,7 @@ impl DwApp {
             });
             ui.separator();
             ui.label(RichText::new("Ressources à cocher").strong());
-            let busy = *s.server.addon_busy.lock().unwrap();
+            let busy = *s.server.addon_busy.lock().unwrap_or_else(|e| e.into_inner());
             for a in ADDONS.iter() {
                 let mut on = s.server.addons_on.iter().any(|k| k == a.key);
                 let inst = s.server.addon_installed(a.key);
@@ -624,7 +655,7 @@ impl DwApp {
                     }
                 });
             }
-            let am = s.server.addon_msg.lock().unwrap().clone();
+            let am = s.server.addon_msg.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if !am.is_empty() {
                 ui.label(RichText::new(am).small());
             }
@@ -669,6 +700,9 @@ impl DwApp {
                 if ui.add_enabled(running, egui::Button::new("Arrêter le serveur")).clicked() {
                     act = Some("stop");
                 }
+                if ui.button("Analyser un plantage").on_hover_text("Explique le dernier plantage de FiveM d'après son journal").clicked() {
+                    act = Some("crash");
+                }
             });
             ui.label(RichText::new(format!("En jeu : F2 noclip (Z Q S D, Espace / Ctrl, Maj plus vite) · /tp x y z · /tpm vers le repère · /dw_home · /dw_coords · /dw_copy · /dw_refresh recharge la zone. État : {}", if running { "serveur en marche" } else { "arrêté" })).small().weak());
             ui.separator();
@@ -710,6 +744,7 @@ impl DwApp {
         }
         match act {
             Some("install") => self.server.install(),
+            Some("crash") => self.crash.open = true,
             Some("test") => self.server_test(),
             Some("goto") => {
                 let p = self.cam.target;

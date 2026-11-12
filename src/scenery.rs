@@ -244,7 +244,7 @@ impl DwApp {
                             }
                             let k = if d <= 0.0 { (-d / 4.0).min(1.0) } else { 0.0 };
                             let target = z - 0.3 - depth * k;
-                            let h = &mut t.h[j * t.nx + i];
+                            let h = &mut std::sync::Arc::make_mut(&mut t.h)[j * t.nx + i];
                             if *h > target {
                                 *h = if d <= 0.0 { target } else { *h + (target - *h) * (1.0 - d / 4.0) * 0.5 };
                             }
@@ -432,12 +432,12 @@ impl DwApp {
             use crate::gta::drawable::{RGeom, RModel, RVert};
             let m = RModel {
                 verts: vec![
-                    RVert { pos: [0.0, 0.0, -0.05], nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255; 4] },
-                    RVert { pos: [0.01, 0.0, -0.05], nrm: [0.0, 0.0, 1.0], uv: [1.0, 0.0], col: [255; 4] },
-                    RVert { pos: [0.0, 0.01, -0.05], nrm: [0.0, 0.0, 1.0], uv: [0.0, 1.0], col: [255; 4] },
+                    RVert { pos: [0.0, 0.0, -0.05], nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255; 4], uv1: [0.0, 0.0] },
+                    RVert { pos: [0.01, 0.0, -0.05], nrm: [0.0, 0.0, 1.0], uv: [1.0, 0.0], col: [255; 4], uv1: [0.0, 0.0] },
+                    RVert { pos: [0.0, 0.01, -0.05], nrm: [0.0, 0.0, 1.0], uv: [0.0, 1.0], col: [255; 4], uv1: [0.0, 0.0] },
                 ],
                 idx: vec![0, 1, 2],
-                geoms: vec![RGeom { first: 0, count: 3, tex: 0, cutout: false, blend: 0, glass: false }],
+                geoms: vec![RGeom { first: 0, count: 3, tex: 0, cutout: false, blend: 0, glass: false, ..Default::default() }],
                 embedded_dict: None,
             };
             crate::sollumz::write_ydr_xml_ex(stream, "dw_fx_point", &m, &[0], &[], Some(crate::terrain::TERRAIN_TXD))?;

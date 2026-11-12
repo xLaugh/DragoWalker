@@ -1125,7 +1125,7 @@ impl DwApp {
         }
         if let Ok(mut g) = gpu.lock() {
             for (h, m, k, t) in &self.mlo_state.models {
-                g.add_custom(crate::gta::loader::Loaded { arch: *h, model: Some(m.clone()), part_keys: k.clone(), textures: t.clone() });
+                g.add_custom(crate::gta::loader::Loaded { arch: *h, model: Some(m.clone()), part_keys: k.clone(), layer_keys: Vec::new(), textures: t.clone() });
             }
         }
         self.mlo_state.sent_to = addr;
@@ -1917,7 +1917,7 @@ impl DwApp {
         if !boxes.is_empty() && ctx.cumulative_pass_nr().saturating_sub(*f) <= 1 {
             for (b, at_origin) in boxes {
                 let col = if *at_origin { Color32::from_rgb(255, 150, 40) } else { Color32::from_rgb(90, 255, 120) };
-                crate::render::draw_box_edges(painter, &self.cam, b, egui::Stroke::new(2.5, col));
+                crate::render::draw_box_edges(painter, &self.cam, b, egui::Stroke::new(2.5_f32, col));
             }
         }
         self.mlo_state.view_hover = None;
@@ -1933,7 +1933,7 @@ impl DwApp {
         // pièces retirées : en rouge, là où elles auraient été
         for p in pieces.iter().filter(|p| visible(p) && !r.taken(p, moved)) {
             for b in self.piece_now_boxes(&r, p) {
-                crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(1.5, Color32::from_rgb(255, 80, 70)));
+                crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(1.5_f32, Color32::from_rgb(255, 80, 70)));
             }
         }
         // mode test : DW_TEST_PIECE_HOVER="x,y" fait comme si la souris était là
@@ -1960,7 +1960,7 @@ impl DwApp {
         let Some((_, _, i, b)) = best else { return };
         let p = &pieces[i];
         let taken = r.taken(p, moved);
-        crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(3.0, Color32::from_rgb(255, 220, 60)));
+        crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(3.0_f32, Color32::from_rgb(255, 220, 60)));
         let text = format!("{}\n{} · {}\nX : {} · clic : la retrouver dans la liste", p.file, p.kind.label(), if taken { "prise à l'export" } else { "retirée de l'export" }, if taken { "la retirer" } else { "la remettre" });
         let galley = painter.layout(text, egui::FontId::proportional(13.0), Color32::WHITE, 420.0);
         let at = hp + egui::vec2(18.0, 14.0);

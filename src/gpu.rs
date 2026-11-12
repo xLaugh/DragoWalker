@@ -44,11 +44,14 @@ struct GpuMesh {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ibo: glow::Buffer,
-    /// (premier indice, nombre, texture, découpe, mélangé)
-    parts: Vec<(u32, u32, u64, bool, u8)>,
+    /// (premier indice, nombre, texture, découpe, mélangé, sol à couches, textures des couches + carte de mélange)
+    parts: Vec<Part>,
     bytes: usize,
     last: u64,
 }
+
+/// Une partie d'un modèle envoyé à la carte graphique.
+type Part = (u32, u32, u64, bool, u8, u8, [u64; 5]);
 
 enum Slot {
     Loading,
@@ -83,6 +86,10 @@ struct Prog {
     u_water: Option<glow::UniformLocation>,
     u_time: Option<glow::UniformLocation>,
     u_clip: Option<glow::UniformLocation>,
+    u_terrain: Option<glow::UniformLocation>,
+    u_has_l: Option<glow::UniformLocation>,
+    u_has_mask: Option<glow::UniformLocation>,
+    u_layers: [Option<glow::UniformLocation>; 5],
 }
 
 pub struct Gpu {
@@ -125,6 +132,11 @@ const MESH_BUDGET: usize = 1_400_000_000;
 const TEX_BUDGET: usize = 700_000_000;
 
 impl Gpu {
+    /// Mémoire graphique prise par les modèles et les textures (Mo).
+    pub fn memory_mb(&self) -> (usize, usize) {
+        (self.mesh_bytes >> 20, self.tex_bytes >> 20)
+    }
+
     pub fn new(src: ModelSource) -> Gpu {
         let claimed = Arc::new(Mutex::new(HashSet::new()));
         let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8) - 1;
@@ -162,7 +174,7 @@ impl Gpu {
             None => {
                 // modèle fabriqué par DragoWalker libéré : renvoyé depuis sa copie en mémoire
                 if let Some(src) = self.custom_src.get(&arch) {
-                    let l = Loaded { arch, model: src.model.clone(), part_keys: src.part_keys.clone(), textures: src.textures.clone() };
+                    let l = Loaded { arch, model: src.model.clone(), part_keys: src.part_keys.clone(), layer_keys: src.layer_keys.clone(), textures: src.textures.clone() };
                     self.slots.insert(arch, Slot::Loading);
                     self.pending.push(l);
                     return false;
@@ -179,7 +191,7 @@ impl Gpu {
     /// Modèle personnel (Blender / Sollumz) : remplace celui du jeu du même nom.
     pub fn add_custom(&mut self, l: Loaded) {
         self.pinned_tex.extend(l.textures.iter().map(|(k, _)| *k));
-        self.custom_src.insert(l.arch, Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), textures: l.textures.clone() });
+        self.custom_src.insert(l.arch, Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), layer_keys: l.layer_keys.clone(), textures: l.textures.clone() });
         self.slots.insert(l.arch, Slot::Loading);
         self.pending.push(l);
     }
@@ -193,6 +205,7 @@ impl Gpu {
         matches!(self.slots.get(&arch), Some(Slot::Ready(_)) | Some(Slot::Loading)) || self.pending.iter().any(|l| l.arch == arch)
     }
 
+    #[allow(dead_code)]
     pub fn has_model(&self, arch: u32) -> bool {
         matches!(self.slots.get(&arch), Some(Slot::Ready(_)))
     }
@@ -205,18 +218,20 @@ impl Gpu {
             v => return Err(format!("OpenGL trop ancien pour les vrais modèles ({v:?})")),
         };
         let vs = format!(
-            "{head}in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aCol;
+            "{head}in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aCol; in vec2 aUv1;
 uniform mat4 uVP; uniform mat4 uM; uniform float uCube; uniform vec3 uBMin; uniform vec3 uBMax;
-out vec3 vN; out vec2 vUv; out vec3 vW;
+out vec3 vN; out vec2 vUv; out vec3 vW; out vec4 vCol; out vec2 vUv1;
 void main() {{
   vec3 p = uCube > 0.5 ? mix(uBMin, uBMax, aPos) : aPos;
   vec4 w = uM * vec4(p, 1.0);
-  vW = w.xyz; vN = mat3(uM) * aNrm; vUv = aUv;
+  vW = w.xyz; vN = mat3(uM) * aNrm; vUv = aUv; vCol = aCol; vUv1 = aUv1;
   gl_Position = uVP * w;
 }}"
         );
         let fs = format!(
-            "{head}in vec3 vN; in vec2 vUv; in vec3 vW;
+            "{head}in vec3 vN; in vec2 vUv; in vec3 vW; in vec4 vCol; in vec2 vUv1;
+uniform sampler2D uL0; uniform sampler2D uL1; uniform sampler2D uL2; uniform sampler2D uL3; uniform sampler2D uMask;
+uniform vec4 uHasL; uniform float uHasMask; uniform float uTerrain;
 uniform sampler2D uTex; uniform float uHasTex; uniform float uCutout; uniform float uBlend; uniform vec3 uColor; uniform vec3 uEye; uniform vec4 uFog; uniform float uAlpha;
 uniform mat4 uLightVP; uniform sampler2D uShadow; uniform float uShadowOn; uniform float uWater; uniform float uTime; uniform float uClipZ;
 out vec4 oCol;
@@ -246,6 +261,19 @@ void main() {{
     if (uBlend > 0.5 && t.a < 0.02) discard;
     base = t.rgb;
     ta = t.a;
+  }}
+  if (uTerrain > 0.5) {{
+    // sol à 4 couches, comme TerrainPS.hlsl de CodeWalker : poids B, G venant de Colour1 (vCol.rg) et / ou de la
+    // carte de mélange (canaux b, g) dosée par Colour0.a (vCol.b) ; couche absente = gris moyen
+    vec4 g = vec4(0.5, 0.5, 0.5, 1.0);
+    vec4 c1 = uHasL.x > 0.5 ? texture(uL0, vUv) : g;
+    vec4 c2 = uHasL.y > 0.5 ? texture(uL1, vUv) : g;
+    vec4 c3 = uHasL.z > 0.5 ? texture(uL2, vUv) : g;
+    vec4 c4 = uHasL.w > 0.5 ? texture(uL3, vUv) : g;
+    vec2 vc = vCol.rg;
+    vec2 m = uHasMask > 0.5 ? texture(uMask, vUv1).bg : vc;
+    vec2 wt = uTerrain < 1.5 ? mix(m, vc, vCol.b) : (uTerrain < 2.5 ? vc : m);
+    base = mix(mix(c1, c2, wt.x), mix(c3, c4, wt.x), wt.y).rgb;
   }}
   float d = length(vW - uEye);
   float f = clamp(1.0 - exp(-d * uFog.w), 0.0, 0.8);
@@ -287,7 +315,7 @@ void main() {{
             gl.attach_shader(p, s);
             shaders.push(s);
         }
-        for (i, n) in ["aPos", "aNrm", "aUv", "aCol"].iter().enumerate() {
+        for (i, n) in ["aPos", "aNrm", "aUv", "aCol", "aUv1"].iter().enumerate() {
             gl.bind_attrib_location(p, i as u32, n);
         }
         gl.link_program(p);
@@ -320,6 +348,10 @@ void main() {{
             u_water: u("uWater"),
             u_time: u("uTime"),
             u_clip: u("uClipZ"),
+            u_terrain: u("uTerrain"),
+            u_has_l: u("uHasL"),
+            u_has_mask: u("uHasMask"),
+            u_layers: [u("uL0"), u("uL1"), u("uL2"), u("uL3"), u("uMask")],
         });
         // carte des ombres : texture de profondeur + cadre de dessin
         let st = gl.create_texture()?;
@@ -357,11 +389,11 @@ void main() {{
         for (n, q) in faces {
             let b = verts.len() as u32;
             for p in q {
-                verts.push(loader_vert::V { pos: p, nrm: n, uv: [0.0, 0.0], col: [255; 4] });
+                verts.push(loader_vert::V { pos: p, nrm: n, uv: [0.0, 0.0], col: [255; 4], uv1: [0.0, 0.0] });
             }
             idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
         }
-        self.cube = Some(upload_mesh(gl, &verts, &idx, vec![(0, idx.len() as u32, 0, false, 0)])?);
+        self.cube = Some(upload_mesh(gl, &verts, &idx, vec![(0, idx.len() as u32, 0, false, 0, 0, [0; 5])])?);
         Ok(())
     }
 
@@ -415,8 +447,13 @@ void main() {{
             }
             match &l.model {
                 Some(m) => {
-                    let verts: Vec<loader_vert::V> = m.verts.iter().map(|v| loader_vert::V { pos: v.pos, nrm: v.nrm, uv: v.uv, col: v.col }).collect();
-                    let parts = m.geoms.iter().zip(l.part_keys.iter()).map(|(g, k)| (g.first, g.count, *k, g.cutout, g.blend)).collect();
+                    let verts: Vec<loader_vert::V> = m.verts.iter().map(|v| loader_vert::V { pos: v.pos, nrm: v.nrm, uv: v.uv, col: v.col, uv1: v.uv1 }).collect();
+                    let parts = m
+                        .geoms
+                        .iter()
+                        .enumerate()
+                        .map(|(i, g)| (g.first, g.count, l.part_keys.get(i).copied().unwrap_or(0), g.cutout, g.blend, g.terrain, l.layer_keys.get(i).copied().unwrap_or([0; 5])))
+                        .collect();
                     match upload_mesh(gl, &verts, &m.idx, parts) {
                         Ok(mut gm) => {
                             gm.last = self.frame;
@@ -483,6 +520,8 @@ void main() {{
     unsafe fn draw_insts(&mut self, gl: &glow::Context, insts: &[Inst], shadow_pass: bool, blend_pass: u8) -> (usize, usize, usize) {
         let p = self.prog.as_ref().unwrap();
         let (u_m, u_cube, u_bmin, u_bmax, u_has, u_col, u_cut) = (p.u_m.clone(), p.u_cube.clone(), p.u_bmin.clone(), p.u_bmax.clone(), p.u_has_tex.clone(), p.u_color.clone(), p.u_cutout.clone());
+        let (u_terr, u_has_l, u_has_mask) = (p.u_terrain.clone(), p.u_has_l.clone(), p.u_has_mask.clone());
+        gl.uniform_1_f32(u_terr.as_ref(), 0.0);
         let frame = self.frame;
         let (mut n_mesh, mut n_box, mut n_tris) = (0, 0, 0);
         gl.active_texture(glow::TEXTURE0);
@@ -497,7 +536,7 @@ void main() {{
                     // texture, EnableTexture = 0) — la couleur par type ne sert qu'aux boîtes
                     gl.uniform_3_f32(u_col.as_ref(), 0.72, 0.72, 0.72);
                     gl.bind_vertex_array(Some(m.vao));
-                    for &(first, count, key, cutout, blend) in &m.parts {
+                    for &(first, count, key, cutout, blend, terr, lk) in &m.parts {
                         // les décalques et transparences ne font pas d'ombre et sont dessinés après le reste
                         if blend != blend_pass {
                             continue;
@@ -516,6 +555,27 @@ void main() {{
                             }
                             None => gl.uniform_1_f32(u_has.as_ref(), 0.0),
                         }
+                        // sol à 4 couches : textures des couches sur les unités 2 à 5, carte de mélange sur la 6
+                        if terr != 0 && !shadow_pass {
+                            let mut has = [0.0f32; 5];
+                            for (i, k) in lk.iter().enumerate() {
+                                if *k == 0 {
+                                    continue;
+                                }
+                                if let Some(t) = self.textures.get_mut(k) {
+                                    t.last = frame;
+                                    gl.active_texture(glow::TEXTURE2 + i as u32);
+                                    gl.bind_texture(glow::TEXTURE_2D, Some(t.tex));
+                                    has[i] = 1.0;
+                                }
+                            }
+                            gl.active_texture(glow::TEXTURE0);
+                            gl.uniform_1_f32(u_terr.as_ref(), terr as f32);
+                            gl.uniform_4_f32(u_has_l.as_ref(), has[0], has[1], has[2], has[3]);
+                            gl.uniform_1_f32(u_has_mask.as_ref(), has[4]);
+                        } else {
+                            gl.uniform_1_f32(u_terr.as_ref(), 0.0);
+                        }
                         gl.draw_elements(glow::TRIANGLES, count as i32, glow::UNSIGNED_INT, (first * 4) as i32);
                         n_tris += count as usize / 3;
                     }
@@ -526,6 +586,7 @@ void main() {{
                         continue;
                     }
                     if let Some(c) = &self.cube {
+                        gl.uniform_1_f32(u_terr.as_ref(), 0.0);
                         gl.uniform_1_f32(u_cube.as_ref(), 1.0);
                         gl.uniform_3_f32(u_bmin.as_ref(), inst.bmin[0], inst.bmin[1], inst.bmin[2]);
                         gl.uniform_3_f32(u_bmax.as_ref(), inst.bmax[0], inst.bmax[1], inst.bmax[2]);
@@ -583,6 +644,13 @@ void main() {{
         };
         gl.uniform_1_i32(u_tex.as_ref(), 0);
         gl.uniform_1_i32(u_shadow.as_ref(), 1);
+        {
+            let p = self.prog.as_ref().unwrap();
+            for (i, u) in p.u_layers.iter().enumerate() {
+                gl.uniform_1_i32(u.as_ref(), 2 + i as i32);
+            }
+            gl.uniform_1_f32(p.u_terrain.as_ref(), 0.0);
+        }
         gl.uniform_1_f32(u_alpha.as_ref(), 1.0);
         gl.uniform_1_f32(u_water.as_ref(), 0.0);
         gl.uniform_1_f32(u_shadow_on.as_ref(), 0.0);
@@ -705,10 +773,11 @@ mod loader_vert {
         pub nrm: [f32; 3],
         pub uv: [f32; 2],
         pub col: [u8; 4],
+        pub uv1: [f32; 2],
     }
 }
 
-unsafe fn upload_mesh(gl: &glow::Context, verts: &[loader_vert::V], idx: &[u32], parts: Vec<(u32, u32, u64, bool, u8)>) -> Result<GpuMesh, String> {
+unsafe fn upload_mesh(gl: &glow::Context, verts: &[loader_vert::V], idx: &[u32], parts: Vec<Part>) -> Result<GpuMesh, String> {
     let vao = gl.create_vertex_array()?;
     gl.bind_vertex_array(Some(vao));
     let vbo = gl.create_buffer()?;
@@ -728,6 +797,8 @@ unsafe fn upload_mesh(gl: &glow::Context, verts: &[loader_vert::V], idx: &[u32],
     gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 24);
     gl.enable_vertex_attrib_array(3);
     gl.vertex_attrib_pointer_f32(3, 4, glow::UNSIGNED_BYTE, true, stride, 32);
+    gl.enable_vertex_attrib_array(4);
+    gl.vertex_attrib_pointer_f32(4, 2, glow::FLOAT, false, stride, 36);
     gl.bind_vertex_array(None);
     gl.bind_buffer(glow::ARRAY_BUFFER, None);
     gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);

@@ -15,6 +15,7 @@ use std::sync::RwLock;
 /// Une texture du jeu : (clé de texture DragoWalker, dictionnaire du jeu, nom de la texture).
 pub struct GameTex {
     pub key: u64,
+    #[allow(dead_code)]
     pub label: &'static str,
     pub txd: &'static str,
     pub tex: &'static str,
@@ -107,6 +108,7 @@ pub fn apply(texs: &mut [(u64, TexData)]) {
 }
 
 /// Texture du jeu d'une clé (pour les aperçus), si elle est lue.
+#[allow(dead_code)]
 pub fn get(key: u64) -> Option<TexData> {
     if !enabled() {
         return None;

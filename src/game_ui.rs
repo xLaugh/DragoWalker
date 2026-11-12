@@ -528,6 +528,7 @@ impl DwApp {
     // ------------------------------------------------------------ choix à la souris
 
     /// Objet du jeu sous la souris (parmi ceux dessinés) : (distance, index).
+    #[allow(dead_code)]
     pub fn game_pick(&self, s: Pos2) -> Option<(f32, u32)> {
         let w = self.game.world.as_ref()?;
         let (o, d) = self.cam.ray(s);
@@ -627,6 +628,16 @@ impl DwApp {
     /// Tout ce qui est sous la souris, du premier au dernier : d'abord les objets qui contiennent le point
     /// visible (le plus petit d'abord), puis les autres du plus proche au plus loin. Ce qui est caché (H) ou
     /// au-dessus de la coupe (C) est ignoré ; un placement d'intérieur passe après ses objets.
+    /// Objet du projet caché par une vue isolée : « Isoler » ne montre que la sélection (render.rs, `only`) ;
+    /// un intérieur isolé de la bibliothèque ne montre aucun objet du projet (`isolate`). Ce qui n'est pas dessiné
+    /// ne doit pas non plus être survolé ni choisi.
+    pub fn hidden_by_isolation(&self, id: u64) -> bool {
+        if self.game.isolate.is_some() {
+            return true;
+        }
+        self.isolate_sel.as_ref().map(|s| !s.contains(&id)).unwrap_or(false)
+    }
+
     pub fn under_cursor(&self, s: Pos2) -> Vec<Under> {
         let (o, d) = self.cam.ray(s);
         let cut = self.cut_z();
@@ -658,7 +669,7 @@ impl DwApp {
                 continue;
             }
             let Some(e) = self.proj.world_entity(it) else { continue };
-            if self.game.hidden_ids.contains(&e.id) {
+            if self.game.hidden_ids.contains(&e.id) || self.hidden_by_isolation(e.id) {
                 continue;
             }
             let Some(t) = crate::render::ray_hit(&e, &self.proj, o, d) else { continue };
@@ -675,7 +686,8 @@ impl DwApp {
                 c.push((1, size * 0.5 * e.scale_xy.max(e.scale_z), Under::Proj(e.id)));
             }
         }
-        if let Some(w) = self.game.world.as_ref() {
+        // vue « Isoler » : la carte du jeu n'est pas dessinée, ses objets ne se choisissent pas
+        if let Some(w) = self.game.world.as_ref().filter(|_| self.isolate_sel.is_none()) {
             for &ei in &self.game.drawn {
                 if !editable(w, ei) || w.ymaps[w.ents[ei as usize].ymap as usize].in_project {
                     continue;
@@ -1149,7 +1161,7 @@ impl DwApp {
                 Color32::from_gray(210),
             );
         }
-        painter.rect_stroke(rect, 6.0, Stroke::new(1.0, Color32::from_gray(70)), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, Color32::from_gray(70)), egui::StrokeKind::Inside);
         let _ = Path::new("");
         let _ = Tab::Props;
     }

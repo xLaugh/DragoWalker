@@ -3,13 +3,19 @@
 mod ai;
 mod analyse;
 mod app;
+mod assistant;
 mod buildings;
 mod camera;
 mod convert;
+mod crashlog;
 mod catalog;
 mod cwbridge;
 mod docking;
+mod edit_ops;
 mod export;
+mod files;
+mod frame;
+mod i18n;
 mod game_ui;
 mod gizmo;
 mod ground;
@@ -17,12 +23,14 @@ mod gpu;
 mod groundtex;
 mod mlo;
 mod bedit;
+#[allow(dead_code)]
 mod grass;
 mod check;
 mod shell;
 mod lights;
 mod groups;
 mod occlusion;
+mod openings;
 mod intlib;
 mod library;
 mod life;
@@ -39,6 +47,7 @@ mod render;
 mod sample;
 mod server;
 mod signals;
+mod safety;
 mod scenery;
 mod sollumz;
 mod texdecode;
@@ -66,10 +75,46 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.len() >= 3 && args[1] == "--analyse-crash" {
+        match crashlog::analyse_folder(std::path::Path::new(&args[2])) {
+            Ok(a) => print!("{}", crashlog::summary(&a)),
+            Err(e) => println!("{e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 12 && args[1] == "--open-ydr-xml" {
+        // dragowalker --open-ydr-xml <entrée.ydr.xml> <sortie.ydr.xml> x y z dirx diry largeur hauteur profondeur [appui]
+        let f = |i: usize| args[i].parse::<f32>().unwrap_or(0.0);
+        let o = openings::Opening { pos: [f(4), f(5), f(6)], dir: [f(7), f(8)], w: f(9), h: f(10), depth: f(11), kind: "test".into(), sill: args.get(12).is_some(), prop: String::new() };
+        match std::fs::read_to_string(&args[2]).ok().and_then(|s| openings::apply_to_ydr_xml(&s, &[o])) {
+            Some((x, n)) => {
+                let _ = std::fs::write(&args[3], x);
+                println!("{n} triangle(s) découpé(s), écrit dans {}", args[3]);
+            }
+            None => println!("rien à faire ou fichier illisible"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 6 && args[1] == "--ground-probe" {
+        let f = |i: usize| args[i].parse::<f32>().unwrap_or(0.0);
+        gta::ground_probe(&args[2], f(3), f(4), f(5));
+        return Ok(());
+    }
+    if args.len() >= 5 && args[1] == "--dump-ydr-xml" {
+        // dragowalker --dump-ydr-xml <dossier du jeu> <modèle> <dossier de sortie> : le .ydr du jeu lu en XML par CodeWalker
+        gta::dump_ydr_xml(&args[2], &args[3], &args[4]);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--gta-region" {
+        gta::region_probe(&args[2], &args[3..]);
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--gta-probe" {
         gta::probe(&args[2], args.get(3).map(|s| s.as_str()).unwrap_or(""));
         return Ok(());
     }
+    safety::install_panic_hook();
+    i18n::init();
     groundtex::init_setting();
     let mut screenshot = None;
     let mut open_files = Vec::new();

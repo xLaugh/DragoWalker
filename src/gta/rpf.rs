@@ -34,6 +34,7 @@ pub struct Archive {
     pub disk: usize,
     pub start: u64,
     pub aes: bool,
+    #[allow(dead_code)]
     pub path: String,
 }
 
@@ -46,7 +47,7 @@ pub struct Vfs {
 }
 
 fn u32le(d: &[u8], p: usize) -> u32 {
-    u32::from_le_bytes(d[p..p + 4].try_into().unwrap())
+    d.get(p..p + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0)
 }
 
 /// Taille d'un segment de ressource à partir de ses drapeaux (GetSizeFromFlags).

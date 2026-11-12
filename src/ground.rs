@@ -57,7 +57,7 @@ impl DwApp {
         let o = v3(x, y, z_from);
         let down = v3(0.0, 0.0, -1.0);
         let mut best: Option<f32> = None;
-        let mut take = |z: f32, best: &mut Option<f32>| {
+        let take = |z: f32, best: &mut Option<f32>| {
             if z <= z_from + 1e-3 && z >= z_from - range && best.map(|b| z > b).unwrap_or(true) {
                 *best = Some(z);
             }

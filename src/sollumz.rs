@@ -374,7 +374,7 @@ fn read_xml_geometry(g: roxmltree::Node, model: &mut RModel, tex: u32, cutout: b
         if p.len() < 3 {
             continue;
         }
-        let mut v = RVert { pos: [p[0], p[1], p[2]], nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255; 4] };
+        let mut v = RVert { pos: [p[0], p[1], p[2]], nrm: [0.0, 0.0, 1.0], uv: [0.0, 0.0], col: [255; 4], uv1: [0.0, 0.0] };
         if let Some(n) = ni.map(get).filter(|n| n.len() >= 3) {
             v.nrm = [n[0], n[1], n[2]];
         }
@@ -398,7 +398,7 @@ fn read_xml_geometry(g: roxmltree::Node, model: &mut RModel, tex: u32, cutout: b
     }
     let count = model.idx.len() as u32 - first;
     if count > 0 {
-        model.geoms.push(RGeom { first, count, tex, cutout, blend: 0, glass: false });
+        model.geoms.push(RGeom { first, count, tex, cutout, blend: 0, glass: false, ..Default::default() });
     }
     Ok(())
 }

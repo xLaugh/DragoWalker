@@ -181,6 +181,7 @@ pub struct GArchetype {
     pub name: u32,
     pub bb_min: [f32; 3],
     pub bb_max: [f32; 3],
+    #[allow(dead_code)]
     pub bs_centre: [f32; 3],
     pub bs_radius: f32,
     /// distance des textures détaillées (CBaseArchetypeDef.hdTextureDist, +84 : entre bsRadius +80 et name +88)
@@ -190,6 +191,7 @@ pub struct GArchetype {
     pub texture_dict: u32,
     pub drawable_dict: u32,
     pub asset_type: u32,
+    #[allow(dead_code)]
     pub asset_name: u32,
     pub mlo: bool,
     /// intérieur : objets (avec l'index de leur groupe d'entités, -1 = toujours là) et noms des groupes

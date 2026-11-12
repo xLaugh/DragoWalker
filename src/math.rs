@@ -16,6 +16,7 @@ pub const fn v3(x: f32, y: f32, z: f32) -> V3 {
 
 impl V3 {
     pub const ZERO: V3 = v3(0.0, 0.0, 0.0);
+    #[allow(dead_code)]
     pub const ONE: V3 = v3(1.0, 1.0, 1.0);
     pub fn dot(self, o: V3) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z

@@ -85,6 +85,7 @@ pub struct Arch {
 }
 
 pub struct GameWorld {
+    #[allow(dead_code)]
     pub game_dir: PathBuf,
     pub vfs: Arc<Vfs>,
     pub keys: Arc<Keys>,
@@ -133,6 +134,7 @@ pub struct MloChild {
     pub rot: Quat,
     pub sxy: f32,
     pub sz: f32,
+    #[allow(dead_code)]
     pub lod_dist: f32,
     /// groupe d'entités (-1 = toujours présent)
     pub set: i32,

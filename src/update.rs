@@ -43,6 +43,10 @@ struct Release {
     page: String,
     setup_url: Option<String>,
     zip_url: Option<String>,
+    setup_name: String,
+    zip_name: String,
+    /// SHA256SUMS.txt de la release (absent des versions d'avant la 0.2.4)
+    sums_url: Option<String>,
 }
 
 fn state() -> &'static Arc<Mutex<State>> {
@@ -112,14 +116,19 @@ fn agent() -> ureq::Agent {
 fn fetch_latest() -> Result<Release, String> {
     let v: serde_json::Value = agent().get(API).set("Accept", "application/vnd.github+json").timeout(std::time::Duration::from_secs(20)).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().ok_or("pas de version")?.to_string();
-    let mut r = Release { version: tag.trim_start_matches(['v', 'V']).to_string(), page: v["html_url"].as_str().unwrap_or("").to_string(), setup_url: None, zip_url: None };
+    let mut r = Release { version: tag.trim_start_matches(['v', 'V']).to_string(), page: v["html_url"].as_str().unwrap_or("").to_string(), setup_url: None, zip_url: None, setup_name: String::new(), zip_name: String::new(), sums_url: None };
     for a in v["assets"].as_array().into_iter().flatten() {
-        let name = a["name"].as_str().unwrap_or("").to_lowercase();
+        let orig = a["name"].as_str().unwrap_or("").to_string();
+        let name = orig.to_lowercase();
         let url = a["browser_download_url"].as_str().map(str::to_string);
         if name.ends_with("-setup.exe") {
             r.setup_url = url;
+            r.setup_name = orig;
         } else if name.ends_with(".zip") {
             r.zip_url = url;
+            r.zip_name = orig;
+        } else if name == "sha256sums.txt" {
+            r.sums_url = url;
         }
     }
     Ok(r)
@@ -142,7 +151,57 @@ fn download(url: &str, version: &str) -> Result<Vec<u8>, String> {
             set(State::Downloading(version.to_string(), out.len() as f32 / total as f32));
         }
     }
+    if total > 0 && out.len() != total {
+        return Err(format!("téléchargement incomplet ({} octets reçus sur {total})", out.len()));
+    }
     Ok(out)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Empreinte d'un fichier dans un SHA256SUMS.txt (format de `sha256sum` : « empreinte  nom »).
+fn parse_sums(text: &str, file: &str) -> Option<String> {
+    for line in text.lines() {
+        let mut it = line.trim().splitn(2, char::is_whitespace);
+        let (Some(h), Some(name)) = (it.next(), it.next()) else { continue };
+        if name.trim().trim_start_matches('*').eq_ignore_ascii_case(file) && h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(h.to_lowercase());
+        }
+    }
+    None
+}
+
+/// Contrôle l'empreinte SHA-256 du fichier téléchargé quand la release en publie une : détecte un fichier
+/// tronqué ou altéré. (Cela ne remplace pas une signature : l'empreinte vient du même endroit que le fichier.)
+fn verify(data: &[u8], file: &str, sums_url: &Option<String>) -> Result<(), String> {
+    let Some(url) = sums_url else { return Ok(()) };
+    let text = agent().get(url).timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("empreintes illisibles : {e}"))?.into_string().map_err(|e| e.to_string())?;
+    match parse_sums(&text, file) {
+        Some(expected) if sha256_hex(data) == expected => Ok(()),
+        Some(_) => Err("l'empreinte SHA-256 du fichier téléchargé ne correspond pas à celle de la release (fichier corrompu ou altéré), rien n'a été installé".into()),
+        None => Ok(()),
+    }
+}
+
+/// Le fichier est bien un exécutable Windows (« MZ »).
+fn check_exe(data: &[u8], what: &str) -> Result<(), String> {
+    if data.len() > 1_000_000 && data.starts_with(b"MZ") {
+        Ok(())
+    } else {
+        Err(format!("{what} n'est pas un exécutable Windows valide"))
+    }
+}
+
+/// Avant de lancer la nouvelle version : le projet en cours est sauvegardé (récupérable au redémarrage) et le
+/// verrou est rendu, sinon la nouvelle fenêtre croirait qu'une autre est ouverte.
+fn hand_over(ctx: &Option<egui::Context>) {
+    crate::safety::flush_autosave(ctx.as_ref());
+    crate::safety::release_lock();
 }
 
 /// Télécharge puis applique la mise à jour ; en cas de succès, l'app se ferme (le nouvel exe prend le relais).
@@ -152,7 +211,7 @@ fn install(r: Release, ctx: Option<egui::Context>) {
         if let Some(c) = &ctx {
             c.request_repaint();
         }
-        let res = if is_installed() { install_setup(&r) } else { install_portable(&r) };
+        let res = if is_installed() { install_setup(&r, &ctx) } else { install_portable(&r, &ctx) };
         match res {
             Ok(()) => {
                 if let Some(c) = &ctx {
@@ -170,22 +229,26 @@ fn install(r: Release, ctx: Option<egui::Context>) {
     });
 }
 
-fn install_setup(r: &Release) -> Result<(), String> {
+fn install_setup(r: &Release, ctx: &Option<egui::Context>) -> Result<(), String> {
     let url = r.setup_url.as_deref().ok_or("cette release n'a pas d'installeur")?;
     let data = download(url, &r.version)?;
+    check_exe(&data, "l'installeur téléchargé")?;
+    verify(&data, &r.setup_name, &r.sums_url)?;
     let path = std::env::temp_dir().join(format!("DragoWalker-{}-setup.exe", r.version));
     std::fs::write(&path, data).map_err(|e| format!("écriture de {} : {e}", path.display()))?;
     // installée pour tout le PC (Program Files) ou pour l'utilisateur seul : on garde le même mode
     let exe = exe_path().unwrap_or_default().to_string_lossy().to_lowercase();
     let pf = std::env::var("ProgramFiles").unwrap_or_default().to_lowercase();
     let mode = if !pf.is_empty() && exe.starts_with(&pf) { "/ALLUSERS" } else { "/CURRENTUSER" };
+    hand_over(ctx);
     std::process::Command::new(&path).args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", mode]).spawn().map_err(|e| format!("lancement de l'installeur : {e}"))?;
     Ok(())
 }
 
-fn install_portable(r: &Release) -> Result<(), String> {
+fn install_portable(r: &Release, ctx: &Option<egui::Context>) -> Result<(), String> {
     let url = r.zip_url.as_deref().ok_or("cette release n'a pas de version portable")?;
     let data = download(url, &r.version)?;
+    verify(&data, &r.zip_name, &r.sums_url)?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| format!("zip illisible : {e}"))?;
     let mut exe_bytes = None;
     for i in 0..zip.len() {
@@ -198,6 +261,7 @@ fn install_portable(r: &Release) -> Result<(), String> {
         }
     }
     let exe_bytes = exe_bytes.ok_or("DragoWalker.exe absent du zip")?;
+    check_exe(&exe_bytes, "DragoWalker.exe du zip")?;
     let cur = exe_path().ok_or("emplacement de l'exe inconnu")?;
     let dir = cur.parent().ok_or("dossier de l'exe inconnu")?;
     let new = dir.join("DragoWalker.new.exe");
@@ -210,6 +274,7 @@ fn install_portable(r: &Release) -> Result<(), String> {
         let _ = std::fs::rename(&old, &cur);
         return Err(format!("remplacement de l'exe : {e}"));
     }
+    hand_over(ctx);
     std::process::Command::new(&cur).spawn().map_err(|e| format!("redémarrage : {e}"))?;
     Ok(())
 }
@@ -229,13 +294,13 @@ pub fn banner(ctx: &egui::Context) {
             State::Available(r) => {
                 ui.label(egui::RichText::new(format!("Nouvelle version {} disponible (vous avez la {}).", r.version, current())).strong());
                 let can = if is_installed() { r.setup_url.is_some() } else { r.zip_url.is_some() };
-                if can && ui.button("Mettre à jour maintenant").on_hover_text("Télécharge la nouvelle version, l'installe et redémarre DragoWalker. Enregistrez votre projet avant.").clicked() {
+                if can && ui.button(crate::i18n::t("Mettre à jour maintenant")).on_hover_text(crate::i18n::t("Télécharge la nouvelle version, l'installe et redémarre DragoWalker. Enregistrez votre projet avant.")).clicked() {
                     install(r.clone(), Some(ctx.clone()));
                 }
                 if !r.page.is_empty() {
-                    ui.hyperlink_to("Voir les nouveautés", &r.page);
+                    ui.hyperlink_to(crate::i18n::t("Voir les nouveautés"), &r.page);
                 }
-                if ui.button("Plus tard").clicked() {
+                if ui.button(crate::i18n::t("Plus tard")).clicked() {
                     set(State::Hidden);
                 }
             }
@@ -246,10 +311,10 @@ pub fn banner(ctx: &egui::Context) {
             }
             State::Error(e) => {
                 ui.colored_label(egui::Color32::from_rgb(230, 90, 80), format!("Mise à jour impossible : {e}"));
-                if ui.button("Réessayer").clicked() {
+                if ui.button(crate::i18n::t("Réessayer")).clicked() {
                     check();
                 }
-                if ui.button("Fermer").clicked() {
+                if ui.button(crate::i18n::t("Fermer")).clicked() {
                     set(State::Hidden);
                 }
             }
@@ -268,5 +333,24 @@ mod tests {
         assert!(is_newer("0.10.0", "0.9.9"));
         assert!(!is_newer("v0.2.1", "0.2.1"));
         assert!(!is_newer("0.2.0", "0.2.1"));
+    }
+
+    #[test]
+    fn empreintes() {
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let sums = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  DragoWalker-0.2.4.zip\r\nFFFF  invalide.txt\n0000000000000000000000000000000000000000000000000000000000000001 *DragoWalker-0.2.4-setup.exe\n";
+        assert_eq!(parse_sums(sums, "dragowalker-0.2.4.zip").as_deref(), Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert_eq!(parse_sums(sums, "DragoWalker-0.2.4-setup.exe").map(|h| h.len()), Some(64));
+        assert!(parse_sums(sums, "invalide.txt").is_none() && parse_sums(sums, "autre.zip").is_none());
+    }
+
+    #[test]
+    fn exe_valide() {
+        let mut ok = vec![0u8; 2_000_000];
+        ok[0] = b'M';
+        ok[1] = b'Z';
+        assert!(check_exe(&ok, "x").is_ok());
+        assert!(check_exe(b"<html>erreur 404</html>", "x").is_err());
+        assert!(check_exe(&vec![0u8; 2_000_000], "x").is_err());
     }
 }

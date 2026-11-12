@@ -30,6 +30,9 @@ pub fn snap_angle(a: f32, s: f32) -> f32 {
 pub const GROUP_QUARTER_DEG: f32 = 90.0;
 /// Hauteur au-dessus du plus haut objet d'où l'on cherche le sol sous l'ancrage (m) — **estimé**.
 pub const GROUP_GROUND_PROBE_UP: f32 = 50.0;
+/// Pendant la pose : hauteur cherchée au-dessus et au-dessous du relief du jeu pour trouver la vraie surface de la
+/// rue (m) — **estimé** (assez pour un trottoir ou une rue au-dessus du relief grossier, pas pour un toit).
+pub const GROUP_STREET_PROBE: f32 = 3.0;
 /// Nombre maximal de cadres verts dessinés pendant la pose — **estimé** (au-delà, seuls les modèles).
 pub const GROUP_MAX_GHOST_BOXES: usize = 400;
 
@@ -263,7 +266,7 @@ impl DwApp {
         }
         if let Some((sp, _)) = self.cam.project(at) {
             let col = Color32::from_rgb(120, 255, 140);
-            painter.circle_stroke(sp, 8.0, egui::Stroke::new(2.0, col));
+            painter.circle_stroke(sp, 8.0, egui::Stroke::new(2.0_f32, col));
             painter.text(sp + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, format!("{} · {:.0}°", g.name, gp.yaw_deg), egui::FontId::proportional(13.0), col);
         }
     }

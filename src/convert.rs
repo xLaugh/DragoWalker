@@ -175,7 +175,7 @@ impl DwApp {
 impl DwApp {
     /// Cherche dans les types d'objets du jeu le meilleur candidat : nom contenant tous les mots de `must`,
     /// taille dans les limites, le plus proche de `target` (largeur, profondeur, hauteur).
-    fn find_game_prop(&self, must: &[&str], prefer: &[&str], min: V3, max: V3, target: V3) -> Option<(String, V3, V3)> {
+    pub(crate) fn find_game_prop(&self, must: &[&str], prefer: &[&str], min: V3, max: V3, target: V3) -> Option<(String, V3, V3)> {
         let w = self.game.world.as_ref()?;
         let mut best: Option<(f32, String, V3, V3)> = None;
         for (h, a) in &w.archetypes {

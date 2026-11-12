@@ -345,6 +345,7 @@ fn tool_schema() -> Value {
 }
 
 /// Envoie la demande à Claude dans un fil séparé ; la réponse arrive sur le canal.
+#[allow(dead_code)]
 pub fn ask_claude(api_key: String, history: Vec<ChatLine>, scene: String) -> mpsc::Receiver<Result<AiReply, String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

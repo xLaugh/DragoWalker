@@ -26,6 +26,44 @@ const SHRINK_Z: f32 = 0.9;
 /// Un bâtiment doit faire au moins 8 m de côté et 6 m de haut pour recevoir une boîte — **estimé**.
 const MIN_XY: f32 = 8.0;
 const MIN_Z: f32 = 6.0;
+/// Au plus 300 boîtes par carte avec l'occlusion automatique (les plus grosses d'abord) — **estimé** : le jeu
+/// teste chaque boîte à chaque image, trop de petites boîtes coûteraient plus qu'elles ne font gagner.
+pub const AUTO_MAX_PER_MAP: usize = 300;
+
+/// Boîte d'occlusion d'un objet dont la boîte locale est (mn, mx) : rien si trop petit.
+pub fn box_for(e: &crate::model::Entity, mn: V3, mx: V3) -> Option<BoxOcc> {
+    let s = (mx - mn).mulv(e.scale());
+    if s.x.max(s.y) < MIN_XY || s.z < MIN_Z {
+        return None;
+    }
+    let c = e.pos + e.rot.rotate(((mn + mx) * 0.5).mulv(e.scale()));
+    let heading = e.rot.heading_deg().to_radians();
+    Some(BoxOcc { pos: c, size: v3(s.x * SHRINK_XY, s.y * SHRINK_XY, s.z * SHRINK_Z), heading })
+}
+
+/// Une boîte quasi identique (même centre à 1,5 m près, même taille à 20 % près) existe déjà.
+pub fn covered(list: &[BoxOcc], b: &BoxOcc) -> bool {
+    list.iter().any(|o| {
+        (o.pos - b.pos).len() < 1.5 && (o.size.x - b.size.x).abs() <= 0.2 * b.size.x.max(o.size.x) && (o.size.y - b.size.y).abs() <= 0.2 * b.size.y.max(o.size.y) && (o.size.z - b.size.z).abs() <= 0.2 * b.size.z.max(o.size.z)
+    })
+}
+
+/// Parmi `cands`, garde les plus grosses boîtes sans doublon (avec `existing` ni entre elles), pour que la carte
+/// n'ait jamais plus de `max` boîtes en tout.
+pub fn pick_boxes(mut cands: Vec<BoxOcc>, existing: &[BoxOcc], max: usize) -> Vec<BoxOcc> {
+    let room = max.saturating_sub(existing.len());
+    cands.sort_by(|a, b| (b.size.x * b.size.y * b.size.z).total_cmp(&(a.size.x * a.size.y * a.size.z)));
+    let mut out: Vec<BoxOcc> = Vec::new();
+    for c in cands {
+        if out.len() >= room {
+            break;
+        }
+        if !covered(existing, &c) && !covered(&out, &c) {
+            out.push(c);
+        }
+    }
+    out
+}
 
 /// Liste XML d'une carte (CMapData.boxOccluders).
 pub fn occluders_xml(list: &[BoxOcc]) -> String {
@@ -54,13 +92,9 @@ impl DwApp {
                 continue;
             }
             let (mn, mx) = e.local_box(&self.proj);
-            let s = (mx - mn).mulv(e.scale());
-            if s.x.max(s.y) < MIN_XY || s.z < MIN_Z {
-                continue;
+            if let Some(b) = box_for(e, mn, mx) {
+                add.push((yi, b));
             }
-            let c = e.pos + e.rot.rotate(((mn + mx) * 0.5).mulv(e.scale()));
-            let heading = e.rot.heading_deg().to_radians();
-            add.push((yi, BoxOcc { pos: c, size: v3(s.x * SHRINK_XY, s.y * SHRINK_XY, s.z * SHRINK_Z), heading }));
         }
         if add.is_empty() {
             return "Choisis un ou plusieurs grands bâtiments (au moins 8 m de côté et 6 m de haut).".into();
@@ -71,6 +105,41 @@ impl DwApp {
             self.proj.ymaps[yi].occluders.push(b);
         }
         format!("{n} boîte(s) d'occlusion ajoutée(s) (violet) : le jeu ne dessinera pas ce qui est caché derrière.")
+    }
+
+    /// Occlusion automatique : une boîte dans chaque grand bâtiment de toutes les cartes du projet (pas les props,
+    /// les intérieurs, les versions lointaines ni les modèles de DragoWalker), sans doublon, les plus grosses d'abord.
+    pub fn add_occluders_auto(&mut self) -> String {
+        let mut plan: Vec<(usize, Vec<BoxOcc>)> = Vec::new();
+        let mut candidates_total = 0;
+        for (yi, y) in self.proj.ymaps.iter().enumerate().filter(|(_, y)| !y.sample) {
+            let mut cands: Vec<BoxOcc> = Vec::new();
+            for e in &y.entities {
+                let low = e.archetype.to_lowercase();
+                let detailed = matches!(e.lod_level.as_str(), "" | "LODTYPES_DEPTH_HD" | "LODTYPES_DEPTH_ORPHANHD");
+                if e.mlo.is_some() || !detailed || low.starts_with("dw_") || crate::buildings::is_prop_name(&low) {
+                    continue;
+                }
+                let (mn, mx) = e.local_box(&self.proj);
+                if let Some(b) = box_for(e, mn, mx) {
+                    cands.push(b);
+                }
+            }
+            candidates_total += cands.len();
+            let picked = pick_boxes(cands, &y.occluders, AUTO_MAX_PER_MAP);
+            if !picked.is_empty() {
+                plan.push((yi, picked));
+            }
+        }
+        let n: usize = plan.iter().map(|p| p.1.len()).sum();
+        if n == 0 {
+            return if candidates_total == 0 { "Aucun grand bâtiment (8 m de côté, 6 m de haut) dans le projet.".into() } else { "Les grands bâtiments ont déjà leur boîte d'occlusion (ou la limite de la carte est atteinte).".into() };
+        }
+        self.push_undo();
+        for (yi, boxes) in plan {
+            self.proj.ymaps[yi].occluders.extend(boxes);
+        }
+        format!("{n} boîte(s) d'occlusion ajoutée(s) (violet), au plus {AUTO_MAX_PER_MAP} par carte : le jeu ne dessine pas ce qui est caché derrière. Ctrl+Z annule.")
     }
 
     /// Dans la vue : boîtes d'occlusion en violet.
@@ -86,7 +155,7 @@ impl DwApp {
                 let l = v3(if i & 1 == 0 { -h.x } else { h.x }, if i & 2 == 0 { -h.y } else { h.y }, if i & 4 == 0 { -h.z } else { h.z });
                 *c = b.pos + q.rotate(l);
             }
-            crate::render::draw_box_edges(painter, &self.cam, &w, egui::Stroke::new(1.5, egui::Color32::from_rgb(190, 90, 255)));
+            crate::render::draw_box_edges(painter, &self.cam, &w, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(190, 90, 255)));
         }
     }
 }
@@ -94,6 +163,37 @@ impl DwApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bx(x: f32, s: f32) -> BoxOcc {
+        BoxOcc { pos: v3(x, 0.0, 0.0), size: v3(s, s, s), heading: 0.0 }
+    }
+
+    #[test]
+    fn automatique_sans_doublon_et_plafonnee() {
+        // un bâtiment 20 × 10 × 30 m à (100, 0, 0), tourné de 0 : boîte réduite à 80 % / 90 %
+        let e = crate::model::Entity::new("dt1_05_build2_h", v3(100.0, 0.0, 0.0));
+        let b = box_for(&e, v3(-10.0, -5.0, 0.0), v3(10.0, 5.0, 30.0)).expect("grand bâtiment");
+        assert!((b.size.x - 16.0).abs() < 1e-3 && (b.size.y - 8.0).abs() < 1e-3 && (b.size.z - 27.0).abs() < 1e-3);
+        assert!((b.pos.z - 15.0).abs() < 1e-3);
+        // trop petit : pas de boîte
+        assert!(box_for(&e, v3(-2.0, -2.0, 0.0), v3(2.0, 2.0, 3.0)).is_none());
+        // doublons : même place même taille = couvert ; plus loin = non
+        assert!(covered(&[bx(0.0, 10.0)], &bx(1.0, 10.5)));
+        assert!(!covered(&[bx(0.0, 10.0)], &bx(20.0, 10.0)));
+        assert!(!covered(&[bx(0.0, 10.0)], &bx(0.5, 20.0)));
+        // 10 candidates de tailles différentes + 1 déjà présente + 1 doublon : plafond 5 en tout, les plus grosses d'abord
+        let existing = vec![bx(0.0, 50.0)];
+        let mut cands: Vec<BoxOcc> = (1..=10).map(|i| bx(i as f32 * 100.0, 10.0 + i as f32)).collect();
+        cands.push(bx(0.2, 50.0)); // doublon de l'existante
+        cands.push(bx(300.0, 13.0)); // doublon d'une autre candidate
+        let picked = pick_boxes(cands, &existing, 5);
+        assert_eq!(picked.len(), 4, "5 en tout moins l'existante");
+        let mut sizes: Vec<f32> = picked.iter().map(|b| b.size.x).collect();
+        sizes.sort_by(|a, b| b.total_cmp(a));
+        assert_eq!(sizes, vec![20.0, 19.0, 18.0, 17.0]);
+        // carte déjà pleine : rien
+        assert!(pick_boxes(vec![bx(500.0, 30.0)], &vec![bx(0.0, 5.0); 3], 3).is_empty());
+    }
 
     #[test]
     fn encoding_matches_codewalker() {

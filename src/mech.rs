@@ -35,6 +35,7 @@ pub const MAP_MOVE_FACTOR: f32 = 0.01;
 pub const MAP_MOVE_CAP: f32 = 50.0;
 
 // Nouvelle entité (ProjectForm::NewEntity / NewMloEntity)
+#[allow(dead_code)]
 pub const DEFAULT_ARCHETYPE: &str = "prop_alien_egg_01";
 pub const SPAWN_DIST: f32 = 5.0;
 /// Copie : distance = rayon de la sphère englobante × 2.5 (ProjectForm::NewEntity 0x06000d3e, IL_0047)

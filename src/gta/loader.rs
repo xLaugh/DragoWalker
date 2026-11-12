@@ -29,6 +29,8 @@ pub struct Loaded {
     pub model: Option<RModel>,
     /// clé de texture de chaque partie (0 = aucune)
     pub part_keys: Vec<u64>,
+    /// sols à 4 couches : clés des textures des couches 0 à 3 et de la carte de mélange, par partie
+    pub layer_keys: Vec<[u64; 5]>,
     pub textures: Vec<(u64, TexData)>,
 }
 
@@ -84,22 +86,31 @@ impl ModelSource {
     }
 
     pub fn load(&self, arch: u32, claimed: &Mutex<HashSet<u64>>, ytd_cache: &mut Vec<(u32, Arc<Resource>)>) -> Loaded {
-        let mut out = Loaded { arch, model: None, part_keys: Vec::new(), textures: Vec::new() };
+        let mut out = Loaded { arch, model: None, part_keys: Vec::new(), layer_keys: Vec::new(), textures: Vec::new() };
         let Some((fi, r, pos)) = self.find_model(arch) else { return out };
         let Some(model) = drawable::read_render_drawable(&r, pos, MAX_TRIS) else { return out };
         let txd = self.arch.get(&arch).map(|a| a.0).unwrap_or(0);
         let mut found: HashMap<u32, u64> = HashMap::new();
+        // textures voulues : celle de chaque partie, et pour les sols à 4 couches leurs couches et carte de mélange
+        let mut wanted: Vec<u32> = Vec::new();
         for g in &model.geoms {
-            if g.tex == 0 || found.contains_key(&g.tex) {
+            for h in std::iter::once(g.tex).chain(g.layers.iter().copied()).chain(std::iter::once(g.mask)) {
+                if h != 0 && !wanted.contains(&h) {
+                    wanted.push(h);
+                }
+            }
+        }
+        for gtex in wanted {
+            if found.contains_key(&gtex) {
                 continue;
             }
             let mut k = 0u64;
             // 1. textures intégrées au modèle
             if let Some(d) = model.embedded_dict {
-                let kk = key(0x8000_0000 | fi as u32, g.tex);
+                let kk = key(0x8000_0000 | fi as u32, gtex);
                 if claimed.lock().map(|c| c.contains(&kk)).unwrap_or(false) {
                     k = kk;
-                } else if let Some(t) = drawable::find_texture(&r, d, g.tex, MAX_TEX) {
+                } else if let Some(t) = drawable::find_texture(&r, d, gtex, MAX_TEX) {
                     if claimed.lock().map(|mut c| c.insert(kk)).unwrap_or(false) {
                         out.textures.push((kk, t));
                     }
@@ -110,13 +121,13 @@ impl ModelSource {
             let mut cur = txd;
             let mut depth = 0;
             while k == 0 && cur != 0 && depth < 8 {
-                let kk = key(cur, g.tex);
+                let kk = key(cur, gtex);
                 if claimed.lock().map(|c| c.contains(&kk)).unwrap_or(false) {
                     k = kk;
                     break;
                 }
                 if let Some(res) = self.ytd(cur, ytd_cache) {
-                    if let Some(t) = drawable::find_texture(&res, 0, g.tex, MAX_TEX) {
+                    if let Some(t) = drawable::find_texture(&res, 0, gtex, MAX_TEX) {
                         if claimed.lock().map(|mut c| c.insert(kk)).unwrap_or(false) {
                             out.textures.push((kk, t));
                         }
@@ -127,9 +138,11 @@ impl ModelSource {
                 cur = self.txd_parents.get(&cur).copied().unwrap_or(0);
                 depth += 1;
             }
-            found.insert(g.tex, k);
+            found.insert(gtex, k);
         }
         out.part_keys = model.geoms.iter().map(|g| found.get(&g.tex).copied().unwrap_or(0)).collect();
+        let kf = |h: u32| if h == 0 { 0 } else { found.get(&h).copied().unwrap_or(0) };
+        out.layer_keys = model.geoms.iter().map(|g| [kf(g.layers[0]), kf(g.layers[1]), kf(g.layers[2]), kf(g.layers[3]), kf(g.mask)]).collect();
         out.model = Some(model);
         out
     }

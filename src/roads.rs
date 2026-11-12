@@ -635,7 +635,7 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
     let c = v3(j.pos[0] - origin.x, j.pos[1] - origin.y, j.pos[2]);
     let (mut pos, mut uv) = (Vec::new(), Vec::new());
     let (mut plain, mut zebra) = (Vec::new(), Vec::new());
-    let mut quad = |pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, q: [V3; 4], u: [[f32; 2]; 4]| {
+    let quad = |pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, q: [V3; 4], u: [[f32; 2]; 4]| {
         let b = pos.len() as u32;
         pos.extend_from_slice(&q);
         uv.extend_from_slice(&u);
@@ -674,7 +674,7 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
             let d = (nu * -(1.0 - f) + nv * -f).norm();
             arc.push(ctr + d * k.rc);
         }
-        let mut tri = |pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, p: [V3; 3], want: V3| {
+        let tri = |pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, p: [V3; 3], want: V3| {
             let n = (p[1] - p[0]).cross(p[2] - p[0]);
             let p = if n.dot(want) < 0.0 { [p[0], p[2], p[1]] } else { p };
             let b0 = pos.len() as u32;

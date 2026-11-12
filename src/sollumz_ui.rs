@@ -32,6 +32,7 @@ impl DwApp {
                             arch: crate::gta::crypto::joaat(&m.name),
                             model: Some(m.model.clone()),
                             part_keys: m.part_keys.clone(),
+                            layer_keys: Vec::new(),
                             textures: m.textures.clone(),
                         });
                     }

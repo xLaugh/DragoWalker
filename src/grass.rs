@@ -124,7 +124,7 @@ impl DwApp {
             if ui.button("Enlever toute l'herbe").clicked() {
                 self.push_undo();
                 if let Some(t) = self.proj.terrain.as_mut() {
-                    t.grass.clear();
+                    t.grass = Default::default();
                 }
             }
         });
@@ -159,7 +159,7 @@ impl DwApp {
         if let Some(t) = self.proj.terrain.as_mut() {
             let n = (nx - 1) * (ny - 1);
             if t.grass.len() != n {
-                t.grass = vec![0; n];
+                t.grass = std::sync::Arc::new(vec![0; n]);
             }
             for j in 0..ny - 1 {
                 for i in 0..nx - 1 {
@@ -168,7 +168,7 @@ impl DwApp {
                     let y = o.y + (j as f32 + 0.5) * cell;
                     let wet = t.height_at(x, y).map(|z| z < 0.3).unwrap_or(true);
                     if b.grass > 0 && !wet && b.grass_on.contains(&t.mat[idx]) {
-                        t.grass[idx] = b.grass;
+                        std::sync::Arc::make_mut(&mut t.grass)[idx] = b.grass;
                         cells += 1;
                     }
                 }
@@ -222,7 +222,7 @@ impl DwApp {
                 for (dx, dy) in [(-0.25f32, 0.0f32), (0.2, 0.15), (0.05, -0.2)] {
                     let base = v3(x + dx, y + dy, z);
                     if let (Some((a, _)), Some((b, _))) = (self.cam.project(base), self.cam.project(base + v3(dx * 0.4, dy * 0.4, 0.55))) {
-                        painter.line_segment([a, b], egui::Stroke::new(1.5, col));
+                        painter.line_segment([a, b], egui::Stroke::new(1.5_f32, col));
                     }
                 }
                 drawn += 1;

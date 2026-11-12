@@ -109,13 +109,13 @@ pub fn room_model(m: &MloArchetype, ri: usize) -> Option<(RModel, (V3, V3))> {
                 for c in t {
                     let uv = if n.z.abs() > 0.5 { [c.x * 0.5, c.y * 0.5] } else if n.x.abs() > 0.5 { [c.y * 0.5, -c.z * 0.5] } else { [c.x * 0.5, -c.z * 0.5] };
                     idx.push(verts.len() as u32);
-                    verts.push(RVert { pos: [c.x, c.y, c.z], nrm: [n.x, n.y, n.z], uv, col: [255, 255, 255, 255] });
+                    verts.push(RVert { pos: [c.x, c.y, c.z], nrm: [n.x, n.y, n.z], uv, col: [255, 255, 255, 255], uv1: [0.0, 0.0] });
                     mn = mn.min(c);
                     mx = mx.max(c);
                 }
             }
         }
-        geoms.push(RGeom { first, count: idx.len() as u32 - first, tex: 0, cutout: false, blend: 0, glass: false });
+        geoms.push(RGeom { first, count: idx.len() as u32 - first, tex: 0, cutout: false, blend: 0, glass: false, ..Default::default() });
     }
     Some((RModel { verts, idx, geoms, embedded_dict: None }, (mn, mx)))
 }
@@ -227,7 +227,7 @@ impl DwApp {
                     let Some((model, bx)) = room_model(m, ri) else { continue };
                     let sn = shell_name(&m.name, ri);
                     boxes.insert(sn.clone(), bx);
-                    g.add_custom(crate::gta::loader::Loaded { arch: crate::gta::crypto::joaat(&sn), model: Some(model), part_keys: SHELL_KEYS.to_vec(), textures: texs.clone() });
+                    g.add_custom(crate::gta::loader::Loaded { arch: crate::gta::crypto::joaat(&sn), model: Some(model), part_keys: SHELL_KEYS.to_vec(), layer_keys: Vec::new(), textures: texs.clone() });
                 }
             }
         }

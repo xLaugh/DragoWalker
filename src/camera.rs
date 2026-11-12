@@ -64,6 +64,7 @@ impl Camera {
     }
 
     /// Molette (Camera::MouseZoom) : ×1.1 en arrière, ÷1.1 en avant.
+    #[allow(dead_code)]
     pub fn mouse_zoom(&mut self, steps: f32) {
         let f = if steps > 0.0 { 1.0 / mech::CAM_ZOOM_FACTOR } else { mech::CAM_ZOOM_FACTOR };
         let n = steps.abs().max(1.0);

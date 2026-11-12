@@ -134,6 +134,9 @@ impl DwApp {
             _ => None,
         };
         self.game.surface = surface;
+        // pendant la pose d'un groupe, ses modèles sont dessinés sous la souris : la profondeur lue toucherait le
+        // groupe lui-même, qui reculerait vers la caméra à chaque image ; on prend alors le sol du jeu (relief)
+        let surface = if self.group_place.is_some() { None } else { surface };
         if !ctx.wants_keyboard_input() && self.game.world.is_some() {
             let (kc, kh, alt_scroll) = ctx.input(|i| (i.key_pressed(Key::C) && !i.modifiers.command, i.key_pressed(Key::H) && !i.modifiers.command, if i.modifiers.alt { i.raw_scroll_delta.y } else { 0.0 }));
             if kc {
@@ -162,10 +165,24 @@ impl DwApp {
             }
         }
         self.mouse_ground = hover_pos.and_then(|p| if self.proj.terrain.is_some() && (self.game.empty_map || surface.is_none()) { surface.or_else(|| self.terrain_ground(p)).or_else(|| self.cam.ground_point(p, 0.0)) } else if self.game.world.is_some() { surface.or_else(|| self.game_ground(p)).or_else(|| self.cam.ground_point(p, self.ground_z)) } else { self.cam.ground_point(p, self.ground_z) });
+        // pose d'un groupe : le relief du jeu est grossier en ville ; comme CodeWalker prend le point touché sur les
+        // collisions du monde (WorldForm::GetSpaceMouseRay 0x060002a5 → Space::RayIntersect), on recale la hauteur
+        // sur la vraie surface (rue, trottoir) juste au-dessus ou au-dessous du relief, sans monter sur les toits
+        if self.group_place.is_some() {
+            if let Some(g) = self.mouse_ground {
+                let up = crate::groups::GROUP_STREET_PROBE;
+                if let Some(z) = self.ground_below(g.x, g.y, g.z + up, up * 2.0, &HashSet::new()) {
+                    self.mouse_ground = Some(v3(g.x, g.y, z));
+                }
+            }
+        }
         if self.game.world.is_some() {
             // survol : exactement l'objet qu'un clic prendrait (y compris celui de derrière après un reclic)
             if self.frame % 2 == 0 {
-                let u = if self.tool != Tool::Place { hover_pos.and_then(|p| self.hover_under(p, !(mods.command || mods.shift))) } else { None };
+                // pas de survol quand la souris ne choisit pas (pose d'un objet ou d'un groupe), comme CodeWalker qui
+                // ne garde la liste des objets dessinés que si la sélection à la souris est active
+                // (WorldForm::BeginMouseHitTest 0x060002a4 : RenderedDrawablesListEnable)
+                let u = if self.tool != Tool::Place && self.group_place.is_none() { hover_pos.and_then(|p| self.hover_under(p, !(mods.command || mods.shift))) } else { None };
                 self.hover = match u {
                     Some(crate::game_ui::Under::Proj(id)) if self.tool == Tool::Select => Some(id),
                     _ => None,
@@ -312,6 +329,7 @@ impl DwApp {
         self.bedit_draw(&painter, hover_pos, ui.ctx());
         // aperçu de l'herbe du jeu : retiré avec le pinceau (voir A_FAIRE.md)
         self.draw_occluders(&painter);
+        self.draw_perf(&painter, rect);
         self.draw_group_ghost(&painter);
         self.draw_scenery_overlay(&painter, hover_pos);
         self.draw_life_overlay(&painter, hover_pos);
@@ -343,7 +361,7 @@ impl DwApp {
             }
             Tool::Erase => {
                 if let Some(g) = self.mouse_ground {
-                    render::draw_ground_circle(&painter, &self.cam, g, self.erase_radius, Stroke::new(2.0, Color32::from_rgb(255, 90, 70)));
+                    render::draw_ground_circle(&painter, &self.cam, g, self.erase_radius, Stroke::new(2.0_f32, Color32::from_rgb(255, 90, 70)));
                 }
             }
             Tool::Select | Tool::Rect => {}
@@ -360,7 +378,7 @@ impl DwApp {
         if let (Drag::Rect(a), Some(b)) = (&self.drag, ptr) {
             let r = Rect::from_two_pos(*a, b);
             painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 200, 60, 30));
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
         }
         // objet du jeu survolé
         if let (None, Some(t), Some(p)) = (self.hover, self.game_hover_text(), hover_pos) {
@@ -383,8 +401,8 @@ impl DwApp {
         painter.circle_filled(c, 22.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
         let ang = if self.cam.map_view { 0.0 } else { self.cam.cur_yaw };
         let n = egui::vec2(-ang.sin(), -ang.cos());
-        painter.line_segment([c, c + n * 17.0], Stroke::new(3.0, Color32::from_rgb(230, 70, 60)));
-        painter.line_segment([c, c - n * 12.0], Stroke::new(2.0, Color32::from_gray(200)));
+        painter.line_segment([c, c + n * 17.0], Stroke::new(3.0_f32, Color32::from_rgb(230, 70, 60)));
+        painter.line_segment([c, c - n * 12.0], Stroke::new(2.0_f32, Color32::from_gray(200)));
         painter.text(c + n * 29.0, egui::Align2::CENTER_CENTER, "N", egui::FontId::proportional(12.0), Color32::WHITE);
         // aide
         let help = match self.tool {
@@ -421,7 +439,7 @@ impl DwApp {
                 continue;
             }
             if let Some(e) = self.proj.world_entity(it) {
-                if self.game.hidden_ids.contains(&e.id) || cut.map(|c| e.pos.z > c).unwrap_or(false) {
+                if self.game.hidden_ids.contains(&e.id) || self.hidden_by_isolation(e.id) || cut.map(|c| e.pos.z > c).unwrap_or(false) {
                     continue;
                 }
                 if let Some((sp, _)) = self.cam.project(e.pos) {
@@ -431,7 +449,8 @@ impl DwApp {
                 }
             }
         }
-        let game_ents: Vec<u32> = self.game_in_rect(r).into_iter().filter(|ei| self.game.world.as_ref().map(|w| cut.map(|c| w.ents[*ei as usize].pos.z <= c).unwrap_or(true)).unwrap_or(true)).collect();
+        // vue « Isoler » : pas d'objets du jeu (non dessinés)
+        let game_ents: Vec<u32> = self.game_in_rect(r).into_iter().filter(|_| self.isolate_sel.is_none()).filter(|ei| self.game.world.as_ref().map(|w| cut.map(|c| w.ents[*ei as usize].pos.z <= c).unwrap_or(true)).unwrap_or(true)).collect();
         if !game_ents.is_empty() {
             self.push_undo();
             ids.extend(self.game_ents_to_project(&game_ents));

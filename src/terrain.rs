@@ -42,9 +42,9 @@ pub struct Terrain {
     pub nx: usize,
     pub ny: usize,
     /// hauteur de chaque sommet (nx × ny)
-    pub h: Vec<f32>,
+    pub h: std::sync::Arc<Vec<f32>>,
     /// matériau de chaque case ((nx-1) × (ny-1))
-    pub mat: Vec<u8>,
+    pub mat: std::sync::Arc<Vec<u8>>,
     /// routes tracées sur le terrain
     #[serde(default)]
     pub roads: Vec<crate::roads::Road>,
@@ -67,7 +67,7 @@ pub struct Terrain {
     /// la collision de la case porte l'étiquette de végétation procédurale correspondante (le jeu fait pousser
     /// l'herbe lui-même)
     #[serde(default)]
-    pub grass: Vec<u8>,
+    pub grass: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,7 +201,7 @@ impl Terrain {
         let cell = if size > 600.0 { 4.0 } else { 2.0 };
         let n = ((size / cell).round() as usize + 1).clamp(16, 400);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: vec![base_h; n * n], mat: vec![mat; (n - 1) * (n - 1)], roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Vec::new() }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default() }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
@@ -255,7 +255,7 @@ impl Terrain {
                         base + (step + edge * 0.2) * 70.0 + (n(25.0, 2) - 0.5) * 1.5
                     }
                 };
-                self.h[j * self.nx + i] = h;
+                std::sync::Arc::make_mut(&mut self.h)[j * self.nx + i] = h;
             }
         }
         self.auto_paint(PRESETS[(preset as usize).min(PRESETS.len() - 1)].2);
@@ -272,7 +272,7 @@ impl Terrain {
                 let sx = ((h(i + 1, j) + h(i + 1, j + 1)) - (h(i, j) + h(i, j + 1))) * 0.5 / self.cell;
                 let sy = ((h(i, j + 1) + h(i + 1, j + 1)) - (h(i, j) + h(i + 1, j))) * 0.5 / self.cell;
                 let slope = (sx * sx + sy * sy).sqrt();
-                let m = &mut self.mat[j * (nx - 1) + i];
+                let m = &mut std::sync::Arc::make_mut(&mut self.mat)[j * (nx - 1) + i];
                 if *m >= 4 {
                     continue; // béton, goudron et routes gardés
                 }
@@ -325,7 +325,8 @@ impl Terrain {
             }
             let target = z - 0.05;
             let w = if *d <= half + 0.5 { 1.0 } else { let t = 1.0 - (*d - half - 0.5) / (blend - 0.5); t * t * (3.0 - 2.0 * t) };
-            self.h[k] += (target - self.h[k]) * w;
+            let v = self.h[k];
+            std::sync::Arc::make_mut(&mut self.h)[k] = v + (target - v) * w;
         }
         let m = if r.kind().dirt { 1 } else { ROAD };
         let hw = r.kind().width * 0.5;
@@ -339,7 +340,7 @@ impl Terrain {
                 }
                 if let Some((d, _)) = r.nearest(x, y) {
                     if d <= hw {
-                        self.mat[j * (nx - 1) + i] = m;
+                        std::sync::Arc::make_mut(&mut self.mat)[j * (nx - 1) + i] = m;
                     }
                 }
             }
@@ -361,7 +362,7 @@ impl Terrain {
                 grass.push(self.grass_at(i, j));
             }
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into() }
     }
 
     /// Version simplifiée pour la vue de loin : un sommet sur `f` dans chaque direction (cases `f` fois plus
@@ -385,7 +386,7 @@ impl Terrain {
                 mat.push(self.mat[gj(j).min(self.ny - 2) * (self.nx - 1) + gi(i).min(self.nx - 2)]);
             }
         }
-        Terrain { origin: self.origin, cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Vec::new() }
+        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default() }
     }
 
     /// Herbe du jeu d'une case (0 = aucune).
@@ -398,7 +399,7 @@ impl Terrain {
     pub fn paint_grass(&mut self, c: V3, r: f32, k: u8) -> usize {
         let n = (self.nx - 1) * (self.ny - 1);
         if self.grass.len() != n {
-            self.grass = vec![0; n];
+            self.grass = std::sync::Arc::new(vec![0; n]);
         }
         let mut changed = 0;
         for j in 0..self.ny - 1 {
@@ -411,7 +412,7 @@ impl Terrain {
                 let idx = j * (self.nx - 1) + i;
                 let v = if k > 0 && self.mat[idx] >= 4 { 0 } else { k };
                 if self.grass[idx] != v {
-                    self.grass[idx] = v;
+                    std::sync::Arc::make_mut(&mut self.grass)[idx] = v;
                     changed += 1;
                 }
             }
@@ -448,7 +449,7 @@ impl Terrain {
 
     pub fn bounds(&self) -> (V3, V3) {
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for v in &self.h {
+        for v in self.h.iter() {
             lo = lo.min(*v);
             hi = hi.max(*v);
         }
@@ -483,12 +484,12 @@ impl Terrain {
         match b {
             Brush::Raise | Brush::Lower => {
                 let s = if b == Brush::Raise { 1.0 } else { -1.0 } * strength * dt;
-                self.each_vertex(c, r, |t, i, j, w| t.h[j * t.nx + i] += s * w);
+                self.each_vertex(c, r, |t, i, j, w| std::sync::Arc::make_mut(&mut t.h)[j * t.nx + i] += s * w);
             }
             Brush::Flatten => {
                 let k = (strength * dt * 1.5).min(1.0);
                 self.each_vertex(c, r, |t, i, j, w| {
-                    let v = &mut t.h[j * t.nx + i];
+                    let v = &mut std::sync::Arc::make_mut(&mut t.h)[j * t.nx + i];
                     *v += (target - *v) * (k * w * 2.0).min(1.0);
                 });
             }
@@ -499,7 +500,7 @@ impl Terrain {
                 self.each_vertex(c, r, |t, i, j, w| {
                     let g = |a: usize, b: usize| old[b * nx + a];
                     let avg = (g(i.saturating_sub(1), j) + g((i + 1).min(nx - 1), j) + g(i, j.saturating_sub(1)) + g(i, (j + 1).min(ny - 1))) * 0.25;
-                    let v = &mut t.h[j * nx + i];
+                    let v = &mut std::sync::Arc::make_mut(&mut t.h)[j * nx + i];
                     *v += (avg - *v) * (k * w * 2.0).min(1.0);
                 });
             }
@@ -509,7 +510,7 @@ impl Terrain {
                 self.each_vertex(c, r, |t, i, j, w| {
                     let p = t.vpos(i, j);
                     let n = wnoise(p.x, p.y, 9.0, 3, seed) - 0.5;
-                    t.h[j * t.nx + i] += n * s * w;
+                    std::sync::Arc::make_mut(&mut t.h)[j * t.nx + i] += n * s * w;
                 });
             }
             Brush::Paint => self.paint_disc(c, r, paint),
@@ -526,7 +527,7 @@ impl Terrain {
                     continue;
                 }
                 if ((x - c.x).powi(2) + (y - c.y).powi(2)).sqrt() <= r {
-                    self.mat[j * (self.nx - 1) + i] = m;
+                    std::sync::Arc::make_mut(&mut self.mat)[j * (self.nx - 1) + i] = m;
                 }
             }
         }
@@ -554,7 +555,7 @@ impl Terrain {
                 }
                 let target = ha + (hb - ha) * t;
                 let k = if d <= half { 1.0 } else { 1.0 - (d - half) / edge };
-                let v = &mut self.h[j * self.nx + i];
+                let v = &mut std::sync::Arc::make_mut(&mut self.h)[j * self.nx + i];
                 *v += (target - *v) * k;
             }
         }
@@ -563,7 +564,7 @@ impl Terrain {
                 let x = self.origin.x + (i as f32 + 0.5) * self.cell;
                 let y = self.origin.y + (j as f32 + 0.5) * self.cell;
                 if seg(x, y).1 <= half {
-                    self.mat[j * (self.nx - 1) + i] = ROAD;
+                    std::sync::Arc::make_mut(&mut self.mat)[j * (self.nx - 1) + i] = ROAD;
                 }
             }
         }
@@ -577,7 +578,7 @@ impl Terrain {
                 let d = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt() / r;
                 if d < 1.2 {
                     let hh = top * (1.0 - d * d).max(-0.2);
-                    let v = &mut self.h[j * self.nx + i];
+                    let v = &mut std::sync::Arc::make_mut(&mut self.h)[j * self.nx + i];
                     *v = v.max(hh);
                 }
             }
@@ -600,7 +601,7 @@ impl Terrain {
                 let n = v3(-dx, -dy, 1.0).norm();
                 let x = i as f32 * self.cell;
                 let y = j as f32 * self.cell;
-                verts.push(RVert { pos: [x, y, self.h[j * nx + i]], nrm: [n.x, n.y, n.z], uv: [(ox + x) / 6.0, (oy + y) / 6.0], col: [255; 4] });
+                verts.push(RVert { pos: [x, y, self.h[j * nx + i]], nrm: [n.x, n.y, n.z], uv: [(ox + x) / 6.0, (oy + y) / 6.0], col: [255; 4], uv1: [0.0, 0.0] });
             }
         }
         let mut per: Vec<Vec<u32>> = vec![Vec::new(); MATERIALS.len()];
@@ -621,7 +622,7 @@ impl Terrain {
             texs.push((key, material_texture(m)));
             // morceaux de 60 000 indices au plus : chaque partie du modèle du jeu compte ses sommets sur 16 bits
             for chunk in list.chunks(60000) {
-                geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex: m as u32, cutout: false, blend: 0, glass: false });
+                geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex: m as u32, cutout: false, blend: 0, glass: false, ..Default::default() });
                 keys.push(key);
                 idx.extend_from_slice(chunk);
             }
@@ -661,12 +662,12 @@ pub fn append_mesh(verts: &mut Vec<RVert>, idx: &mut Vec<u32>, geoms: &mut Vec<R
     }
     for (i, p) in pos.iter().enumerate() {
         let n = if nrm[i].len() > 1e-6 { nrm[i].norm() } else { v3(0.0, 0.0, 1.0) };
-        verts.push(RVert { pos: [p.x, p.y, p.z], nrm: [n.x, n.y, n.z], uv: uv[i], col: [255; 4] });
+        verts.push(RVert { pos: [p.x, p.y, p.z], nrm: [n.x, n.y, n.z], uv: uv[i], col: [255; 4], uv1: [0.0, 0.0] });
     }
     for (key, list, _) in parts {
         let tex = texs.iter().position(|t| t.0 == *key).unwrap_or(0) as u32;
         for chunk in list.chunks(60000) {
-            geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex, cutout: false, blend: 0, glass: false });
+            geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex, cutout: false, blend: 0, glass: false, ..Default::default() });
             keys.push(*key);
             idx.extend(chunk.iter().map(|i| i + base));
         }
@@ -811,7 +812,7 @@ impl DwApp {
         let Some(gpu) = &self.game.gpu else { return };
         let (model, part_keys, textures) = t.model();
         if let Ok(mut g) = gpu.lock() {
-            g.add_custom(Loaded { arch: crate::gta::crypto::joaat(TERRAIN_ARCH), model: Some(model), part_keys, textures });
+            g.add_custom(Loaded { arch: crate::gta::crypto::joaat(TERRAIN_ARCH), model: Some(model), part_keys, layer_keys: Vec::new(), textures });
         }
         self.terrain.dirty = false;
         self.terrain.generation += 1;
@@ -1214,7 +1215,7 @@ impl DwApp {
                     self.push_undo();
                     let h0 = self.terrain.new_height;
                     if let Some(t) = self.proj.terrain.as_mut() {
-                        t.h.iter_mut().for_each(|v| *v = h0);
+                        std::sync::Arc::make_mut(&mut t.h).iter_mut().for_each(|v| *v = h0);
                         t.roads.clear();
                     }
                     self.terrain.dirty = true;

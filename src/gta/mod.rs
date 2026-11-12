@@ -11,6 +11,143 @@ pub mod world;
 
 use std::path::Path;
 
+/// Sonde : modèles posés près de (x, y) dont des parties n'ont pas de texture de couleur (affichées en couleur unie).
+pub fn ground_probe(game: &str, x: f32, y: f32, r: f32) {
+    let prog = std::sync::Arc::new(std::sync::Mutex::new(world::Progress { text: String::new(), frac: 0.0 }));
+    let Ok(w) = world::GameWorld::load(Path::new(game), "", prog) else { return println!("chargement impossible") };
+    let mut seen = std::collections::HashSet::new();
+    let src = w.model_source();
+    let (mut parts_total, mut parts_flat, mut models_flat) = (0usize, 0usize, 0usize);
+    for ei in w.ents_in_radius(crate::math::v3(x, y, 0.0), r) {
+        let e = &w.ents[ei as usize];
+        if e.lod_level != 0 || !seen.insert(e.arch) {
+            continue;
+        }
+        let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let mut cache = Vec::new();
+        let l = src.load(e.arch, &claimed, &mut cache);
+        let Some(m) = l.model.as_ref() else { continue };
+        let flat = m.geoms.iter().filter(|g| g.tex == 0 && g.terrain == 0).count();
+        parts_total += m.geoms.len();
+        parts_flat += flat;
+        if flat > 0 {
+            models_flat += 1;
+            if models_flat <= 12 {
+                println!("{} : {} partie(s) sur {} sans texture de couleur", w.name_of(e.arch), flat, m.geoms.len());
+            }
+        }
+    }
+    println!("total : {} modèles détaillés, {models_flat} avec des parties sans texture ; {parts_flat} parties sans texture sur {parts_total}", seen.len());
+}
+
+/// Mode test : écrit le .ydr d'un modèle du jeu et sa lecture en XML par CodeWalker (format des sommets, parties…).
+pub fn dump_ydr_xml(game: &str, model: &str, out: &str) {
+    let prog = std::sync::Arc::new(std::sync::Mutex::new(world::Progress { text: String::new(), frac: 0.0 }));
+    let Ok(w) = world::GameWorld::load(Path::new(game), "", prog) else { return println!("chargement impossible") };
+    let h = crypto::joaat(&model.to_lowercase());
+    let Some(f) = w.models.get(&h).and_then(|v| v.iter().map(|&i| &w.vfs.files[i]).find(|f| f.name.ends_with(".ydr"))) else { return println!("modèle introuvable") };
+    let Some(raw) = w.vfs.raw_resource_file(f) else { return println!("lecture impossible") };
+    let Some(dll) = keys::find_codewalker_dll("") else { return println!("CodeWalker introuvable") };
+    let dir = std::path::PathBuf::from(out);
+    let _ = std::fs::create_dir_all(&dir);
+    let ydr = dir.join(format!("{model}.ydr"));
+    let xml = dir.join(format!("{model}.ydr.xml"));
+    let _ = std::fs::write(&ydr, raw);
+    println!("{:?}", crate::cwbridge::to_xml(&dll, &[(ydr, xml.clone())]));
+    println!("écrit : {}", xml.display());
+}
+
+/// Mesure (lecture seule) : « garder seulement une zone » — `dragowalker --gta-region <dossier du jeu> x0,y0,x1,y1 [...]`.
+/// Pour chaque zone à garder, compte les cartes du jeu entièrement dedans (intactes), entièrement dehors (à remplacer
+/// par une carte vide du même nom) et à cheval (à recouper), et les objets concernés.
+pub fn region_probe(game: &str, zones: &[String]) {
+    let prog = std::sync::Arc::new(std::sync::Mutex::new(world::Progress { text: String::new(), frac: 0.0 }));
+    let w = match world::GameWorld::load(Path::new(game), "", prog) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("chargement impossible : {e}");
+            return;
+        }
+    };
+    println!("monde : {} cartes, {} objets", w.ymaps.len(), w.ents.len());
+    let ybn: std::collections::HashSet<String> = w.vfs.files.iter().filter(|f| f.name.ends_with(".ybn")).map(|f| f.name.trim_end_matches(".ybn").to_string()).collect();
+    println!("fichiers de collision (.ybn) : {}", ybn.len());
+    for z in zones {
+        let v: Vec<f32> = z.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if v.len() != 4 {
+            println!("zone illisible : {z}");
+            continue;
+        }
+        let (x0, y0, x1, y1) = (v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3]));
+        let (mut inside, mut outside, mut cross) = (0usize, 0usize, 0usize);
+        let (mut ents_in, mut ents_out_whole, mut ents_cross_total, mut ents_cross_removed) = (0usize, 0usize, 0usize, 0usize);
+        let mut by_group: std::collections::BTreeMap<String, (usize, usize, usize)> = std::collections::BTreeMap::new();
+        let mut outside_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lod_cross = 0usize;
+        for y in &w.ymaps {
+            if y.count == 0 {
+                continue;
+            }
+            let g = by_group.entry(w.groups[y.group].label.clone()).or_insert((0, 0, 0));
+            let disjoint = y.max.x < x0 || y.min.x > x1 || y.max.y < y0 || y.min.y > y1;
+            let contained = y.min.x >= x0 && y.max.x <= x1 && y.min.y >= y0 && y.max.y <= y1;
+            if contained {
+                inside += 1;
+                ents_in += y.count;
+                g.0 += 1;
+            } else if disjoint {
+                outside += 1;
+                ents_out_whole += y.count;
+                outside_names.insert(y.name.to_lowercase());
+                g.1 += 1;
+            } else {
+                cross += 1;
+                g.2 += 1;
+                ents_cross_total += y.count;
+                let removed = w.ents[y.first..y.first + y.count].iter().filter(|e| e.pos.x < x0 || e.pos.x > x1 || e.pos.y < y0 || e.pos.y > y1).count();
+                ents_cross_removed += removed;
+                if y.name.to_lowercase().contains("lod") {
+                    lod_cross += 1;
+                }
+            }
+        }
+        let _ = &ybn;
+        let mut cross_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut in_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for y in &w.ymaps {
+            if y.count == 0 {
+                continue;
+            }
+            let n = y.name.to_lowercase();
+            let disjoint = y.max.x < x0 || y.min.x > x1 || y.max.y < y0 || y.min.y > y1;
+            let contained = y.min.x >= x0 && y.max.x <= x1 && y.min.y >= y0 && y.max.y <= y1;
+            if contained {
+                in_names.insert(n);
+            } else if !disjoint {
+                cross_names.insert(n);
+            }
+        }
+        // un nom présent dans plusieurs paquets : un seul fichier de ce nom suffit dans stream/ ; s'il est à cheval ou
+        // dedans quelque part, il ne doit pas être vidé
+        let empty_unique = outside_names.iter().filter(|n| !in_names.contains(*n) && !cross_names.contains(*n)).count();
+        let ybn_out = empty_unique;
+        println!("
+== zone à garder x {x0}..{x1}, y {y0}..{y1} ({:.1} km × {:.1} km)", (x1 - x0) / 1000.0, (y1 - y0) / 1000.0);
+        println!("  cartes entièrement dedans (intactes)     : {inside:>5}  ({ents_in} objets)");
+        println!("  cartes entièrement dehors (à vider)      : {outside:>5}  ({ents_out_whole} objets supprimés)");
+        println!("  cartes à cheval (à recouper)             : {cross:>5}  ({ents_cross_removed} objets supprimés sur {ents_cross_total}), dont {lod_cross} cartes de niveaux de détail");
+        println!("  fichiers à écrire (vides + recoupés)     : {:>5}", outside + cross);
+        println!("  noms UNIQUES à vider (un fichier par nom) : {ybn_out} ; noms à recouper : {} ; noms gardés tels quels : {}", cross_names.len(), in_names.len());
+        let total_ents: usize = ents_out_whole + ents_cross_removed + ents_in + (ents_cross_total - ents_cross_removed);
+        println!("  part des objets supprimés : {:.1} %", 100.0 * (ents_out_whole + ents_cross_removed) as f64 / total_ents.max(1) as f64);
+        for (k, (a, b, c)) in &by_group {
+            if a + b + c > 0 {
+                println!("    {k:<44} dedans {a:>4} · dehors {b:>4} · à cheval {c:>4}");
+            }
+        }
+    }
+}
+
 /// Mode test : `dragowalker --gta-probe <dossier du jeu> [dossier CodeWalker]`.
 pub fn probe(game: &str, cw: &str) {
     if std::env::var("DW_WORLD").is_ok() {
@@ -48,7 +185,7 @@ pub fn probe(game: &str, cw: &str) {
                 }
                 for (lbl, x, y, ez) in [("legion", 195.0f32, -934.0f32, 600.0f32), ("cayo", 4890.0, -5170.0, 2000.0), ("carte", 0.0, 0.0, 6000.0)] {
                     let mut v: Vec<(f32, u32)> = w.visible_near(crate::math::v3(x, y, ez), crate::math::v3(x, y, 0.0), 3000.0, 1.0).into_iter().map(|i| { let (a, b) = w.arch_box(w.ents[i as usize].arch); ((b - a).len(), i) }).collect();
-                    v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    v.sort_by(|a, b| b.0.total_cmp(&a.0));
                     println!("{lbl} : {} visibles", v.len());
                     for (d, i) in v.iter().take(12) { let e = &w.ents[*i as usize]; let (a, b) = w.arch_box(e.arch); let s = b - a; println!("   {:>7.0} {:<40} lod {} taille {:.0}x{:.0}x{:.0} ymap {}", d, w.name_of(e.arch), e.lod_level, s.x, s.y, s.z, w.ymaps[e.ymap as usize].name); }
                     let mut by = [0usize; 8]; for (_, i) in &v { by[w.ents[*i as usize].lod_level.min(7) as usize] += 1; } println!("   par niveau {:?}", by);
@@ -191,8 +328,8 @@ pub fn probe(game: &str, cw: &str) {
                             dists.push(along.abs());
                             lat.push(side.abs());
                         }
-                        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        dists.sort_by(|a, b| a.total_cmp(b));
+                        lat.sort_by(|a, b| a.total_cmp(b));
                         let med = |v: &Vec<f32>| v.get(v.len() / 2).copied().unwrap_or(0.0);
                         println!("{nm} : {} placés, {groups} dans un carrefour ; du côté des voitures regardées (avant le centre) {near}, après le centre {far} ; bras vers le centre {arm_in}, vers l'extérieur {arm_out} ; distance médiane au centre le long {:.1} m, en travers {:.1} m", list.len(), med(&dists), med(&lat));
                     }
@@ -360,7 +497,7 @@ pub fn probe(game: &str, cw: &str) {
                         }
                     }
                     println!("lumières : {} dans {} modèles d'intérieur", all.len(), seen.len());
-                    let mut hist = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
+                    let hist = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
                         let mut m: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
                         for (_, l) in &all {
                             *m.entry(f(l)).or_insert(0) += 1;
@@ -387,7 +524,7 @@ pub fn probe(game: &str, cw: &str) {
                     // spots vers le bas allumés toute la journée : réglages pris ensemble
                     all.retain(|(_, l)| l.kind == 2 && l.dir[2] < -0.99 && l.time_flags == 0xFF_FFFF);
                     println!("  spots vers le bas, toute la journée : {}", all.len());
-                    let mut hist2 = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
+                    let hist2 = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
                         let mut m: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
                         for (_, l) in &all {
                             *m.entry(f(l)).or_insert(0) += 1;
