@@ -55,6 +55,9 @@ pub struct Entity {
     /// position dans le ymap du jeu d'origine (copie d'un ymap du jeu), -1 sinon
     #[serde(default = "minus_one")]
     pub game_index: i32,
+    /// pose d'un groupe dont l'objet fait partie (0 = aucune) : un clic prend tout le bloc (groups.rs)
+    #[serde(default)]
+    pub group_inst: u64,
 }
 
 fn minus_one() -> i32 {
@@ -85,6 +88,7 @@ impl Entity {
             mlo: None,
             extensions_xml: String::new(),
             game_index: -1,
+            group_inst: 0,
         }
     }
     pub fn scale(&self) -> V3 {
@@ -135,6 +139,9 @@ pub struct Ymap {
     /// véhicules garés (générateurs de véhicules)
     #[serde(default)]
     pub car_gens: Vec<crate::life::CarGen>,
+    /// boîtes d'occlusion ajoutées dans DragoWalker (occlusion.rs)
+    #[serde(default)]
+    pub occluders: Vec<crate::occlusion::BoxOcc>,
     /// PNJ posés (exportés en script client)
     #[serde(default)]
     pub peds: Vec<crate::life::PedSpot>,
@@ -154,6 +161,7 @@ impl Ymap {
             from_game: false,
             car_gens: Vec::new(),
             peds: Vec::new(),
+            occluders: Vec::new(),
         }
     }
 
@@ -180,6 +188,10 @@ impl Ymap {
             if e.mlo.is_some() {
                 cf |= 8;
             }
+        }
+        // boîtes d'occlusion : bit 5 (32) de contentFlags (CodeWalker YmapFile::CalcFlags 0x06002cd4, IL_0161–IL_0172)
+        if !self.occluders.is_empty() {
+            cf |= 32;
         }
         // garde les bits qu'on ne gère pas (physique, lumières...)
         self.flags = (self.flags & !2) | flags;
@@ -342,6 +354,53 @@ pub struct Project {
     /// ressources MLO importées (fichiers du créateur, crédits, objet de référence)
     #[serde(default)]
     pub mlo_res: Vec<crate::mlo::MloRes>,
+    /// orientation des placements d'intérieur selon CodeWalker (non inversée dans les fichiers) ; faux pour un
+    /// projet enregistré avant la correction : il est corrigé à l'ouverture (fix_mlo_rotations)
+    #[serde(default)]
+    pub mlo_rot_fixed: bool,
+    /// bâtiments du jeu édités (morceaux retirés à la main) : modèles « dw_cut_N »
+    #[serde(default)]
+    pub building_cuts: Vec<crate::bedit::BuildingCut>,
+    /// intérieurs créés depuis un bâtiment (« Transformer en intérieur ») : (placement de l'intérieur, bâtiment) ;
+    /// ils bougent et tournent ensemble
+    #[serde(default)]
+    pub mlo_links: Vec<(u64, u64)>,
+    /// angle (radians) de l'intérieur par rapport à son bâtiment relié : direction des murs dans le modèle
+    #[serde(default)]
+    pub mlo_link_yaw: Vec<(u64, f32)>,
+    /// groupes d'objets (« Faire un groupe ») à poser ailleurs
+    #[serde(default)]
+    pub groups: Vec<crate::groups::Group>,
+}
+
+impl Project {
+    /// Projets enregistrés quand DragoWalker inversait aussi la rotation des placements d'intérieur
+    /// (CMloInstanceDef) : orientation lue = inverse de la vraie (R0⁻¹), et un tour G donné avec les poignées
+    /// était appliqué par-dessus (G·R0⁻¹). Correction : vraie orientation d'origine R0 = (réf. lue)⁻¹ et
+    /// orientation voulue G·R0 = actuelle · réf⁻¹ · réf⁻¹ ; placement d'intérieur sans référence : simplement
+    /// inversé. Rend le nombre de placements corrigés.
+    pub fn fix_mlo_rotations(&mut self) -> usize {
+        if self.mlo_rot_fixed {
+            return 0;
+        }
+        self.mlo_rot_fixed = true;
+        let mut n = 0;
+        let refs: Vec<(u64, Quat)> = self.mlo_res.iter().map(|r| (r.ref_id, r.ref_rot)).collect();
+        for y in self.ymaps.iter_mut() {
+            for e in y.entities.iter_mut().filter(|e| e.mlo.is_some()) {
+                e.rot = match refs.iter().find(|r| r.0 == e.id) {
+                    Some((_, rr)) => e.rot.mul(rr.inverse()).mul(rr.inverse()).normalized(),
+                    None => e.rot.inverse().normalized(),
+                };
+                n += 1;
+            }
+        }
+        let mlo_ids: Vec<u64> = self.ymaps.iter().flat_map(|y| y.entities.iter().filter(|e| e.mlo.is_some()).map(|e| e.id)).collect();
+        for r in self.mlo_res.iter_mut().filter(|r| mlo_ids.contains(&r.ref_id)) {
+            r.ref_rot = r.ref_rot.inverse().normalized();
+        }
+        n
+    }
 }
 
 /// Un élément sélectionnable.

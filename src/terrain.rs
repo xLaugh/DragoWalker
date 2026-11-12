@@ -63,6 +63,11 @@ pub struct Terrain {
     /// effets de particules posés
     #[serde(default)]
     pub emitters: Vec<crate::scenery::Emitter>,
+    /// herbe du jeu de chaque case ((nx-1) × (ny-1)) : 0 aucune, sinon 1 + numéro dans grass::KINDS ; à l'export,
+    /// la collision de la case porte l'étiquette de végétation procédurale correspondante (le jeu fait pousser
+    /// l'herbe lui-même)
+    #[serde(default)]
+    pub grass: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,6 +126,10 @@ pub struct TerrainState {
     pub veg_set: usize,
     pub veg_density: f32,
     pub veg_last: Option<V3>,
+    /// pinceau végétation : 0 objets (arbres, buissons…), 1 herbe du jeu ; herbe choisie (grass::KINDS) ; biome
+    pub veg_mode: u8,
+    pub grass_kind: u8,
+    pub biome: usize,
     /// eau : coin de départ du rectangle, creuser le bassin, profondeur
     pub water_start: Option<V3>,
     pub water_dig: bool,
@@ -152,6 +161,9 @@ impl Default for TerrainState {
             veg_set: 0,
             veg_density: 0.5,
             veg_last: None,
+            veg_mode: 0,
+            grass_kind: 0,
+            biome: 0,
             water_start: None,
             water_dig: true,
             water_depth: 2.0,
@@ -189,7 +201,7 @@ impl Terrain {
         let cell = if size > 600.0 { 4.0 } else { 2.0 };
         let n = ((size / cell).round() as usize + 1).clamp(16, 400);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: vec![base_h; n * n], mat: vec![mat; (n - 1) * (n - 1)], roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: vec![base_h; n * n], mat: vec![mat; (n - 1) * (n - 1)], roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Vec::new() }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
@@ -342,10 +354,69 @@ impl Terrain {
             h.extend_from_slice(&self.h[j * self.nx + i0..=j * self.nx + i1]);
         }
         let mut mat = Vec::with_capacity((nx - 1) * (ny - 1));
+        let mut grass = Vec::with_capacity((nx - 1) * (ny - 1));
         for j in j0..j1 {
             mat.extend_from_slice(&self.mat[j * (self.nx - 1) + i0..j * (self.nx - 1) + i1]);
+            for i in i0..i1 {
+                grass.push(self.grass_at(i, j));
+            }
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass }
+    }
+
+    /// Version simplifiée pour la vue de loin : un sommet sur `f` dans chaque direction (cases `f` fois plus
+    /// grandes), hauteurs reprises du terrain (bord de tuile compris), matériau de la case du coin.
+    pub fn downsample(&self, f: usize) -> Terrain {
+        let f = f.max(1);
+        let nx = (self.nx - 1).div_ceil(f) + 1;
+        let ny = (self.ny - 1).div_ceil(f) + 1;
+        let cell = self.cell * f as f32;
+        let gi = |i: usize| (i * f).min(self.nx - 1);
+        let gj = |j: usize| (j * f).min(self.ny - 1);
+        let mut h = Vec::with_capacity(nx * ny);
+        for j in 0..ny {
+            for i in 0..nx {
+                h.push(self.h[gj(j) * self.nx + gi(i)]);
+            }
+        }
+        let mut mat = Vec::with_capacity((nx - 1) * (ny - 1));
+        for j in 0..ny - 1 {
+            for i in 0..nx - 1 {
+                mat.push(self.mat[gj(j).min(self.ny - 2) * (self.nx - 1) + gi(i).min(self.nx - 2)]);
+            }
+        }
+        Terrain { origin: self.origin, cell, nx, ny, h, mat, roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Vec::new() }
+    }
+
+    /// Herbe du jeu d'une case (0 = aucune).
+    pub fn grass_at(&self, i: usize, j: usize) -> u8 {
+        self.grass.get(j * (self.nx - 1) + i).copied().unwrap_or(0)
+    }
+
+    /// Peint l'herbe du jeu `k` (0 = l'enlève) dans le disque ; jamais sur le béton, le goudron ni les routes
+    /// (matériaux 4 et plus). Rend le nombre de cases changées.
+    pub fn paint_grass(&mut self, c: V3, r: f32, k: u8) -> usize {
+        let n = (self.nx - 1) * (self.ny - 1);
+        if self.grass.len() != n {
+            self.grass = vec![0; n];
+        }
+        let mut changed = 0;
+        for j in 0..self.ny - 1 {
+            for i in 0..self.nx - 1 {
+                let x = self.origin.x + (i as f32 + 0.5) * self.cell;
+                let y = self.origin.y + (j as f32 + 0.5) * self.cell;
+                if (x - c.x).powi(2) + (y - c.y).powi(2) > r * r {
+                    continue;
+                }
+                let idx = j * (self.nx - 1) + i;
+                let v = if k > 0 && self.mat[idx] >= 4 { 0 } else { k };
+                if self.grass[idx] != v {
+                    self.grass[idx] = v;
+                    changed += 1;
+                }
+            }
+        }
+        changed
     }
 
     fn vpos(&self, i: usize, j: usize) -> V3 {
@@ -723,8 +794,16 @@ impl DwApp {
     /// Renvoie le terrain à la carte graphique quand il a changé (au plus ~12 fois par seconde).
     pub fn terrain_tick(&mut self, now: f64) {
         let Some(t) = self.proj.terrain.as_ref() else { return };
+        // terrain absent de la carte graphique (jamais envoyé, ou perdu) : renvoyé, sinon il serait dessiné comme une
+        // boîte beige
         if !self.terrain.dirty {
-            return;
+            let arch = crate::gta::crypto::joaat(TERRAIN_ARCH);
+            let missing = self.game.gpu.as_ref().and_then(|g| g.lock().ok().map(|g| !g.has_or_loading(arch))).unwrap_or(false);
+            // (au plus toutes les 2 s, si l'envoi échouait)
+            if !missing || now - self.terrain_last_upload < 2.0 {
+                return;
+            }
+            self.terrain.dirty = true;
         }
         if now - self.terrain_last_upload < 0.08 {
             return;
@@ -806,6 +885,14 @@ impl DwApp {
                 return;
             }
             self.terrain.veg_last = Some(c);
+            // herbe du jeu : une étiquette par case (Ctrl : l'enlève)
+            if self.terrain.veg_mode == 1 {
+                let k = if ctx.input(|i| i.modifiers.command) { 0 } else { self.terrain.grass_kind + 1 };
+                let n = self.proj.terrain.as_mut().map(|t| t.paint_grass(c, r, k)).unwrap_or(0);
+                let name = crate::grass::KINDS[(self.terrain.grass_kind as usize).min(crate::grass::KINDS.len() - 1)].name;
+                self.status = if k == 0 { format!("Herbe enlevée sur {n} case(s).") } else { format!("Herbe « {name} » sur {n} case(s) · le jeu la fera pousser · Ctrl + pinceau pour l'enlever.") };
+                return;
+            }
             if ctx.input(|i| i.modifiers.command) {
                 let n = self.veg_remove(c, r);
                 if n > 0 {
@@ -1393,6 +1480,7 @@ impl DwApp {
                     .fill(if self.terrain.veg_set == i { Color32::from_rgb(140, 210, 120) } else { Color32::from_gray(40) });
                 if ui.add(b).on_hover_text(format!("{} · {n} modèles du jeu · écart {:.0} m", s.tip, s.spacing)).clicked() {
                     self.terrain.veg_set = i;
+                    self.terrain.veg_mode = 0;
                     self.set_terrain_brush(Brush::Vegetation);
                 }
                 if i % 2 == 1 {
@@ -1418,6 +1506,8 @@ impl DwApp {
                 self.status = format!("{n} objet(s) de végétation retiré(s).");
             }
         });
+        // « Herbe du jeu » et « Biomes » (grass.rs) : retirés de l'interface le 11 nov. 2026 à la demande de la
+        // personne (pas encore vus fonctionner en jeu) — à reprendre plus tard, voir A_FAIRE.md
     }
 
     fn terrain_ui_export(&mut self, ui: &mut egui::Ui) {
@@ -1482,6 +1572,39 @@ fn arch_xml(name: &str, txd: &str, lmn: V3, lmx: V3, lod: f32) -> String {
     )
 }
 
+/// Distance d'affichage d'une tuile détaillée quand elle a une version de loin (m) — **estimé** ; au-delà, la
+/// version simplifiée (TERRAIN_LOD_STEP fois moins de sommets par côté) prend le relais jusqu'à TERRAIN_LOD_DIST.
+pub const TERRAIN_HD_DIST: f32 = 500.0;
+pub const TERRAIN_LOD_STEP: usize = 4;
+
+/// Distance de la tuile détaillée comptée depuis son coin (position du placement, d'où CodeWalker mesure :
+/// RenderLodManager.GetEntityChildren 0x060009a8, `Distance = |Position − caméra|`) : TERRAIN_HD_DIST plus la
+/// demi-diagonale, pour que tout point à TERRAIN_HD_DIST du centre de la tuile la voie détaillée.
+pub fn hd_dist_from_corner(w: f32, h: f32) -> f32 {
+    TERRAIN_HD_DIST + 0.5 * (w * w + h * h).sqrt()
+}
+
+/// Associe chaque morceau détaillé d'une tuile (nom, dictionnaire de textures) à un morceau de sa version de loin :
+/// celui du même dictionnaire, sinon le premier. Rend (parent de chaque morceau détaillé, morceaux de loin gardés).
+/// Un morceau de loin sans enfant serait une racine dessinée jusqu'à sa distance même quand la tuile détaillée
+/// l'est (RenderLodManager.Update 0x060009a6 : racine dessinée si Distance ≤ LodDist, enfants seulement via
+/// GetEntityChildren 0x060009a8) : il n'est donc pas placé.
+pub fn pair_lod_pieces(hd: &[(String, String)], lods: &[(String, String)]) -> (Vec<Option<usize>>, Vec<usize>) {
+    let parent_of: Vec<Option<usize>> = hd.iter().map(|(_, t)| if lods.is_empty() { None } else { Some(lods.iter().position(|(_, lt)| lt == t).unwrap_or(0)) }).collect();
+    let kept: Vec<usize> = (0..lods.len()).filter(|li| parent_of.contains(&Some(*li))).collect();
+    (parent_of, kept)
+}
+
+/// Placement d'un morceau du terrain avec niveau de détail : `lod_level` (LODTYPES_…), `parent` (index dans la
+/// carte parente, -1 aucun), drapeaux (bit 0x8 si le parent est dans la carte parente, comme les objets du jeu),
+/// nombre d'enfants et distance de leurs enfants.
+#[allow(clippy::too_many_arguments)]
+fn ent_xml_lod(name: &str, guid: u32, x: f32, y: f32, lod: f32, lod_level: &str, parent: i32, flags: u32, nchild: u32, child_lod: f32) -> String {
+    format!(
+        "  <Item type=\"CEntityDef\">\n   <archetypeName>{name}</archetypeName>\n   <flags value=\"{flags}\" />\n   <guid value=\"{guid}\" />\n   <position x=\"{x}\" y=\"{y}\" z=\"0\" />\n   <rotation x=\"0\" y=\"0\" z=\"0\" w=\"1\" />\n   <scaleXY value=\"1\" />\n   <scaleZ value=\"1\" />\n   <parentIndex value=\"{parent}\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"{child_lod}\" />\n   <lodLevel>{lod_level}</lodLevel>\n   <numChildren value=\"{nchild}\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n"
+    )
+}
+
 /// Placement (CEntityDef) d'un morceau du terrain exporté, au point (x, y, 0).
 fn ent_xml(name: &str, guid: u32, x: f32, y: f32, lod: f32) -> String {
     format!(
@@ -1533,7 +1656,9 @@ impl Terrain {
     /// Les voisins des triangles (f1–f3), la quantification, les matériaux utilisés, l'arbre de recherche et les
     /// drapeaux sont recalculés par CodeWalker à la conversion (BoundGeometry::ReadXml 0x0600410a,
     /// BoundComposite::ReadXml 0x06004170) : on les laisse à 0 / par défaut ici.
-    pub fn collision_xml(&self, types: [u32; 7]) -> String {
+    /// `pids` : ProceduralID de chaque herbe (pids[0] = 0 sans herbe, pids[k] = herbe k) ; un matériau par couple
+    /// (surface, herbe), triangle m = herbe × 7 + surface.
+    pub fn collision_xml(&self, types: [u32; 7], pids: &[u32]) -> String {
         use std::fmt::Write;
         let (mn, mx) = self.bounds();
         let c = (mn + mx) * 0.5;
@@ -1582,8 +1707,9 @@ impl Terrain {
                 let verts = rel;
                 for j in j0..j1 {
                     for i in i0..i1 {
-                        let m = (self.mat[j * (self.nx - 1) + i] as usize).min(6);
-                        used[m] = true;
+                        let g = (self.grass_at(i, j) as usize).min(pids.len().saturating_sub(1));
+                        let m = (self.mat[j * (self.nx - 1) + i] as usize).min(6) + g * 7;
+                        used[m % 7] = true;
                         let a = (j - j0) * w + (i - i0);
                         let (b, cc, d) = (a + 1, a + w, a + w + 1);
                         let _ = writeln!(polys, "     <Triangle m=\"{m}\" v1=\"{a}\" v2=\"{b}\" v3=\"{d}\" f1=\"0\" f2=\"0\" f3=\"0\" />");
@@ -1595,8 +1721,10 @@ impl Terrain {
                 head(&mut s, "    ", bmn, bmx, 0.04);
                 let gc = (bmn + bmx) * 0.5;
                 let _ = writeln!(s, "    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n    {}\n    <UnkFloat1 value=\"0\" />\n    <UnkFloat2 value=\"0.0025\" />\n    <Materials>", xyz("GeometryCenter", gc));
-                for t in types {
-                    let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
+                for pid in pids.iter().copied().chain(if pids.is_empty() { Some(0) } else { None }) {
+                    for t in types {
+                        let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"{pid}\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
+                    }
                 }
                 let _ = writeln!(s, "    </Materials>\n    <Vertices>\n{verts}    </Vertices>\n    <Polygons>\n{polys}    </Polygons>\n   </Item>");
                 i0 = i1;
@@ -1623,7 +1751,7 @@ impl DwApp {
         if let Ok(rd) = std::fs::read_dir(stream) {
             for f in rd.flatten() {
                 let n = f.file_name().to_string_lossy().to_lowercase();
-                if n.starts_with("dw_terrain") && f.path().is_file() {
+                if n.starts_with("dw_terrain") && n.ends_with(".xml") && f.path().is_file() {
                     let _ = std::fs::remove_file(f.path());
                 }
             }
@@ -1631,6 +1759,8 @@ impl DwApp {
         let txd = TERRAIN_TXD;
         let lod = TERRAIN_LOD_DIST;
         let types = collision_types(self.game.world.as_deref());
+        // herbe du jeu : ProceduralID de chaque herbe, lu dans procedural.meta (procTagTable)
+        let pids = crate::grass::proc_ids(self.game.world.as_deref());
         let mut written_tex = false;
         let mut archs = Vec::new();
         let mut ents = String::new();
@@ -1638,6 +1768,9 @@ impl DwApp {
         let (mut emn, mut emx) = (v3(big, big, big), v3(-big, -big, -big));
         let (mut smn, mut smx) = (emn, emx);
         let mut tiles = 0;
+        // versions de loin des tuiles : leurs placements et leur nombre
+        let mut lod_ents = String::new();
+        let mut lod_n = 0usize;
         // numéros d'objet à part de ceux des effets (export_scenery compte avec `tiles`)
         let mut guid_n = 0x8000u32;
         let block = 100usize;
@@ -1670,21 +1803,49 @@ impl DwApp {
                     written_tex = true;
                 }
                 let pieces = write_split(stream, &name, &m, &k, &tx, txd)?;
-                std::fs::write(stream.join(format!("dw_terrain_col_r{row}c{col}.ybn.xml")), tile.collision_xml(types)).map_err(|e| e.to_string())?;
+                std::fs::write(stream.join(format!("dw_terrain_col_r{row}c{col}.ybn.xml")), tile.collision_xml(types, &pids)).map_err(|e| e.to_string())?;
                 // type d'objet : boîte du modèle (repère de la tuile : x, y depuis son coin, z absolu)
                 let (mn, mx) = tile.bounds();
                 let lmn = v3(0.0, 0.0, mn.z);
                 let lmx = v3(mx.x - mn.x, mx.y - mn.y, mx.z);
                 tiles += 1;
-                for (pn, ptxd) in &pieces {
+                // version de loin de la tuile (carte « dw_terrain_lod », parente) ; son premier morceau est le
+                // parent des morceaux détaillés (CMapData.parent + parentIndex + bit 0x8, comme lods.rs)
+                let lt = tile.downsample(TERRAIN_LOD_STEP);
+                let (lm, lk, ltx) = lt.model();
+                let lname = format!("dw_terrain_lod_r{row}c{col}");
+                let lpieces = write_split(stream, &lname, &lm, &lk, &ltx, txd)?;
+                // la distance est mesurée depuis la position du placement (coin de la tuile) :
+                // RenderLodManager.Update 0x060009a6 / GetEntityChildren 0x060009a8 ; on ajoute la demi-diagonale
+                // pour que tout point à TERRAIN_HD_DIST du centre voie la tuile détaillée
+                let hd = hd_dist_from_corner(mx.x - mn.x, mx.y - mn.y);
+                // un morceau de loin sans enfant est une racine dessinée jusqu'à sa distance, même quand la tuile
+                // détaillée l'est aussi (0x060009a6) : chaque morceau de loin est donc le parent des morceaux
+                // détaillés du même dictionnaire de textures (le premier prend ceux qui n'ont pas d'équivalent)
+                let (parent_of, kept) = pair_lod_pieces(&pieces, &lpieces);
+                for &li in &kept {
+                    let (pn, ptxd) = &lpieces[li];
                     archs.push(arch_xml(pn, ptxd, lmn, lmx, lod));
                     guid_n += 1;
-                    ents.push_str(&ent_xml(pn, 0x0D77_0000u32 + guid_n, tile.origin.x, tile.origin.y, lod));
+                    let nchild = parent_of.iter().filter(|p| **p == Some(li)).count() as u32;
+                    lod_ents.push_str(&ent_xml_lod(pn, 0x0D77_0000u32 + guid_n, tile.origin.x, tile.origin.y, lod, "LODTYPES_DEPTH_LOD", -1, TERRAIN_ENTITY_FLAGS, nchild, hd));
                 }
+                for ((pn, ptxd), p) in pieces.iter().zip(&parent_of) {
+                    // index du parent dans la carte de loin = rang parmi les morceaux de loin gardés
+                    let parent = p.and_then(|li| kept.iter().position(|k| *k == li)).map(|r| (lod_n + r) as i32).unwrap_or(-1);
+                    let (elod, flags) = if parent < 0 { (lod, TERRAIN_ENTITY_FLAGS) } else { (hd, TERRAIN_ENTITY_FLAGS | crate::mech::LOD_IN_PARENT_YMAP) };
+                    archs.push(arch_xml(pn, ptxd, lmn, lmx, elod));
+                    guid_n += 1;
+                    ents.push_str(&ent_xml_lod(pn, 0x0D77_0000u32 + guid_n, tile.origin.x, tile.origin.y, elod, "LODTYPES_DEPTH_HD", parent, flags, 0, 0.0));
+                }
+                lod_n += kept.len();
                 emn = emn.min(mn);
                 emx = emx.max(mx);
-                smn = smn.min(mn - v3(lod, lod, lod));
-                smx = smx.max(mx + v3(lod, lod, lod));
+                // zone de chargement = boîte ± distance des placements (CalcExtents 0x06002cd5) : la tuile
+                // détaillée n'a besoin d'être chargée que jusqu'à sa propre distance quand elle a un parent
+                let ext = if kept.is_empty() { lod } else { hd };
+                smn = smn.min(mn - v3(ext, ext, ext));
+                smx = smx.max(mx + v3(ext, ext, ext));
                 i0 = i1;
                 col += 1;
             }
@@ -1783,13 +1944,24 @@ impl DwApp {
         // ne connaît pas la taille des modèles du terrain)
         let vx = |n: &str, p: V3| format!(" <{n} x=\"{}\" y=\"{}\" z=\"{}\" />\n", p.x, p.y, p.z);
         let ymap = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>dw_terrain_placement</name>\n <parent />\n <flags value=\"0\" />\n <contentFlags value=\"1\" />\n{}{}{}{} <entities>\n{ents} </entities>\n <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>dw_terrain_placement</name>\n  <exportedBy>DragoWalker</exportedBy>\n  <owner />\n  <time />\n </block>\n</CMapData>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>dw_terrain_placement</name>\n <parent>dw_terrain_lod</parent>\n <flags value=\"0\" />\n <contentFlags value=\"1\" />\n{}{}{}{} <entities>\n{ents} </entities>\n <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>dw_terrain_placement</name>\n  <exportedBy>DragoWalker</exportedBy>\n  <owner />\n  <time />\n </block>\n</CMapData>\n",
             vx("streamingExtentsMin", smn),
             vx("streamingExtentsMax", smx),
             vx("entitiesExtentsMin", emn),
             vx("entitiesExtentsMax", emx)
         );
         std::fs::write(stream.join("dw_terrain_placement.ymap.xml"), ymap).map_err(|e| e.to_string())?;
+        // carte des versions de loin : parente de dw_terrain_placement ; drapeaux d'une carte de LOD
+        // (YmapFile::CalcFlags, model.rs calc_flags : flags 2, contentFlags 2) ; chargée jusqu'à TERRAIN_LOD_DIST
+        let (lmn, lmx) = (emn - v3(lod, lod, lod), emx + v3(lod, lod, lod));
+        let lymap = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>dw_terrain_lod</name>\n <parent />\n <flags value=\"2\" />\n <contentFlags value=\"2\" />\n{}{}{}{} <entities>\n{lod_ents} </entities>\n <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>dw_terrain_lod</name>\n  <exportedBy>DragoWalker</exportedBy>\n  <owner />\n  <time />\n </block>\n</CMapData>\n",
+            vx("streamingExtentsMin", lmn),
+            vx("streamingExtentsMax", lmx),
+            vx("entitiesExtentsMin", emn),
+            vx("entitiesExtentsMax", emx)
+        );
+        std::fs::write(stream.join("dw_terrain_lod.ymap.xml"), lymap).map_err(|e| e.to_string())?;
         Ok(vec![
             format!(
                 "Terrain exporté : {} tuile(s) ({} × {} m), {road_n} route(s), {} zone(s) d'eau, {fx_n} effet(s) ; modèles et collisions, textures dans {txd}.ytd, visible jusqu'à {lod} m.",
@@ -1800,5 +1972,40 @@ impl DwApp {
             ),
             "dw_terrain_types".to_string(),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(n: &str, t: &str) -> (String, String) {
+        (n.to_string(), t.to_string())
+    }
+
+    #[test]
+    fn lod_pieces_each_have_children() {
+        // même dictionnaire → même parent ; un morceau de loin sans enfant n'est pas placé
+        let hd = vec![p("a", "dw"), p("a_g1", "g1")];
+        let lods = vec![p("l", "dw"), p("l_g1", "g1"), p("l_g2", "g2")];
+        let (parent, kept) = pair_lod_pieces(&hd, &lods);
+        assert_eq!(parent, vec![Some(0), Some(1)]);
+        assert_eq!(kept, vec![0, 1]);
+        // morceau détaillé sans équivalent de loin → le premier
+        let (parent, kept) = pair_lod_pieces(&[p("a_g3", "g3")], &lods);
+        assert_eq!(parent, vec![Some(0)]);
+        assert_eq!(kept, vec![0]);
+        // pas de version de loin → pas de parent
+        let (parent, kept) = pair_lod_pieces(&hd, &[]);
+        assert_eq!(parent, vec![None, None]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn hd_distance_covers_tile_centre() {
+        let d = hd_dist_from_corner(200.0, 200.0);
+        // point à TERRAIN_HD_DIST du centre, du côté opposé au coin
+        let far = (100.0f32 * 2f32.sqrt()) + TERRAIN_HD_DIST;
+        assert!(d >= far - 0.01);
     }
 }

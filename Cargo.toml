@@ -1,6 +1,6 @@
 [package]
 name = "dragowalker"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "DragoWalker - Ã©diteur de cartes GTA V (ymap / ytyp / MLO) avec assistant IA"
 

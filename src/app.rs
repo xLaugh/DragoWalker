@@ -122,6 +122,33 @@ pub struct DwApp {
     pub sollumz_sent: u64,
     /// modèles des ressources MLO importées
     pub mlo_state: crate::mlo::MloState,
+    /// édition d'un bâtiment posé (morceaux retirés à la main)
+    pub bedit: Option<crate::bedit::BEdit>,
+    pub cut_state: crate::bedit::CutState,
+    /// dernière position / orientation commune de chaque intérieur relié à son bâtiment (pour savoir lequel a bougé)
+    pub mlo_link_seen: std::collections::HashMap<u64, (V3, crate::math::Quat)>,
+    /// fenêtre « Contrôle avant l'export »
+    pub check_open: bool,
+    /// groupe qui suit la souris pour être posé
+    pub group_place: Option<crate::groups::GroupPlace>,
+    /// fenêtre « Faire un groupe »
+    pub group_new: Option<crate::groups::NewGroup>,
+    /// fenêtre « Groupes du projet »
+    pub groups_open: bool,
+    /// bibliothèque « Mes groupes » (tous les projets)
+    pub group_lib: crate::groups::GroupLib,
+    /// bloc ouvert par double-clic : ses pièces se choisissent une par une
+    pub group_open: Option<u64>,
+    /// signature des pièces et portails dont les coques sont dans la carte graphique
+    pub shell_sig: u64,
+    /// serveur FiveM de test
+    pub server: crate::server::ServerState,
+    /// parties laissées de côté par l'export en cours (test en jeu) : « traffic », « peds », « water », « veg »,
+    /// « mlo:<nom> » (voir server.rs, TEST_PARTS)
+    pub export_skip: Vec<String>,
+    /// export pour le test en jeu : conversion CodeWalker laissée au fil du serveur (dll, stream, dossier)
+    pub export_defer_convert: bool,
+    pub pending_convert: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
     /// poignées : mode et poignée sous la souris
     pub gizmo_mode: crate::gizmo::GizmoMode,
     pub gizmo_hover: Option<u8>,
@@ -228,7 +255,7 @@ impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         crate::update::start();
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![] };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -295,6 +322,20 @@ impl DwApp {
             sollumz: crate::sollumz::SollumzState::new(),
             sollumz_sent: 0,
             mlo_state: Default::default(),
+            bedit: None,
+            cut_state: Default::default(),
+            mlo_link_seen: Default::default(),
+            check_open: std::env::var("DW_TEST_CHECK").is_ok(),
+            group_place: None,
+            group_new: None,
+            groups_open: false,
+            group_lib: Default::default(),
+            group_open: None,
+            shell_sig: 0,
+            server: crate::server::ServerState::new(),
+            export_skip: Vec::new(),
+            export_defer_convert: false,
+            pending_convert: None,
             gizmo_mode: crate::gizmo::GizmoMode::Move,
             gizmo_hover: None,
             gizmo_object_space: false,
@@ -556,12 +597,17 @@ impl DwApp {
         }
         self.push_undo();
         let mut new_ids = Vec::new();
+        // la copie d'un groupe posé forme son propre bloc
+        let mut inst_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for id in self.selected.clone() {
             let Some(r) = self.proj.find_id(id) else { continue };
             let mut e = self.proj.ent(r).unwrap().clone();
             e.id = model::new_id();
             e.game_index = -1;
             e.pos = e.pos + off;
+            if e.group_inst != 0 {
+                e.group_inst = *inst_map.entry(e.group_inst).or_insert_with(model::new_id);
+            }
             new_ids.push(e.id);
             match r {
                 ItemRef::Ent(y, _) => {
@@ -1037,6 +1083,12 @@ impl DwApp {
                 self.target_ymap = self.proj.ymaps.iter().position(|y| !y.sample).unwrap_or(0);
                 self.project_path = Some(path.to_path_buf());
                 self.status = format!("Projet ouvert : {}", path.display());
+                // projet d'avant la correction des rotations d'intérieur (CMloInstanceDef non inversé)
+                let fixed = self.proj.fix_mlo_rotations();
+                if fixed > 0 {
+                    self.status += &format!(" · Orientation de {fixed} placement(s) d'intérieur corrigée (le tour donné avec les poignées est gardé) : enregistre le projet.");
+                    self.sync_game_project();
+                }
             }
             Err(e) => self.status = format!("Projet illisible : {e}"),
         }
@@ -1077,6 +1129,10 @@ impl eframe::App for DwApp {
         self.poll_game_load(ctx);
         self.sollumz_tick(ctx);
         self.mlo_tick();
+        self.cuts_tick();
+        self.mlo_link_tick();
+        self.shells_tick();
+        self.server_tick(ctx);
         // capture automatique : attendre la fin du chargement du jeu (au plus ~90 s)
         if self.shot_path.is_some() && self.game.loading.is_some() && self.frame > 2 && self.frame < 6000 {
             self.frame = 2;
@@ -1259,6 +1315,12 @@ impl eframe::App for DwApp {
                     }
                     println!("végétation {} : {n} objet(s) posé(s), {} au total", crate::vegetation::SETS[self.terrain.veg_set].name, self.veg_count());
                 }
+                // DW_TEST_BIOME=n : peuple tout le terrain avec le biome n
+                if let Some(bi) = std::env::var("DW_TEST_BIOME").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    let msg = self.apply_biome(bi);
+                    println!("biome : {msg}");
+                    println!("étiquettes d'herbe : {:?}", crate::grass::proc_ids(self.game.world.as_deref()));
+                }
                 // DW_TEST_WATER=1 : un bassin creusé et quelques effets ; DW_TEST_BUILDING=nom : copie d'un bâtiment
                 if std::env::var("DW_TEST_WATER").is_ok() {
                     if let Some(t) = self.proj.terrain.as_mut() {
@@ -1326,6 +1388,15 @@ impl eframe::App for DwApp {
         // mode test : DW_TEST_MLO="dossier" importe une ressource MLO ; DW_TEST_MLO_MOVE="dx,dy,dz,degrés" la
         // déplace et la tourne (tous ses objets autour de l'objet de référence) ; DW_TEST_MLO_EXPORT="dossier" exporte
         if self.frame == 40 {
+            // DW_TEST_PIECES_OPEN="nom" : ouvre la fenêtre « Pièces du MLO » de ce MLO (capture)
+            if let Ok(n) = std::env::var("DW_TEST_PIECES_OPEN") {
+                if let Some(r) = self.proj.mlo_res.iter().find(|r| r.name == n).cloned() {
+                    let p = self.mlo_move(&r).p1;
+                    self.goto(p, 45.0);
+                }
+                self.mlo_state.pieces_open = Some(n);
+                self.mlo_state.solo = true;
+            }
             if let Ok(dir) = std::env::var("DW_TEST_MLO") {
                 let msg = self.import_mlo(std::path::Path::new(&dir));
                 println!("import MLO : {msg}");
@@ -1352,6 +1423,120 @@ impl eframe::App for DwApp {
                 }
             }
         }
+        // mode test : DW_TEST_GROUP="rayon" : prend les objets détaillés du jeu autour du centre de la vue, en fait un
+        // groupe et le pose 80 m plus loin tourné d'un quart de tour (DW_TEST_GROUP_MOVE=1 : en « Déplacer ») ;
+        // le groupe reste ensuite sous la souris pour la capture
+        if self.game.world.as_ref().map(|w| w.visible_ents > 0).unwrap_or(false) && std::env::var("DW_TEST_GROUP_DONE").is_err() {
+            if let Some(r) = std::env::var("DW_TEST_GROUP").ok().and_then(|v| v.parse::<f32>().ok()) {
+                std::env::set_var("DW_TEST_GROUP_DONE", "1");
+                let at = self.cam.target;
+                let all: Vec<(u32, u8)> = self.game.world.as_ref().map(|w| w.ents_in_radius(at, r).into_iter().map(|i| (i, w.ents[i as usize].lod_level)).collect()).unwrap_or_default();
+                println!("groupe : {} objet(s) dans le rayon, niveaux {:?}", all.len(), all.iter().map(|a| a.1).collect::<std::collections::BTreeSet<_>>());
+                let ents: Vec<u32> = all.iter().filter(|a| a.1 == 0).map(|a| a.0).collect();
+                self.push_undo();
+                let ids = self.game_ents_to_project(&ents);
+                println!("groupe : autour de {:.0} {:.0}, {} objet(s) du jeu, {} dans le projet", at.x, at.y, ents.len(), ids.len());
+                self.set_selection(ids);
+                let mv = std::env::var("DW_TEST_GROUP_MOVE").is_ok();
+                let msg = self.group_from_selection("Test", mv);
+                println!("groupe : {msg}");
+                if let Some(g) = self.proj.groups.last() {
+                    println!("   {} objet(s), emprise {:.1} × {:.1} × {:.1} m", g.items.len(), g.size[0], g.size[1], g.size[2]);
+                }
+                let before = self.proj.ymaps.iter().map(|y| y.entities.len()).sum::<usize>();
+                if let Some(g) = self.group_place.as_mut() {
+                    g.yaw_deg = crate::groups::next_yaw(g.yaw_deg, 1.0, true);
+                }
+                let dest = at + crate::math::v3(80.0, 0.0, 0.0);
+                let placed = self.group_place_at(dest);
+                let after = self.proj.ymaps.iter().map(|y| y.entities.len()).sum::<usize>();
+                println!("pose : {} objet(s) posé(s), objets du projet {before} → {after} ; {}", placed.len(), self.status);
+                // bloc : un objet posé donne tout le bloc ; une fois ouvert (double-clic), lui seul
+                if let Some(&first) = placed.first() {
+                    let block = self.group_block(first).len();
+                    self.group_open_piece(first);
+                    println!("bloc : {block} objet(s) d'un clic, {} après double-clic", self.group_block(first).len());
+                    self.group_open = None;
+                }
+                // bibliothèque : relue depuis le disque, avec la vignette
+                self.group_lib.loaded = false;
+                self.group_lib_load();
+                for it in &self.group_lib.items {
+                    println!("bibliothèque : « {} » {} objet(s), vignette {} triangle(s), {}", it.group.name, it.group.items.len(), it.thumb.as_ref().map(|t| t.tris.len()).unwrap_or(0), it.path.display());
+                }
+                // DW_TEST_GROUPS_OPEN=1 : fenêtre « Mes groupes » ouverte sur le groupe, pour la capture
+                if std::env::var("DW_TEST_GROUPS_OPEN").is_ok() {
+                    self.groups_open = true;
+                    self.group_lib.sel = Some(0);
+                    self.group_place = None;
+                }
+                self.goto(dest, 60.0);
+            }
+        }
+        // mode test : DW_TEST_PLACE_CONVERT="modèle" : pose une copie du bâtiment au centre de la vue et la transforme
+        // en intérieur ; DW_TEST_CONVERT_EXPORT="dossier" exporte ensuite
+        if self.game.world.is_some() && std::env::var("DW_TEST_PLACE_CONVERT_DONE").is_err() {
+            if let Ok(name) = std::env::var("DW_TEST_PLACE_CONVERT") {
+                std::env::set_var("DW_TEST_PLACE_CONVERT_DONE", "1");
+                let at = self.cam.target;
+                self.building_place(crate::gta::crypto::joaat(&name), at);
+                // DW_TEST_OCCLUDER=1 : boîte d'occlusion dans le bâtiment posé
+                if std::env::var("DW_TEST_OCCLUDER").is_ok() {
+                    let m = self.add_occluders_for_selection();
+                    println!("occlusion : {m}");
+                }
+                let msg = self.convert_to_interior();
+                println!("conversion : {msg}");
+                self.goto(at, 28.0);
+                if let Some(a) = self.game.analysis.as_ref() {
+                    println!("analyse : pied {:.2}, étages {:?}, toit {:.2}, murs à {:.1}°", a.pos.z, a.levels.iter().map(|l| (l.0 - a.pos.z, l.1)).collect::<Vec<_>>(), a.roof_z - a.pos.z, a.wall_yaw.to_degrees());
+                }
+                if let Some((t, m)) = self.cur_mlo {
+                    for r in self.proj.ytyps[t].mlos[m].rooms.iter().skip(1) {
+                        println!("   pièce {} : {:?} → {:?}", r.name, r.bb_min, r.bb_max);
+                    }
+                }
+                self.cuts_tick();
+                // DW_TEST_ROTATE_AFTER="degrés" : tourne ensuite le bâtiment seul ; l'intérieur relié doit suivre
+                if let Ok(deg) = std::env::var("DW_TEST_ROTATE_AFTER") {
+                    let d: f32 = deg.parse().unwrap_or(30.0);
+                    if let Some(&(iid, bid)) = self.proj.mlo_links.last() {
+                        self.mlo_link_tick();
+                        if let Some(r) = self.proj.find_id(bid) {
+                            if let Some(e) = self.proj.ent_mut(r) {
+                                e.rot = crate::math::Quat::from_z(d.to_radians()).mul(e.rot).normalized();
+                            }
+                        }
+                        self.mlo_link_tick();
+                        let get = |id: u64| self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| (e.pos, e.rot.heading_deg()));
+                        println!("après rotation de {d}° : bâtiment {:?}, intérieur {:?}", get(bid), get(iid));
+                    }
+                }
+                if let Ok(dir) = std::env::var("DW_TEST_CONVERT_EXPORT") {
+                    let rep = self.export_project(std::path::Path::new(&dir), true);
+                    println!("export : {rep}");
+                }
+            }
+        }
+        // mode test : DW_TEST_BEDIT="modèle" : pose une copie du bâtiment au centre de la vue, l'édite et retire les
+        // triangles dont le centre est du côté x > 0 du modèle ; DW_TEST_BEDIT_EXPORT="dossier" exporte ensuite
+        if self.game.world.is_some() && std::env::var("DW_TEST_BEDIT_DONE").is_err() {
+            if let Ok(name) = std::env::var("DW_TEST_BEDIT") {
+                std::env::set_var("DW_TEST_BEDIT_DONE", "1");
+                let h = crate::gta::crypto::joaat(&name);
+                let at = self.cam.target;
+                self.building_place(h, at);
+                self.bedit_start();
+                println!("édition : {}", self.status);
+                let half = self.bedit_test_half();
+                println!("triangles retirés (x > 0) : {half}");
+                self.cuts_tick();
+                if let Ok(dir) = std::env::var("DW_TEST_BEDIT_EXPORT") {
+                    let rep = self.export_project(std::path::Path::new(&dir), true);
+                    println!("export : {rep}");
+                }
+            }
+        }
         // mode test : DW_TEST_READY_EXPORT="dossier" : exporte la ressource FiveM une fois le jeu chargé (projet ouvert
         // en argument), après le contrôle des MLO
         if self.game.world.is_some() && !self.shot_sent {
@@ -1363,8 +1548,76 @@ impl eframe::App for DwApp {
                         println!("MLO {} : cartes {:?}, fichiers {}, collisions {}, scripts {:?}, déplacement {:?}", r.name, r.ymaps, r.assets.len(), r.ybns.len(), r.scripts, { let m = self.mlo_move(r); (m.p1 - m.p0, m.q.heading_deg()) });
                     }
                     println!("cartes du projet : {:?}, destination {}", self.proj.ymaps.iter().map(|y| (y.name.clone(), y.entities.len())).collect::<Vec<_>>(), self.target_ymap);
+                    // DW_TEST_SKIP="peds,veg,mlo:nom" : parties laissées de côté (comme « Contenu du test »)
+                    self.export_skip = std::env::var("DW_TEST_SKIP").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+                    // DW_TEST_DEFER=1 : conversion laissée de côté (comme « Tester en jeu »), puis faite et chronométrée
+                    self.export_defer_convert = std::env::var("DW_TEST_DEFER").is_ok();
+                    // DW_TEST_PICK="fichier=0,fichier=1" : choix de la fenêtre « Pièces du MLO » ; la liste des pièces
+                    // de chaque MLO est affichée
+                    let picks: Vec<(String, bool)> = std::env::var("DW_TEST_PICK").unwrap_or_default().split(',').filter_map(|s| s.split_once('=')).map(|(f, v)| (f.trim().to_lowercase(), v.trim() == "1")).collect();
+                    for ri in 0..self.proj.mlo_res.len() {
+                        let r = self.proj.mlo_res[ri].clone();
+                        let moved = !self.mlo_move(&r).is_identity();
+                        for p in self.mlo_pieces(&r) {
+                            println!("pièce {} : {} [{:?}] prise par défaut {}", r.name, p.file, p.kind, crate::mlo::piece_default(p.kind, moved));
+                        }
+                        for (f, v) in &picks {
+                            self.proj.mlo_res[ri].set_pick(f, *v);
+                        }
+                    }
+                    let t0 = std::time::Instant::now();
                     let rep = self.export_project(std::path::Path::new(&dir), true);
+                    let ta = t0.elapsed().as_secs_f32();
+                    self.export_defer_convert = false;
+                    self.export_skip.clear();
                     println!("export : {rep}");
+                    println!("durée de l'export (fil de l'interface) : {ta:.1} s");
+                    if let Some((dll, stream, out)) = self.pending_convert.take() {
+                        let t1 = std::time::Instant::now();
+                        let (ok, r) = crate::export::convert_and_tidy(&dll, &stream, &out);
+                        println!("conversion (arrière-plan) : {:.1} s, réussie {ok}, {}", t1.elapsed().as_secs_f32(), r.join(" "));
+                    }
+                }
+            }
+        }
+        // mode test : DW_TEST_SERVER="dossier" : installe le serveur FiveM de test dans ce dossier, le démarre avec la
+        // ressource d'outils (sans map), affiche sa console puis l'arrête
+        if self.frame == 45 {
+            if let Ok(dir) = std::env::var("DW_TEST_SERVER") {
+                self.server.dir = dir;
+                if !self.server.installed() {
+                    self.server.install();
+                    let t0 = std::time::Instant::now();
+                    while *self.server.installing.lock().unwrap() && t0.elapsed().as_secs() < 600 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+                println!("installation : {} (installé : {})", self.server.install_msg.lock().unwrap(), self.server.installed());
+                // DW_TEST_ADDONS=1 : télécharge et coche les ressources de la communauté
+                if self.server.installed() && std::env::var("DW_TEST_ADDONS").is_ok() {
+                    for a in crate::server::ADDONS.iter() {
+                        self.server.install_addon(a.key);
+                        let t0 = std::time::Instant::now();
+                        while *self.server.addon_busy.lock().unwrap() && t0.elapsed().as_secs() < 600 {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                        println!("ressource {} : {} (installée : {})", a.key, self.server.addon_msg.lock().unwrap(), self.server.addon_installed(a.key));
+                        self.server.addons_on.push(a.key.to_string());
+                    }
+                }
+                if self.server.installed() {
+                    self.server.license = std::env::var("DW_TEST_LICENSE").unwrap_or_default();
+                    self.server.resource.clear();
+                    println!("config : {:?}", self.server.write_config(v3(195.0, -934.0, 30.0)));
+                    println!("démarrage : {:?}", self.server.start());
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    println!("en marche : {}", self.server.running());
+                    self.server.send("dw_tp 1 2 3");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    for l in self.server.console.lock().unwrap().iter() {
+                        println!("   | {l}");
+                    }
+                    self.server.stop();
                 }
             }
         }
@@ -1677,7 +1930,14 @@ impl eframe::App for DwApp {
             self.terrain_window(ctx);
             self.intlib_window(ctx);
             self.life_window(ctx);
+            self.server_window(ctx);
+            self.mlo_pieces_window(ctx);
+            self.bedit_window(ctx);
+            self.check_window(ctx);
         }
+        // fenêtres simples (egui::Window) : une seule fois par image, hors des deux passes du rangement des panneaux
+        // (dessinées dans les deux, chaque lettre tapée était lue deux fois)
+        self.groups_window(ctx);
         self.dock_overlay(ctx);
         self.isolate_banner(ctx);
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {

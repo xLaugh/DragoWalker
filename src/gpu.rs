@@ -106,6 +106,13 @@ pub struct Gpu {
     pub probe: Option<([f32; 2], f32)>,
     shadow_fbo: Option<glow::Framebuffer>,
     shadow_tex: Option<glow::Texture>,
+    /// modèles fabriqués par DragoWalker (terrain, MLO importés, Blender) : copie gardée en mémoire, renvoyée à la
+    /// carte graphique s'ils ont été libérés (on ne peut pas les relire dans les fichiers du jeu ; sans elle, ils
+    /// devenaient des boîtes beiges) — comme CodeWalker, qui garde la source de chaque élément libéré et le recharge
+    /// depuis elle (RenderableCacheLookup::RenderThreadSync 0x06000943 → RenderableCacheItem.Load)
+    custom_src: HashMap<u32, Loaded>,
+    /// leurs textures : jamais libérées (un modèle resté chargé ne saurait pas les redemander)
+    pinned_tex: HashSet<u64>,
 }
 
 /// Côté de la carte des ombres (pixels) — choix de DragoWalker.
@@ -142,6 +149,8 @@ impl Gpu {
             probe: None,
             shadow_fbo: None,
             shadow_tex: None,
+            custom_src: HashMap::new(),
+            pinned_tex: HashSet::new(),
         }
     }
 
@@ -151,6 +160,13 @@ impl Gpu {
             Some(Slot::Ready(_)) => true,
             Some(_) => false,
             None => {
+                // modèle fabriqué par DragoWalker libéré : renvoyé depuis sa copie en mémoire
+                if let Some(src) = self.custom_src.get(&arch) {
+                    let l = Loaded { arch, model: src.model.clone(), part_keys: src.part_keys.clone(), textures: src.textures.clone() };
+                    self.slots.insert(arch, Slot::Loading);
+                    self.pending.push(l);
+                    return false;
+                }
                 if self.in_flight < MAX_IN_FLIGHT && self.tx.send(arch).is_ok() {
                     self.slots.insert(arch, Slot::Loading);
                     self.in_flight += 1;
@@ -162,12 +178,19 @@ impl Gpu {
 
     /// Modèle personnel (Blender / Sollumz) : remplace celui du jeu du même nom.
     pub fn add_custom(&mut self, l: Loaded) {
+        self.pinned_tex.extend(l.textures.iter().map(|(k, _)| *k));
+        self.custom_src.insert(l.arch, Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), textures: l.textures.clone() });
         self.slots.insert(l.arch, Slot::Loading);
         self.pending.push(l);
     }
 
     pub fn busy(&self) -> bool {
         self.in_flight > 0 || !self.pending.is_empty()
+    }
+
+    /// Le modèle est prêt ou en route (pas absent ni introuvable).
+    pub fn has_or_loading(&self, arch: u32) -> bool {
+        matches!(self.slots.get(&arch), Some(Slot::Ready(_)) | Some(Slot::Loading)) || self.pending.iter().any(|l| l.arch == arch)
     }
 
     pub fn has_model(&self, arch: u32) -> bool {
@@ -438,7 +461,7 @@ void main() {{
             }
         }
         if self.tex_bytes > TEX_BUDGET {
-            let mut v: Vec<(u64, u64)> = self.textures.iter().map(|(k, t)| (t.last, *k)).collect();
+            let mut v: Vec<(u64, u64)> = self.textures.iter().filter(|(k, _)| !self.pinned_tex.contains(k)).map(|(k, t)| (t.last, *k)).collect();
             v.sort();
             for (last, k) in v {
                 if self.tex_bytes <= TEX_BUDGET * 8 / 10 || last + 30 > self.frame {

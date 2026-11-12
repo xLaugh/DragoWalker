@@ -9,8 +9,8 @@ use std::collections::HashMap;
 /// Une vignette prête à dessiner : triangles déjà projetés dans un carré [-1, 1], du plus loin au plus proche,
 /// avec la couleur de la texture du jeu à chaque coin.
 pub struct Thumb {
-    tris: Vec<([Pos2; 3], [Color32; 3])>,
-    last: u64,
+    pub tris: Vec<([Pos2; 3], [Color32; 3])>,
+    pub last: u64,
     pub dims: V3,
 }
 
@@ -25,6 +25,148 @@ pub struct TexModel {
     pub big: Vec<Option<crate::texdecode::Rgba>>,
     pub min: [f32; 3],
     pub max: [f32; 3],
+    /// triangle vu de l'extérieur (outside_mask) : l'intérieur d'un bâtiment n'est pas dessiné dans les vignettes
+    /// et l'aperçu
+    pub outside: Vec<bool>,
+}
+
+/// Résolution du rendu en profondeur qui repère les triangles vus de l'extérieur — **estimé**.
+const OUTSIDE_RES: usize = 160;
+
+/// Triangles vus de l'extérieur : le modèle est rendu en profondeur (sans couleur) depuis 25 directions (12 autour
+/// à 9°, 12 autour à 34° de hauteur, 1 de dessus) ; un triangle est gardé s'il est devant (à une marge près) sur au
+/// moins un pixel d'une de ces vues, ou, trop petit pour couvrir un pixel, au pixel de son centre. Les murs, sols
+/// et meubles de l'intérieur, cachés derrière la façade, sont écartés. Si presque rien ne reste (moins de 5 %),
+/// tout est gardé — **estimé** (DragoWalker : les vignettes sont dessinées sans tampon de profondeur).
+pub fn outside_mask(pos: &[[f32; 3]], tris: &[([u32; 3], u16)], min: [f32; 3], max: [f32; 3]) -> Vec<bool> {
+    let n = tris.len();
+    let mut vis = vec![false; n];
+    if n == 0 {
+        return vis;
+    }
+    let c = v3((min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5, (min[2] + max[2]) * 0.5);
+    let r = (v3(max[0] - min[0], max[1] - min[1], max[2] - min[2]).len() * 0.5).max(0.01);
+    let res = OUTSIDE_RES;
+    let eps = r * 0.004 + 0.005;
+    let mut dirs = Vec::new();
+    for (el, off) in [(0.15f32, 0.0f32), (0.6, 0.26)] {
+        for i in 0..12 {
+            let az = i as f32 * std::f32::consts::TAU / 12.0 + off;
+            dirs.push(v3(el.cos() * az.cos(), el.cos() * az.sin(), el.sin()));
+        }
+    }
+    dirs.push(v3(0.0, 0.0, 1.0));
+    let mut depth = vec![f32::MAX; res * res];
+    let mut p2: Vec<[f32; 3]> = vec![[0.0; 3]; pos.len()];
+    for d in dirs {
+        let up = if d.z.abs() > 0.9 { v3(0.0, 1.0, 0.0) } else { v3(0.0, 0.0, 1.0) };
+        let u = up.cross(d).norm();
+        let w = d.cross(u);
+        let k = res as f32 / (2.0 * r);
+        for (o, p) in p2.iter_mut().zip(pos.iter()) {
+            let q = v3(p[0], p[1], p[2]) - c;
+            // x, y en pixels ; profondeur : plus petite = plus près de la caméra (placée du côté de d)
+            *o = [(q.dot(u) + r) * k, (q.dot(w) + r) * k, -q.dot(d)];
+        }
+        depth.iter_mut().for_each(|z| *z = f32::MAX);
+        // deux passes : la profondeur la plus proche, puis les triangles qui l'atteignent
+        for pass in 0..2 {
+            for (ti, (t, _)) in tris.iter().enumerate() {
+                if pass == 1 && vis[ti] {
+                    continue;
+                }
+                let (Some(a), Some(b), Some(cc)) = (p2.get(t[0] as usize), p2.get(t[1] as usize), p2.get(t[2] as usize)) else { continue };
+                let area = (b[0] - a[0]) * (cc[1] - a[1]) - (cc[0] - a[0]) * (b[1] - a[1]);
+                if area.abs() < 1e-9 {
+                    continue;
+                }
+                let mut test = |x: usize, y: usize, z: f32| -> bool {
+                    let i = y * res + x;
+                    if pass == 0 {
+                        if z < depth[i] {
+                            depth[i] = z;
+                        }
+                        false
+                    } else {
+                        z <= depth[i] + eps
+                    }
+                };
+                let x0 = a[0].min(b[0]).min(cc[0]).floor().max(0.0) as usize;
+                let x1 = (a[0].max(b[0]).max(cc[0]).ceil().max(0.0) as usize).min(res - 1);
+                let y0 = a[1].min(b[1]).min(cc[1]).floor().max(0.0) as usize;
+                let y1 = (a[1].max(b[1]).max(cc[1]).ceil().max(0.0) as usize).min(res - 1);
+                let mut covered = false;
+                let mut hit = false;
+                if x0 <= x1 && y0 <= y1 {
+                    'px: for y in y0..=y1 {
+                        for x in x0..=x1 {
+                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                            let w0 = ((b[0] - px) * (cc[1] - py) - (cc[0] - px) * (b[1] - py)) / area;
+                            let w1 = ((cc[0] - px) * (a[1] - py) - (a[0] - px) * (cc[1] - py)) / area;
+                            let w2 = 1.0 - w0 - w1;
+                            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                                continue;
+                            }
+                            covered = true;
+                            if test(x, y, w0 * a[2] + w1 * b[2] + w2 * cc[2]) {
+                                hit = true;
+                                break 'px;
+                            }
+                        }
+                    }
+                }
+                if !covered {
+                    // trop petit pour couvrir un centre de pixel : son centre
+                    let (mx, my) = ((a[0] + b[0] + cc[0]) / 3.0, (a[1] + b[1] + cc[1]) / 3.0);
+                    if mx >= 0.0 && my >= 0.0 && (mx as usize) < res && (my as usize) < res {
+                        hit = test(mx as usize, my as usize, (a[2] + b[2] + cc[2]) / 3.0);
+                    }
+                }
+                if pass == 1 && hit {
+                    vis[ti] = true;
+                }
+            }
+        }
+    }
+    if vis.iter().filter(|v| **v).count() * 20 < n {
+        return vec![true; n];
+    }
+    vis
+}
+
+/// Plusieurs modèles du jeu assemblés en un seul (bâtiment complet) : chaque morceau placé (position,
+/// orientation, échelles xy et z dans le repère commun), ses textures gardées ; la partie vue de l'extérieur est
+/// recalculée sur l'ensemble.
+pub fn merged_tex_model(w: &crate::gta::world::GameWorld, parts: &[(u32, V3, crate::math::Quat, f32, f32)]) -> Option<TexModel> {
+    let mut out = TexModel { pos: Vec::new(), uv: Vec::new(), tris: Vec::new(), small: Vec::new(), big: Vec::new(), min: [0.0; 3], max: [0.0; 3], outside: Vec::new() };
+    for (h, p, q, sxy, sz) in parts {
+        let Some(m) = load_tex_model(w, *h, 32, 256) else { continue };
+        let base = out.pos.len() as u32;
+        let pb = out.small.len() as u16;
+        out.pos.extend(m.pos.iter().map(|v| {
+            let r = *p + q.rotate(v3(v[0] * sxy, v[1] * sxy, v[2] * sz));
+            [r.x, r.y, r.z]
+        }));
+        out.uv.extend(m.uv.iter().copied());
+        out.tris.extend(m.tris.iter().map(|(t, pi)| ([t[0] + base, t[1] + base, t[2] + base], pi + pb)));
+        out.small.extend(m.small);
+        out.big.extend(m.big);
+    }
+    if out.tris.is_empty() {
+        return None;
+    }
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for v in &out.pos {
+        for k in 0..3 {
+            mn[k] = mn[k].min(v[k]);
+            mx[k] = mx[k].max(v[k]);
+        }
+    }
+    out.min = mn;
+    out.max = mx;
+    out.outside = outside_mask(&out.pos, &out.tris, mn, mx);
+    Some(out)
 }
 
 /// Aperçu texturé : le modèle et ses textures envoyées à egui.
@@ -67,11 +209,13 @@ pub fn load_tex_model(w: &crate::gta::world::GameWorld, h: u32, small_px: u32, b
             mx[k] = mx[k].max(v.pos[k]);
         }
     }
-    Some(TexModel { pos: m.verts.iter().map(|v| v.pos).collect(), uv: m.verts.iter().map(|v| v.uv).collect(), tris, small, big, min: mn, max: mx })
+    let pos: Vec<[f32; 3]> = m.verts.iter().map(|v| v.pos).collect();
+    let outside = outside_mask(&pos, &tris, mn, mx);
+    Some(TexModel { pos, uv: m.verts.iter().map(|v| v.uv).collect(), tris, small, big, min: mn, max: mx, outside })
 }
 
 /// Vignette texturée : vue de trois quarts, couleur de la texture à chaque coin des triangles.
-fn make_thumb_tex(m: &TexModel, frame: u64) -> Thumb {
+pub fn make_thumb_tex(m: &TexModel, frame: u64) -> Thumb {
     let c = [(m.min[0] + m.max[0]) * 0.5, (m.min[1] + m.max[1]) * 0.5, (m.min[2] + m.max[2]) * 0.5];
     let ext = ((m.max[0] - m.min[0]).powi(2) + (m.max[1] - m.min[1]).powi(2) + (m.max[2] - m.min[2]).powi(2)).sqrt().max(0.01);
     let (sy, cy) = 0.6f32.sin_cos();
@@ -88,7 +232,11 @@ fn make_thumb_tex(m: &TexModel, frame: u64) -> Thumb {
         .collect();
     let light = v3(-0.4, 0.6, -0.7).norm();
     let mut tris: Vec<(f32, f32, [Pos2; 3], [Color32; 3])> = Vec::with_capacity(m.tris.len());
-    for (t, part) in &m.tris {
+    for (ti, (t, part)) in m.tris.iter().enumerate() {
+        // l'intérieur (caché derrière la façade) n'est pas dessiné
+        if !m.outside.get(ti).copied().unwrap_or(true) {
+            continue;
+        }
         let (a, b, cc) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
         let n = v3(b[0] - a[0], b[1] - a[1], b[2] - a[2]).cross(v3(cc[0] - a[0], cc[1] - a[1], cc[2] - a[2])).norm();
         let k = (0.62 + 0.55 * n.dot(light).abs()).min(1.15);
@@ -221,7 +369,7 @@ fn make_thumb(m: &crate::gta::drawable::Mesh, frame: u64) -> Thumb {
     Thumb { tris: tris.into_iter().map(|t| (t.2, t.3)).collect(), last: frame, dims: v3(m.max[0] - m.min[0], m.max[1] - m.min[1], m.max[2] - m.min[2]) }
 }
 
-fn draw_thumb(painter: &egui::Painter, rect: egui::Rect, t: &Thumb) {
+pub fn draw_thumb(painter: &egui::Painter, rect: egui::Rect, t: &Thumb) {
     let c = rect.center();
     let s = rect.width().min(rect.height()) * 0.5;
     let mut mesh = egui::Mesh::default();
@@ -461,8 +609,13 @@ impl DwApp {
 impl DwApp {
     /// Grand aperçu qui tourne, avec les vraies textures du jeu posées sur le modèle.
     pub fn textured_preview(&mut self, ui: &mut egui::Ui, h: u32, name: &str) {
+        self.textured_preview_with(ui, h, name, &|w| load_tex_model(w, h, 32, 256));
+    }
+
+    /// Aperçu tournant d'un modèle donné par `load` (gardé tant que `h` ne change pas).
+    pub fn textured_preview_with(&mut self, ui: &mut egui::Ui, h: u32, name: &str, load: &dyn Fn(&crate::gta::world::GameWorld) -> Option<TexModel>) {
         if self.library.preview.as_ref().map(|p| p.0) != Some(h) {
-            let tm = self.game.world.as_ref().and_then(|w| load_tex_model(w, h, 32, 256));
+            let tm = self.game.world.as_ref().and_then(|w| load(w));
             let ctx = ui.ctx().clone();
             let tp = tm.map(|model| {
                 let tex = model
@@ -513,10 +666,12 @@ impl DwApp {
             })
             .collect();
         let light = v3(-0.4, 0.6, -0.7).norm();
+        let inside = self.game.preview_inside;
         let mut order: Vec<(f32, usize, u8)> = m
             .tris
             .iter()
             .enumerate()
+            .filter(|(i, _)| inside || m.outside.get(*i).copied().unwrap_or(true))
             .map(|(i, (t, _))| {
                 let (a, b, cc) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
                 let n = v3(b[0] - a[0], b[1] - a[1], b[2] - a[2]).cross(v3(cc[0] - a[0], cc[1] - a[1], cc[2] - a[2])).norm();
@@ -556,5 +711,50 @@ impl DwApp {
         let sz = [m.max[0] - m.min[0], m.max[1] - m.min[1], m.max[2] - m.min[2]];
         painter.text(rect.left_bottom() + egui::vec2(8.0, -6.0), egui::Align2::LEFT_BOTTOM, format!("{name}  ·  {:.2} × {:.2} × {:.2} m  ·  {} triangles", sz[0], sz[1], sz[2], m.tris.len()), egui::FontId::proportional(11.5), Color32::from_gray(220));
         painter.rect_stroke(rect, 6.0, Stroke::new(1.0, Color32::from_gray(70)), egui::StrokeKind::Inside);
+        let hidden = m.outside.iter().filter(|v| !**v).count();
+        if hidden > 0 {
+            ui.checkbox(&mut self.game.preview_inside, format!("Voir aussi l'intérieur ({hidden} triangles cachés derrière la façade)"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cube(pos: &mut Vec<[f32; 3]>, tris: &mut Vec<([u32; 3], u16)>, c: f32, h: f32) {
+        let b = pos.len() as u32;
+        for i in 0..8 {
+            pos.push([if i & 1 == 0 { c - h } else { c + h }, if i & 2 == 0 { c - h } else { c + h }, if i & 4 == 0 { c - h } else { c + h }]);
+        }
+        for f in [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]] {
+            tris.push(([b + f[0], b + f[1], b + f[2]], 0));
+            tris.push(([b + f[0], b + f[2], b + f[3]], 0));
+        }
+    }
+
+    #[test]
+    fn inside_of_a_closed_box_is_hidden() {
+        let (mut pos, mut tris) = (Vec::new(), Vec::new());
+        cube(&mut pos, &mut tris, 0.0, 10.0);
+        cube(&mut pos, &mut tris, 0.0, 3.0);
+        // petit détail collé dehors (enseigne) : gardé
+        cube(&mut pos, &mut tris, 10.4, 0.3);
+        let m = outside_mask(&pos, &tris, [-10.0, -10.0, -10.0], [10.7, 10.7, 10.7]);
+        assert!(m[..12].iter().filter(|v| **v).count() >= 10, "façade : {:?}", &m[..12]);
+        assert!(m[12..24].iter().all(|v| !*v), "intérieur visible : {:?}", &m[12..24]);
+        assert!(m[24..].iter().any(|v| *v));
+    }
+
+    #[test]
+    fn big_model_is_fast_enough() {
+        let (mut pos, mut tris) = (Vec::new(), Vec::new());
+        for i in 0..1700 {
+            cube(&mut pos, &mut tris, (i % 40) as f32 * 0.5 - 10.0, 0.2);
+        }
+        let t = std::time::Instant::now();
+        let _ = outside_mask(&pos, &tris, [-10.5; 3], [10.5; 3]);
+        assert!(t.elapsed().as_millis() < 3000, "{} ms pour {} triangles", t.elapsed().as_millis(), tris.len());
+        println!("{} ms pour {} triangles", t.elapsed().as_millis(), tris.len());
     }
 }

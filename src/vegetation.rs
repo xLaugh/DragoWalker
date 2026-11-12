@@ -20,7 +20,7 @@ pub struct VegSet {
     pub max_slope: f32,
 }
 
-pub const SETS: [VegSet; 7] = [
+pub const SETS: [VegSet; 13] = [
     VegSet {
         name: "Forêt de pins",
         tip: "Pins et cèdres de la région de Paleto / Mont Chiliad",
@@ -76,6 +76,56 @@ pub const SETS: [VegSet; 7] = [
         spacing: 6.0,
         lod_dist: 250.0,
         max_slope: 3.0,
+    },
+    // variétés ajoutées le 11 nov. 2026 : noms et nombre de placements relevés par la sonde DW_ARCH_GREP
+    // (prop_tree_birch_04 5 398 fois, prop_tree_eucalip_01 1 102, prop_tree_cypress_01 840, test_tree_forest_trunk_01 682…)
+    VegSet {
+        name: "Bouleaux",
+        tip: "Bouleaux de toutes tailles (nord de la carte)",
+        props: &["prop_tree_birch_01", "prop_tree_birch_02", "prop_tree_birch_03", "prop_tree_birch_03b", "prop_tree_birch_04", "prop_tree_birch_05"],
+        spacing: 7.0,
+        lod_dist: 300.0,
+        max_slope: 0.8,
+    },
+    VegSet {
+        name: "Méditerranéen",
+        tip: "Eucalyptus, cyprès, oliviers, mesquites (Vinewood Hills, collines sèches)",
+        props: &["prop_tree_eucalip_01", "prop_tree_cypress_01", "prop_tree_olive_01", "prop_tree_mquite_01", "prop_tree_jacada_02"],
+        spacing: 11.0,
+        lod_dist: 320.0,
+        max_slope: 0.8,
+    },
+    VegSet {
+        name: "Arbres morts et tombés",
+        tip: "Cèdres morts, troncs couchés, herbes mortes",
+        props: &["prop_w_r_cedar_dead", "prop_tree_fallen_pine_01", "prop_tree_fallen_01", "prop_tree_fallen_02", "prop_weeddead_nxg01", "prop_weeddead_nxg02"],
+        spacing: 10.0,
+        lod_dist: 250.0,
+        max_slope: 0.9,
+    },
+    VegSet {
+        name: "Forêt géante",
+        tip: "Très grands troncs de forêt ancienne (Raton Canyon) et grands cèdres",
+        props: &["test_tree_forest_trunk_01", "test_tree_cedar_trunk_001", "prop_tree_cedar_03", "prop_tree_cedar_04"],
+        spacing: 18.0,
+        lod_dist: 500.0,
+        max_slope: 0.9,
+    },
+    VegSet {
+        name: "Neige",
+        tip: "Sapins enneigés de North Yankton",
+        props: &["prop_snow_tree_03_i", "prop_snow_tree_04_d", "prop_snow_tree_04_f"],
+        spacing: 9.0,
+        lod_dist: 350.0,
+        max_slope: 1.0,
+    },
+    VegSet {
+        name: "Forêt mixte",
+        tip: "Pins, cèdres, chênes, bouleaux, érables et buissons mélangés",
+        props: &["prop_tree_pine_02", "prop_tree_cedar_03", "prop_tree_eng_oak_01", "prop_tree_birch_04", "prop_tree_maple_02", "prop_tree_birch_03b", "prop_bush_med_03", "prop_bush_lrg_01"],
+        spacing: 9.0,
+        lod_dist: 320.0,
+        max_slope: 0.9,
     },
 ];
 

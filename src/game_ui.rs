@@ -36,6 +36,8 @@ pub struct GameState {
     pub preview: Option<Mesh>,
     pub preview_for: u32,
     pub preview_yaw: f32,
+    /// aperçu de la bibliothèque : dessiner aussi l'intérieur (caché derrière la façade)
+    pub preview_inside: bool,
     pub preview_pitch: f32,
     /// ymap du jeu copié dans le projet → identifiants des objets (dans l'ordre du fichier)
     pub links: HashMap<String, Vec<u64>>,
@@ -95,6 +97,7 @@ impl GameState {
             preview: None,
             preview_for: 0,
             preview_yaw: 0.6,
+            preview_inside: std::env::var("DW_PREVIEW_INSIDE").is_ok(),
             preview_pitch: 0.45,
             links: HashMap::new(),
             disabled_groups,
@@ -395,6 +398,7 @@ impl DwApp {
             .as_ref()
             .and_then(|w| w.heightmaps.iter().rev().find(|h| h.contains(p.x, p.y)).and_then(|h| Some((h.height_min(p.x, p.y)? + h.height(p.x, p.y)?) * 0.5)))
             .unwrap_or(p.z);
+        self.cam.pan_left = V3::ZERO;
         self.cam.target = v3(p.x, p.y, z);
         self.ground_z = z;
         self.cam.dist = dist;

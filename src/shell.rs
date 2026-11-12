@@ -1,0 +1,289 @@
+//! Coque des intérieurs créés dans DragoWalker : pour chaque pièce, un vrai modèle avec sol, plafond et murs
+//! (ouverts là où passe un portail), textures fabriquées par DragoWalker ; posé dans la pièce comme objet de
+//! l'intérieur (« dw_shell_<intérieur>_<pièce> ») et repris en entier dans la collision de l'intérieur, avec le
+//! numéro de la pièce sur chaque surface (RoomId, BoundMaterial_s::set_RoomId 0x060042e3).
+
+use crate::app::DwApp;
+use crate::gta::drawable::{RGeom, RModel, RVert, TexData, TexFmt};
+use crate::math::{v3, V3};
+use crate::model::{Entity, MloArchetype};
+
+pub const SHELL_PREFIX: &str = "dw_shell_";
+/// Clés des trois textures (mur, sol, plafond).
+pub const K_WALL: u64 = 0xD5_5E11_0001;
+pub const K_FLOOR: u64 = 0xD5_5E11_0002;
+pub const K_CEIL: u64 = 0xD5_5E11_0003;
+/// Un portail est sur un mur quand ses quatre coins sont à moins de cette distance du plan du mur (m) — **estimé**.
+const ON_WALL: f32 = 0.2;
+/// Distance d'affichage de l'objet « coque » : celle d'un nouvel objet d'intérieur de CodeWalker
+/// (ProjectForm::NewMloEntity 0x06000d68, IL_0398 : ldc.r4 200 → CEntityDef.lodDist).
+const SHELL_LOD: f32 = 200.0;
+/// Distance d'affichage du type d'objet : celle d'un nouveau type de CodeWalker (YtypFile::AddArchetype
+/// 0x060030f8 : lodDist 60, hdTextureDist 15, assetType 2 = drawable).
+const SHELL_ARCH_LOD: f32 = 60.0;
+
+pub fn shell_name(mlo: &str, ri: usize) -> String {
+    format!("{SHELL_PREFIX}{}_{ri}", mlo.to_lowercase())
+}
+
+/// Triangles de la coque d'une pièce (repère de l'intérieur), rangés par partie : 0 sol, 1 murs, 2 plafond.
+/// Chaque triangle : (3 sommets, normale vers l'intérieur de la pièce).
+pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
+    let Some(r) = m.rooms.get(ri) else { return Vec::new() };
+    let (a, b) = (r.bb_min, r.bb_max);
+    let mut out = Vec::new();
+    // sol (vers le haut) et plafond (vers le bas)
+    out.push((0, [v3(a.x, a.y, a.z), v3(b.x, a.y, a.z), v3(b.x, b.y, a.z), v3(a.x, b.y, a.z)], v3(0.0, 0.0, 1.0)));
+    out.push((2, [v3(a.x, a.y, b.z), v3(a.x, b.y, b.z), v3(b.x, b.y, b.z), v3(b.x, a.y, b.z)], v3(0.0, 0.0, -1.0)));
+    // murs : (axe fixe 0 = x / 1 = y, valeur, début et fin le long du mur, normale vers l'intérieur)
+    let walls = [(0usize, a.x, a.y, b.y, v3(1.0, 0.0, 0.0)), (0, b.x, a.y, b.y, v3(-1.0, 0.0, 0.0)), (1, a.y, a.x, b.x, v3(0.0, 1.0, 0.0)), (1, b.y, a.x, b.x, v3(0.0, -1.0, 0.0))];
+    for (axis, val, s0, s1, n) in walls {
+        let fixed = |p: V3| if axis == 0 { p.x } else { p.y };
+        let along = |p: V3| if axis == 0 { p.y } else { p.x };
+        // ouvertures : portails de cette pièce posés sur ce mur
+        let mut holes: Vec<(f32, f32, f32, f32)> = m
+            .portals
+            .iter()
+            .filter(|p| p.room_from as usize == ri || p.room_to as usize == ri)
+            .filter(|p| p.corners.iter().all(|c| (fixed(*c) - val).abs() < ON_WALL))
+            .map(|p| {
+                let (mut lo, mut hi, mut zl, mut zh) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for c in p.corners {
+                    lo = lo.min(along(c));
+                    hi = hi.max(along(c));
+                    zl = zl.min(c.z);
+                    zh = zh.max(c.z);
+                }
+                (lo.max(s0), hi.min(s1), zl.max(a.z), zh.min(b.z))
+            })
+            .filter(|h| h.1 - h.0 > 0.05)
+            .collect();
+        holes.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        let pt = |s: f32, z: f32| if axis == 0 { v3(val, s, z) } else { v3(s, val, z) };
+        let mut rect = |s0: f32, s1: f32, z0: f32, z1: f32| {
+            if s1 - s0 > 0.01 && z1 - z0 > 0.01 {
+                out.push((1, [pt(s0, z0), pt(s1, z0), pt(s1, z1), pt(s0, z1)], n));
+            }
+        };
+        let mut cur = s0;
+        for (lo, hi, zl, zh) in holes {
+            if lo > cur {
+                rect(cur, lo, a.z, b.z);
+            }
+            let (l, h) = (lo.max(cur), hi);
+            rect(l, h, zh, b.z);
+            rect(l, h, a.z, zl);
+            cur = cur.max(hi);
+        }
+        rect(cur, s1, a.z, b.z);
+    }
+    out
+}
+
+/// Deux triangles d'un quadrilatère, tournés vers la normale voulue.
+fn tri_pair(q: &[V3; 4], n: V3) -> [[V3; 3]; 2] {
+    let t = [[q[0], q[1], q[2]], [q[0], q[2], q[3]]];
+    if (q[1] - q[0]).cross(q[2] - q[0]).dot(n) < 0.0 {
+        [[q[0], q[2], q[1]], [q[0], q[3], q[2]]]
+    } else {
+        t
+    }
+}
+
+/// Modèle de la coque d'une pièce : 3 parties (sol, murs, plafond), coordonnées de texture en mètres / 2.
+pub fn room_model(m: &MloArchetype, ri: usize) -> Option<(RModel, (V3, V3))> {
+    let quads = room_quads(m, ri);
+    if quads.is_empty() {
+        return None;
+    }
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let mut geoms = Vec::new();
+    let big = 3.0e38f32;
+    let (mut mn, mut mx) = (v3(big, big, big), v3(-big, -big, -big));
+    for part in 0..3 {
+        let first = idx.len() as u32;
+        for (p, q, n) in quads.iter().filter(|x| x.0 == part) {
+            let _ = p;
+            for t in tri_pair(q, *n) {
+                for c in t {
+                    let uv = if n.z.abs() > 0.5 { [c.x * 0.5, c.y * 0.5] } else if n.x.abs() > 0.5 { [c.y * 0.5, -c.z * 0.5] } else { [c.x * 0.5, -c.z * 0.5] };
+                    idx.push(verts.len() as u32);
+                    verts.push(RVert { pos: [c.x, c.y, c.z], nrm: [n.x, n.y, n.z], uv, col: [255, 255, 255, 255] });
+                    mn = mn.min(c);
+                    mx = mx.max(c);
+                }
+            }
+        }
+        geoms.push(RGeom { first, count: idx.len() as u32 - first, tex: 0, cutout: false, blend: 0, glass: false });
+    }
+    Some((RModel { verts, idx, geoms, embedded_dict: None }, (mn, mx)))
+}
+
+/// Textures de la coque : enduit clair, parquet, plafond blanc (64 × 64, léger grain) — **estimé**.
+pub fn shell_textures() -> Vec<(u64, TexData)> {
+    let make = |base: [u8; 3], grain: u8, planks: bool| {
+        let n = 64usize;
+        let mut px = Vec::with_capacity(n * n * 4);
+        for y in 0..n {
+            for x in 0..n {
+                let h = ((x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663)) % (grain as u32 * 2 + 1);
+                let mut d = h as i32 - grain as i32;
+                if planks && y % 16 == 0 {
+                    d -= 25;
+                }
+                for c in base {
+                    px.push((c as i32 + d).clamp(0, 255) as u8);
+                }
+                px.push(255);
+            }
+        }
+        TexData { w: n as u32, h: n as u32, fmt: TexFmt::Rgba8, levels: vec![px] }
+    };
+    vec![(K_WALL, make([214, 208, 196], 6, false)), (K_FLOOR, make([150, 108, 72], 10, true)), (K_CEIL, make([236, 234, 228], 3, false))]
+}
+
+pub const SHELL_KEYS: [u64; 3] = [K_FLOOR, K_WALL, K_CEIL];
+
+impl DwApp {
+    /// Intérieurs à doter d'une coque : créés dans DragoWalker (ni MLO importé, ni intérieur du jeu).
+    pub fn shell_mlos(&self) -> Vec<(usize, usize)> {
+        let external = self.mlo_external_ytyps();
+        let w = self.game.world.as_deref();
+        let mut out = Vec::new();
+        for (ti, t) in self.proj.ytyps.iter().enumerate().filter(|(_, t)| !external.contains(&t.name.to_lowercase())) {
+            for (mi, m) in t.mlos.iter().enumerate() {
+                let game = w.and_then(|w| w.archetypes.get(&crate::gta::crypto::joaat(&m.name.to_lowercase()))).map(|a| a.mlo).unwrap_or(false);
+                if !game {
+                    out.push((ti, mi));
+                }
+            }
+        }
+        out
+    }
+
+    /// Chaque pièce d'un intérieur créé a son objet « coque » (et rien pour les pièces disparues).
+    pub fn ensure_shell_entities(&mut self) {
+        for (ti, mi) in self.shell_mlos() {
+            let m = &mut self.proj.ytyps[ti].mlos[mi];
+            let name = m.name.clone();
+            let nr = m.rooms.len();
+            m.entities.retain(|e| !e.archetype.starts_with(SHELL_PREFIX) || (e.room > 0 && e.room < nr && e.archetype == shell_name(&name, e.room)));
+            for ri in 1..nr {
+                let sn = shell_name(&name, ri);
+                if !m.entities.iter().any(|e| e.archetype == sn) {
+                    let mut e = Entity::new(&sn, V3::ZERO);
+                    e.flags = crate::mech::MLO_ENTITY_FLAGS;
+                    e.room = ri;
+                    e.lod_dist = SHELL_LOD;
+                    m.entities.push(e);
+                }
+            }
+        }
+    }
+
+    /// Coques dans la vue : modèles envoyés à la carte graphique et tailles au catalogue, quand les pièces ou les
+    /// portails changent.
+    pub fn shells_tick(&mut self) {
+        let mlos = self.shell_mlos();
+        if mlos.is_empty() {
+            return;
+        }
+        let Some(gpu) = self.game.gpu.clone() else { return };
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (std::sync::Arc::as_ptr(&gpu) as usize).hash(&mut h);
+        for &(ti, mi) in &mlos {
+            let m = &self.proj.ytyps[ti].mlos[mi];
+            m.name.hash(&mut h);
+            for r in &m.rooms {
+                for v in [r.bb_min, r.bb_max] {
+                    v.x.to_bits().hash(&mut h);
+                    v.y.to_bits().hash(&mut h);
+                    v.z.to_bits().hash(&mut h);
+                }
+            }
+            for p in &m.portals {
+                (p.room_from, p.room_to).hash(&mut h);
+                for c in p.corners {
+                    c.x.to_bits().hash(&mut h);
+                    c.y.to_bits().hash(&mut h);
+                    c.z.to_bits().hash(&mut h);
+                }
+            }
+        }
+        let sig = h.finish();
+        if sig == self.shell_sig {
+            return;
+        }
+        self.shell_sig = sig;
+        self.ensure_shell_entities();
+        let texs = shell_textures();
+        let mut boxes = std::collections::HashMap::new();
+        if let Ok(mut g) = gpu.lock() {
+            for &(ti, mi) in &mlos {
+                let m = &self.proj.ytyps[ti].mlos[mi];
+                for ri in 1..m.rooms.len() {
+                    let Some((model, bx)) = room_model(m, ri) else { continue };
+                    let sn = shell_name(&m.name, ri);
+                    boxes.insert(sn.clone(), bx);
+                    g.add_custom(crate::gta::loader::Loaded { arch: crate::gta::crypto::joaat(&sn), model: Some(model), part_keys: SHELL_KEYS.to_vec(), textures: texs.clone() });
+                }
+            }
+        }
+        crate::catalog::set_shell_boxes(boxes);
+    }
+
+    /// Export des coques : un modèle par pièce (textures intégrées), leurs types dans « dw_shell_types ».
+    /// Rend (compte rendu, lignes du fxmanifest).
+    pub fn export_shells(&self, stream: &std::path::Path) -> (Vec<String>, String) {
+        for f in std::fs::read_dir(stream).into_iter().flatten().flatten() {
+            let n = f.file_name().to_string_lossy().to_lowercase();
+            if n.starts_with(SHELL_PREFIX) && n.ends_with(".xml") && f.path().is_file() {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let texs = shell_textures();
+        let mut archs = Vec::new();
+        let mut n = 0;
+        let mut nl = 0;
+        let mut lit_rooms = 0;
+        let src = self.game.world.as_ref().map(|w| w.model_source());
+        let mut lit_cache: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+        for (ti, mi) in self.shell_mlos() {
+            let m = &self.proj.ytyps[ti].mlos[mi];
+            for ri in 1..m.rooms.len() {
+                let Some((model, (mn, mx))) = room_model(m, ri) else { continue };
+                let sn = shell_name(&m.name, ri);
+                let Ok(path) = crate::sollumz::write_ydr_xml_ex(stream, &sn, &model, &SHELL_KEYS, &texs, None) else { continue };
+                // spots du plafond, rangés dans le modèle comme les lumières des intérieurs du jeu
+                let r = &m.rooms[ri];
+                // pièce déjà éclairée par un objet du jeu qui porte ses propres lumières (plafonnier…) : pas de
+                // spots en plus ; sinon (objet sans lumière, ou aucun), spots au plafond
+                let lit = m.entities.iter().filter(|e| e.room == ri).any(|e| {
+                    let h = crate::gta::crypto::joaat(&e.archetype);
+                    *lit_cache.entry(h).or_insert_with(|| src.as_ref().map(|s| !s.lights(h).is_empty()).unwrap_or(false))
+                });
+                let lights = if lit { Vec::new() } else { crate::lights::room_lights(r.bb_min, r.bb_max) };
+                if lit {
+                    lit_rooms += 1;
+                }
+                if crate::lights::add_lights_to_ydr_xml(&path, &lights).is_ok() {
+                    nl += lights.len();
+                }
+                let (c, r) = ((mn + mx) * 0.5, (mx - mn).len() * 0.5);
+                archs.push(format!(
+                    "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{SHELL_ARCH_LOD}\" />\n   <flags value=\"0\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{r}\" />\n   <hdTextureDist value=\"15\" />\n   <name>{sn}</name>\n   <textureDictionary />\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{sn}</assetName>\n   <extensions />\n  </Item>",
+                    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, c.x, c.y, c.z
+                ));
+                n += 1;
+            }
+        }
+        if archs.is_empty() {
+            return (Vec::new(), String::new());
+        }
+        let ytyp = crate::model::Ytyp { name: "dw_shell_types".into(), mlos: Vec::new(), visible: true, raw_archetypes: archs };
+        let _ = std::fs::write(stream.join("dw_shell_types.ytyp.xml"), crate::xmlio::write_ytyp(&ytyp));
+        (vec![format!("Coques des intérieurs : {n} pièce(s) avec sol, murs (ouverts aux passages) et plafond ; collision complète avec le numéro de chaque pièce ; {nl} spot(s) au plafond ajouté(s) ; {lit_rooms} pièce(s) déjà éclairée(s) par les lumières de leurs objets du jeu.")], "data_file 'DLC_ITYP_REQUEST' 'stream/dw_shell_types.ytyp'\n".into())
+    }
+}

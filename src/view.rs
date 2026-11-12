@@ -79,12 +79,16 @@ impl DwApp {
         if resp.hovered() {
             let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                if self.tool == Tool::Erase && mods.alt {
+                if self.group_place.is_some() {
+                    // pose d'un groupe : la molette le tourne (groups.rs)
+                } else if self.tool == Tool::Erase && mods.alt {
                     self.erase_radius = (self.erase_radius * if scroll > 0.0 { 1.1 } else { 0.9 }).clamp(1.0, 500.0);
                 } else if mods.alt && self.game.cut_on {
                     // la molette + Alt règle la hauteur de coupe (plus bas)
                 } else {
-                    self.cam.mouse_zoom(scroll.signum());
+                    // vers le point sous la souris (et au-delà, tout près)
+                    let at = self.mouse_ground;
+                    self.cam.zoom_at(scroll.signum(), at);
                 }
             }
         }
@@ -184,7 +188,15 @@ impl DwApp {
         }
         let ptr = resp.interact_pointer_pos().or(hover_pos);
         let press_origin = ctx.input(|i| i.pointer.press_origin());
+        // édition d'un bâtiment posé : la souris retire des morceaux, à la place de l'outil en cours
+        let editing = self.bedit.is_some();
+        if editing {
+            self.bedit_input(&resp, ptr, press_origin, mods);
+        }
+        // pose d'un groupe : la souris le pose, la molette le tourne
+        let grouping = !editing && self.group_input(&ctx, &resp);
         match self.tool {
+            _ if editing || grouping => {}
             Tool::Select | Tool::Rect => self.select_tool(&resp, ptr, press_origin, mods),
             Tool::Terrain => self.terrain_tool(&resp, ptr, &ctx),
             Tool::Life => self.life_tool(&resp, ptr),
@@ -260,7 +272,11 @@ impl DwApp {
                 ctx.request_repaint();
             }
         }
-        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default() });
+        // aperçu de l'export d'un MLO (fenêtre « Pièces du MLO ») : ses façades là où elles seront posées
+        let mut mlo_extra = self.mlo_preview_insts();
+        // groupe en cours de pose, sous la souris
+        mlo_extra.extend(self.group_ghost());
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default(), extra: mlo_extra });
         render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
         drop(gctx);
         self.game.drawn = drawn;
@@ -292,6 +308,11 @@ impl DwApp {
             self.draw_gizmo(&painter, self.gizmo_hover);
         }
         self.draw_lists_overlay(&painter);
+        self.mlo_pieces_view(&painter, hover_pos, ui.ctx());
+        self.bedit_draw(&painter, hover_pos, ui.ctx());
+        // aperçu de l'herbe du jeu : retiré avec le pinceau (voir A_FAIRE.md)
+        self.draw_occluders(&painter);
+        self.draw_group_ghost(&painter);
         self.draw_scenery_overlay(&painter, hover_pos);
         self.draw_life_overlay(&painter, hover_pos);
         // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
@@ -439,10 +460,12 @@ impl DwApp {
             match self.pick_for_drag(start) {
                 Some(id) => {
                     if !self.sel_set.contains(&id) {
+                        // un groupe posé se déplace d'un bloc
+                        let block = self.group_block(id);
                         if mods.command || mods.shift {
-                            self.add_selection([id]);
+                            self.add_selection(block);
                         } else {
-                            self.set_selection(vec![id]);
+                            self.set_selection(block);
                         }
                     }
                     self.push_undo();
@@ -495,11 +518,46 @@ impl DwApp {
         let click = resp.clicked_by(PointerButton::Primary) || resp.clicked_by(PointerButton::Secondary);
         // un clic sur une poignée ne change pas la sélection
         let click = click && !ptr.map(|p| self.gizmo_pick(p).is_some()).unwrap_or(false);
+        // double-clic sur un objet d'un groupe posé : n'en prendre que cette pièce
+        if resp.double_clicked_by(PointerButton::Primary) {
+            // la pièce du bloc choisi qui est sous la souris
+            if let Some(id) = ptr.and_then(|p| self.pick_for_drag(p)) {
+                if self.group_open_piece(id) {
+                    return;
+                }
+            }
+        }
         if click {
             if let Some(p) = ptr {
                 let add = mods.command || mods.shift;
                 match self.pick_any(p, !add) {
+                    // objet d'un groupe posé : tout le bloc (sauf s'il est ouvert)
+                    Some(id) if self.group_block(id).len() > 1 => {
+                        let block = self.group_block(id);
+                        let n = block.len();
+                        // Ctrl + clic : interrupteur, comme CodeWalker (WorldForm::SelectItem 0x060002b5 avec
+                        // addSelection : déjà dans la sélection multiple → retiré, sinon ajouté)
+                        if add && block.iter().all(|b| self.sel_set.contains(b)) {
+                            let rm: std::collections::HashSet<u64> = block.into_iter().collect();
+                            self.selected.retain(|x| !rm.contains(x));
+                            self.sel_set.retain(|x| !rm.contains(x));
+                            self.status = format!("Groupe posé retiré de la sélection ({n} objet(s)) : {} objet(s) sélectionné(s).", self.selected.len());
+                        } else {
+                            if add {
+                                self.add_selection(block);
+                            } else {
+                                self.set_selection(block);
+                            }
+                            self.status = format!("Groupe posé : {n} objet(s) pris d'un bloc (déplace-le ou tourne-le d'un coup) · double-clic pour une seule pièce.");
+                        }
+                        self.tab = Tab::Selection;
+                    }
                     Some(id) => {
+                        // clic hors du bloc ouvert : il se referme
+                        let inst = self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| e.group_inst).unwrap_or(0);
+                        if self.group_open.is_some() && self.group_open != Some(inst) {
+                            self.group_open = None;
+                        }
                         if add {
                             // Ctrl + clic : ajoute (ou retire) l'objet sous la souris, comme CodeWalker
                             let name = self.proj.find_id(id).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()).unwrap_or_default();
@@ -588,6 +646,11 @@ impl DwApp {
             self.export_xml(true);
         } else if ck[8] {
             self.export_xml(false);
+        }
+        // F12 : tester en jeu (serveur local ; s'il tourne déjà, la map est rechargée sans déconnexion)
+        if ctx.input(|i| i.key_pressed(Key::F12)) {
+            self.server.open = true;
+            self.server_test();
         }
         // éditeur de terrain : F2–F9 pinceaux, + / - rayon, route en cours (Entrée, Retour arrière, Échap)
         if self.proj.terrain.is_some() {

@@ -117,6 +117,26 @@ pub fn set_game_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
 
 static CUSTOM_BOXES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
 
+static SHELL_BOXES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
+
+/// Tailles des coques des intérieurs créés (shell.rs).
+pub fn set_shell_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
+    let lock = SHELL_BOXES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = lock.write() {
+        *g = m;
+    }
+}
+
+static CUT_BOXES:std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
+
+/// Tailles des bâtiments du jeu édités (ce qui reste après les morceaux retirés).
+pub fn set_cut_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
+    let lock = CUT_BOXES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = lock.write() {
+        *g = m;
+    }
+}
+
 /// Tailles des modèles personnels (Blender / Sollumz).
 pub fn set_custom_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
     let lock = CUSTOM_BOXES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -142,6 +162,12 @@ pub fn game_box(name: &str) -> Option<(V3, V3)> {
         return Some(c);
     }
     if let Some(c) = MLO_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
+        return Some(c);
+    }
+    if let Some(c) = CUT_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
+        return Some(c);
+    }
+    if let Some(c) = SHELL_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
         return Some(c);
     }
     let g = GAME_BOXES.get()?.read().ok()?;

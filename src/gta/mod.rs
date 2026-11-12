@@ -95,6 +95,74 @@ pub fn probe(game: &str, cw: &str) {
                 }
                 // DW_TRAFFIC_STATS=1 : feux du jeu regroupés par carrefour ; pour chaque feu, le côté où il se tient
                 // (avant / après le centre pour les voitures qu'il regarde) et le sens de son bras
+                // DW_MLOROT=1 : placements d'intérieur du jeu tournés (cap hors multiple de 90°) et le grand bâtiment le
+                // plus proche (à moins de 20 m) : écart de cap modulo 90° selon que la rotation du placement se lit
+                // telle quelle (lecture de CodeWalker) ou inversée (comme un objet ordinaire)
+                if std::env::var("DW_MLOROT").is_ok() {
+                    let m90 = |d: f32| { let r = d.rem_euclid(90.0); r.min(90.0 - r) };
+                    let (mut n, mut ok_as_is, mut ok_inv) = (0usize, 0usize, 0usize);
+                    let mut ex = Vec::new();
+                    for (mi, m) in w.ents.iter().enumerate().filter(|(_, e)| e.mlo && e.lod_level == 0) {
+                        let ym = m.rot.heading_deg();
+                        if m90(ym) < 3.0 {
+                            continue;
+                        }
+                        let best = w.ents.iter().filter(|b| !b.mlo && b.lod_level == 0 && (b.pos - m.pos).len() < 20.0).filter(|b| { let n = w.name_of(b.arch); !crate::buildings::is_prop_name(&n) && !n.contains("tree") && !n.contains("bush") && !n.contains("decal") }).filter(|b| { let (a, c) = w.arch_box(b.arch); let s = c - a; s.x.max(s.y) > 8.0 && s.z > 4.0 }).min_by(|a, b| (a.pos - m.pos).len().partial_cmp(&(b.pos - m.pos).len()).unwrap_or(std::cmp::Ordering::Equal));
+                        let Some(b) = best else { continue };
+                        let yb = b.rot.heading_deg();
+                        let d_as_is = m90(ym - yb);
+                        let d_inv = m90(-ym - yb);
+                        n += 1;
+                        ok_as_is += (d_as_is < 3.0) as usize;
+                        ok_inv += (d_inv < 3.0) as usize;
+                        if ex.len() < 8 {
+                            ex.push(format!("{} cap {ym:.1}° / {} cap {yb:.1}° : écart tel quel {d_as_is:.1}°, inversé {d_inv:.1}°", w.name_of(m.arch), w.name_of(b.arch)));
+                        }
+                        let _ = mi;
+                    }
+                    println!("intérieurs tournés comparés : {n} ; alignés lu tel quel : {ok_as_is} ; alignés lu inversé : {ok_inv}");
+                    for s in ex {
+                        println!("   {s}");
+                    }
+                }
+                // DW_LODFLAGS=1 : objets qui ont un parent (version de loin) — bit 0x8 des drapeaux (CodeWalker
+                // YmapEntityDef::get_LodInParentYmap 0x06002d03) selon que le parent est dans la carte parente
+                // (CMapData.parent) ou dans la même carte ; 400 premières cartes HD de la carte de base
+                if std::env::var("DW_LODFLAGS").is_ok() {
+                    let (mut pp, mut pp8, mut same, mut same8, mut orphan8, mut orphan) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+                    let mut ex: Vec<String> = Vec::new();
+                    for yi in (0..w.ymaps.len()).filter(|&i| w.ymaps[i].parent != 0).take(400) {
+                        let Some(r) = w.ymap_resource(yi) else { continue };
+                        let Some(y) = meta::parse_ymap(&r) else { continue };
+                        let n = y.entities.len();
+                        for (i, e) in y.entities.iter().enumerate() {
+                            let bit = e.flags & 8 != 0;
+                            if e.parent < 0 {
+                                orphan += 1;
+                                orphan8 += bit as usize;
+                                continue;
+                            }
+                            // même règle que YmapFile::EnsureEntities 0x06002cb0 pour « parent dans la même carte »
+                            let in_same = (e.parent as usize) < n && y.entities[e.parent as usize].lod_level > e.lod_level && (y.entities[e.parent as usize].lod_level != 5 || e.lod_level == 5);
+                            if in_same {
+                                same += 1;
+                                same8 += bit as usize;
+                            } else {
+                                pp += 1;
+                                pp8 += bit as usize;
+                                if ex.len() < 4 {
+                                    ex.push(format!("{} #{i} {} lod {} parent {} flags {:#x}", w.ymaps[yi].name, w.name_of(e.arch), e.lod_level, e.parent, e.flags));
+                                }
+                            }
+                        }
+                    }
+                    println!("parent dans la carte parente : {pp} objets, bit 0x8 sur {pp8}");
+                    println!("parent dans la même carte : {same} objets, bit 0x8 sur {same8}");
+                    println!("sans parent : {orphan} objets, bit 0x8 sur {orphan8}");
+                    for s in ex {
+                        println!("   ex. {s}");
+                    }
+                }
                 if std::env::var("DW_TRAFFIC_STATS").is_ok() {
                     use crate::math::v3;
                     let names = ["prop_traffic_01a", "prop_traffic_01b", "prop_traffic_01d", "prop_traffic_03a", "prop_sign_road_01a"];
@@ -158,6 +226,22 @@ pub fn probe(game: &str, cw: &str) {
                         }
                     }
                     println!("dictionnaires affichés : {shown}");
+                }
+                // DW_TEXT_DUMP="nom" : écrit les fichiers non-ressource (xml, meta, dat…) de ce nom, de toutes les archives,
+                // dans le dossier temporaire dragowalker_text (ex. gameconfig.xml : tailles des pools du jeu)
+                if let Ok(name) = std::env::var("DW_TEXT_DUMP") {
+                    let dir = std::env::temp_dir().join("dragowalker_text");
+                    let _ = std::fs::create_dir_all(&dir);
+                    for (i, f) in w.vfs.files.iter().filter(|f| f.name.eq_ignore_ascii_case(&name)).enumerate() {
+                        match w.vfs.read_binary(f, &w.keys) {
+                            Some(d) => {
+                                let out = dir.join(format!("{i}_{}", f.name));
+                                let _ = std::fs::write(&out, &d);
+                                println!("   {} ({} octets) -> {}", f.path, d.len(), out.display());
+                            }
+                            None => println!("   {} illisible", f.path),
+                        }
+                    }
                 }
                 // DW_BLOCK_DUMP="structure,extension,nombre" : écrit les fichiers qui contiennent ce type de bloc
                 if let Ok(v) = std::env::var("DW_BLOCK_DUMP") {
@@ -256,6 +340,70 @@ pub fn probe(game: &str, cw: &str) {
                                 println!("  {} : {:?}", f.path, m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
                             }
                         }
+                    }
+                }
+                // DW_LIGHTS=N : lumières rangées dans les modèles des N premiers intérieurs du jeu (réglages
+                // les plus fréquents, pour les lumières des intérieurs créés dans DragoWalker)
+                if let Some(nm) = std::env::var("DW_LIGHTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    let src = w.model_source();
+                    let mut keys: Vec<&u32> = w.mlo_defs.keys().collect();
+                    keys.sort();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all = Vec::new();
+                    for k in keys.into_iter().take(nm) {
+                        for c in &w.mlo_defs[k].children {
+                            if seen.insert(c.arch) {
+                                for l in src.lights(c.arch) {
+                                    all.push((c.arch, l));
+                                }
+                            }
+                        }
+                    }
+                    println!("lumières : {} dans {} modèles d'intérieur", all.len(), seen.len());
+                    let mut hist = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
+                        let mut m: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                        for (_, l) in &all {
+                            *m.entry(f(l)).or_insert(0) += 1;
+                        }
+                        let mut v: Vec<_> = m.into_iter().collect();
+                        v.sort_by(|a, b| b.1.cmp(&a.1));
+                        println!("  {label} : {:?}", v.into_iter().take(8).collect::<Vec<_>>());
+                    };
+                    hist("type", &|l| l.kind.to_string());
+                    hist("flags", &|l| format!("{:#x}", l.flags));
+                    hist("heures", &|l| format!("{:#x}", l.time_flags));
+                    hist("intensité", &|l| format!("{:.1}", l.intensity));
+                    hist("portée", &|l| format!("{:.0}", l.falloff));
+                    hist("exposant", &|l| format!("{:.0}", l.falloff_exp));
+                    hist("couleur", &|l| format!("{:?}", l.color));
+                    hist("cône", &|l| format!("{:.0}/{:.0}", l.cone_inner, l.cone_outer));
+                    hist("halo", &|l| format!("{:.1}/{:.1}", l.corona_size, l.corona_intensity));
+                    hist("volume", &|l| format!("{:.1}", l.volume_intensity));
+                    hist("près ombre", &|l| format!("{:.2}", l.shadow_near_clip));
+                    hist("fondu", &|l| l.light_fade.to_string());
+                    hist("direction", &|l| format!("{:.0} {:.0} {:.0}", l.dir[0], l.dir[1], l.dir[2]));
+                    hist("étendue", &|l| format!("{:.1} {:.1} {:.1}", l.extent[0], l.extent[1], l.extent[2]));
+                    hist("clignote", &|l| l.flashiness.to_string());
+                    // spots vers le bas allumés toute la journée : réglages pris ensemble
+                    all.retain(|(_, l)| l.kind == 2 && l.dir[2] < -0.99 && l.time_flags == 0xFF_FFFF);
+                    println!("  spots vers le bas, toute la journée : {}", all.len());
+                    let mut hist2 = |label: &str, f: &dyn Fn(&drawable::GameLight) -> String| {
+                        let mut m: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                        for (_, l) in &all {
+                            *m.entry(f(l)).or_insert(0) += 1;
+                        }
+                        let mut v: Vec<_> = m.into_iter().collect();
+                        v.sort_by(|a, b| b.1.cmp(&a.1));
+                        println!("  {label} : {:?}", v.into_iter().take(8).collect::<Vec<_>>());
+                    };
+                    hist2("ensemble", &|l| format!("i{:.0} p{:.1} e{:.0} c{:.0}/{:.0} f{:#x} h{:.1}/{:.1} v{:.1} {:?}", l.intensity, l.falloff, l.falloff_exp, l.cone_inner, l.cone_outer, l.flags, l.corona_size, l.corona_intensity, l.volume_intensity, l.color));
+                    hist2("portée", &|l| format!("{:.0}", l.falloff));
+                    hist2("intensité", &|l| format!("{:.0}", l.intensity));
+                    hist2("cône", &|l| format!("{:.0}/{:.0}", l.cone_inner, l.cone_outer));
+                    hist2("exposant", &|l| format!("{:.0}", l.falloff_exp));
+                    hist2("flags", &|l| format!("{:#x}", l.flags));
+                    for (a, l) in all.iter().take(4) {
+                        println!("  ex. {} : {:?}", w.name_of(*a), l);
                     }
                 }
                 // DW_MODEL="nom1,nom2" : détail d'un modèle du jeu (parties, triangles, découpe, fichiers)

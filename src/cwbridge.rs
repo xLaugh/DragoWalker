@@ -56,8 +56,15 @@ pub fn to_binary(dll: &Path, dir: &Path) -> Result<(usize, Vec<String>), String>
 
 /// Convertit des fichiers binaires du jeu en XML (CodeWalker), en une seule fois.
 pub fn to_xml(dll: &Path, pairs: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
+    // déjà converti et à jour (XML plus récent que le fichier d'origine) : pas relu — chaque lancement de
+    // CodeWalker par PowerShell coûte plusieurs secondes et bloquait DragoWalker à chaque test en jeu
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let todo: Vec<&(PathBuf, PathBuf)> = pairs.iter().filter(|(a, b)| !matches!((mtime(a), mtime(b)), (Some(ta), Some(tb)) if tb >= ta)).collect();
+    if todo.is_empty() {
+        return Ok(pairs.len());
+    }
     let list = std::env::temp_dir().join("dragowalker_cw").join("liste.txt");
-    let txt: Vec<String> = pairs.iter().map(|(a, b)| format!("{}|{}", a.display(), b.display())).collect();
+    let txt: Vec<String> = todo.iter().map(|(a, b)| format!("{}|{}", a.display(), b.display())).collect();
     std::fs::write(&list, txt.join("\n")).map_err(|e| e.to_string())?;
     let r = run(&["-Dll", &dll.to_string_lossy(), "-ToXmlList", &list.to_string_lossy()])?;
     Ok(r.iter().filter(|x| x.0).count())

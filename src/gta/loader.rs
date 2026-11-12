@@ -75,6 +75,14 @@ impl ModelSource {
         None
     }
 
+    /// Lumières rangées dans le modèle d'un type d'objet (vide pour les yft).
+    pub fn lights(&self, arch: u32) -> Vec<drawable::GameLight> {
+        match self.find_model(arch) {
+            Some((fi, r, pos)) if !self.vfs.files[fi].name.ends_with(".yft") => drawable::read_lights(&r, pos),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn load(&self, arch: u32, claimed: &Mutex<HashSet<u64>>, ytd_cache: &mut Vec<(u32, Arc<Resource>)>) -> Loaded {
         let mut out = Loaded { arch, model: None, part_keys: Vec::new(), textures: Vec::new() };
         let Some((fi, r, pos)) = self.find_model(arch) else { return out };

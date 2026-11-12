@@ -51,6 +51,15 @@ impl DwApp {
                     self.export_xml(true);
                     ui.close_menu();
                 }
+                if item(ui, true, "Contrôle avant l'export…", "") {
+                    self.check_open = true;
+                    ui.close_menu();
+                }
+                if item(ui, true, "Tester en jeu (serveur local)", "F12") {
+                    self.server.open = true;
+                    self.server_test();
+                    ui.close_menu();
+                }
                 ui.separator();
                 if item(ui, true, "Quitter", "Alt+F4") {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -221,6 +230,9 @@ impl DwApp {
                 if ui.selectable_label(self.ai_open, RichText::new("Assistant IA").strong()).on_hover_text("Fenêtre de l'assistant : décris ce que tu veux construire").clicked() {
                     self.ai_open = !self.ai_open;
                 }
+                if ui.selectable_label(self.server.open, RichText::new("Tester en jeu").strong()).on_hover_text("Serveur FiveM local géré par DragoWalker : tester la map et les MLO en jeu, recharger sans se déconnecter").clicked() {
+                    self.server.open = !self.server.open;
+                }
                 if ui.selectable_label(self.life.open, RichText::new("Vie (PNJ, véhicules)").strong()).on_hover_text("Véhicules garés, parkings, PNJ avec activité ou ronde, circulation sur tes routes").clicked() {
                     self.life.open = !self.life.open;
                     if self.life.open {
@@ -363,7 +375,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![] };
+        self.proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -409,12 +421,17 @@ impl DwApp {
         self.push_undo();
         let yi = self.ensure_target_ymap();
         let mut ids = Vec::new();
+        // les copies d'un groupe posé forment leur propre bloc
+        let mut inst_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for e in self.clipboard.clone() {
             let mut e = e;
             e.id = model::new_id();
             e.game_index = -1;
             e.pos = e.pos + off;
             e.mlo = None;
+            if e.group_inst != 0 {
+                e.group_inst = *inst_map.entry(e.group_inst).or_insert_with(model::new_id);
+            }
             ids.push(e.id);
             self.proj.ymaps[yi].entities.push(e);
         }
@@ -449,6 +466,9 @@ impl DwApp {
             }
             if ui.selectable_label(self.buildings.open, RichText::new("Bâtiments").size(15.0)).on_hover_text("Bâtiments du jeu : les copier pour les poser ailleurs, sur une carte custom (N)").clicked() {
                 self.buildings.open = !self.buildings.open;
+            }
+            if ui.selectable_label(self.groups_open, RichText::new("Groupes").size(15.0)).on_hover_text("Tes groupes d'objets : les poser à la souris (molette = tourner, Maj + molette = quart de tour)").clicked() {
+                self.groups_open = !self.groups_open;
             }
             if ui.selectable_label(self.library.open, RichText::new("Bibliothèque").size(15.0)).on_hover_text("Tous les props du jeu en images, avec aperçu 3D ; clic pour choisir, double-clic pour poser, glisser sur la carte pour poser à cet endroit (B)").clicked() {
                 self.library.open = !self.library.open;
@@ -685,6 +705,15 @@ impl DwApp {
                 let label = if self.isolate_sel.is_some() { "Tout revoir" } else { "Isoler" };
                 if ui.button(RichText::new(label).strong()).on_hover_text("Ne montrer que la sélection (ni carte du jeu, ni terrain) · Échap ou Ctrl+H pour revenir").clicked() {
                     self.toggle_isolate();
+                }
+                if ui.button("Boîte d'occlusion").on_hover_text("Ajoute dans chaque grand bâtiment choisi une boîte (violette) derrière laquelle le jeu ne dessine rien : la ville va plus vite").clicked() {
+                    self.status = self.add_occluders_for_selection();
+                }
+                if ui.button(RichText::new("Faire un groupe").strong()).on_hover_text("Range ces objets ensemble (ton propre bâtiment : station-service, coin de rue…) pour les poser ailleurs à la souris, autant de fois que tu veux").clicked() {
+                    self.group_new = Some(crate::groups::NewGroup::default());
+                }
+                if self.bedit_possible() && ui.button("Éditer ce bâtiment").on_hover_text("Retirer à la main les morceaux qui ne te plaisent pas (bâtiments voisins, restes…) : clic sur un morceau ou rectangle. Seule cette copie change.").clicked() {
+                    self.bedit_start();
                 }
             });
             self.visible_until_ui(ui);

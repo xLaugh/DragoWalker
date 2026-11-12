@@ -32,12 +32,145 @@ pub struct BuildingLib {
     /// liste affichée : morceaux de route du jeu au lieu des bâtiments
     pub roads: bool,
     pub road_list: Option<Vec<Building>>,
+    /// liste affichée : bâtiments complets (tous leurs morceaux ensemble)
+    pub whole: bool,
+    pub whole_list: Option<Vec<WholeBuilding>>,
 }
 
 impl BuildingLib {
     pub fn new() -> BuildingLib {
-        BuildingLib { open: std::env::var("DW_BUILDINGS").is_ok(), filter: std::env::var("DW_BUILDINGS_FILTER").unwrap_or_default(), zone: 0, list: None, chosen: None, roads: std::env::var("DW_ROAD_PIECES").is_ok(), road_list: None }
+        BuildingLib {
+            open: std::env::var("DW_BUILDINGS").is_ok(),
+            filter: std::env::var("DW_BUILDINGS_FILTER").unwrap_or_default(),
+            zone: 0,
+            list: None,
+            chosen: std::env::var("DW_BUILDINGS_CHOSEN").ok().map(|n| crate::gta::crypto::joaat(&n.to_lowercase())),
+            roads: std::env::var("DW_ROAD_PIECES").is_ok(),
+            road_list: None,
+            whole: std::env::var("DW_WHOLE_BUILDINGS").is_ok(),
+            whole_list: None,
+        }
     }
+}
+
+/// Un bâtiment complet : le morceau principal et tout ce que le jeu pose avec lui (détails, rambardes, enseignes,
+/// décalques…), placés les uns par rapport aux autres comme dans la carte d'origine.
+#[derive(Clone)]
+pub struct WholeBuilding {
+    /// morceau principal (le plus grand bâtiment du groupe)
+    pub core: u32,
+    pub name: String,
+    /// (modèle, position et orientation dans le repère du morceau principal, échelles xy et z) ; le principal
+    /// en premier
+    pub parts: Vec<(u32, V3, Quat, f32, f32)>,
+    /// taille de l'ensemble
+    pub size: V3,
+    /// endroit d'origine (morceau principal) et nombre de fois où le jeu le pose
+    pub pos: V3,
+    pub count: usize,
+    pub zone: usize,
+}
+
+/// Morceaux de carte jamais rattachés à un bâtiment complet : sol, routes, eau, versions lointaines, occlusion.
+const NOT_PART: [&str; 15] = ["_lod", "slod", "proxy", "ground", "land", "_rd", "rd_", "road", "water", "occl", "terrain", "grnd", "shadow", "_glue", "_weed"];
+
+/// Marge autour de la boîte du morceau principal pour y rattacher un morceau voisin (m) — **estimé**.
+const WHOLE_TOUCH: f32 = 0.5;
+
+/// Début de nom commun d'un pâté de maisons (« dt1_05 » pour « dt1_05_build1_dtl »).
+fn block_of(name: &str) -> String {
+    name.split('_').take(2).collect::<Vec<_>>().join("_")
+}
+
+/// Bâtiments complets : dans chaque carte du jeu (version détaillée), chaque bâtiment (mêmes règles que la liste
+/// des bâtiments) reçoit les morceaux de la même carte dont le nom commence par le sien (dt1_05_build1_dtl,
+/// …_railing, …_emissive), sinon ceux du même pâté (même début de nom) dont la boîte touche la sienne (à
+/// WHOLE_TOUCH près) et qui ne sont pas plus grands que lui ; un morceau va au bâtiment le plus proche. Ni props, ni
+/// sol, ni routes, ni versions lointaines — **estimé** (le jeu ne dit pas quels morceaux forment un bâtiment).
+pub fn build_whole_list(w: &crate::gta::world::GameWorld) -> Vec<WholeBuilding> {
+    let mut map: std::collections::HashMap<u32, WholeBuilding> = std::collections::HashMap::new();
+    for y in &w.ymaps {
+        // (objet, nom, boîte dans le monde, principal ?)
+        let mut cands: Vec<(usize, String, V3, V3, bool)> = Vec::new();
+        for ei in y.first..(y.first + y.count).min(w.ents.len()) {
+            let e = &w.ents[ei];
+            if e.lod_level != 0 || e.mlo || w.hidden_archs.contains(&e.arch) {
+                continue;
+            }
+            let Some(a) = w.archetypes.get(&e.arch) else { continue };
+            if a.mlo {
+                continue;
+            }
+            let name = w.name_of(e.arch);
+            if is_prop_name(&name) || name.starts_with("hash_") || NOT_PART.iter().any(|k| name.contains(k)) {
+                continue;
+            }
+            let s = a.bb_max - a.bb_min;
+            let core = s.x.max(s.y) >= 12.0 && s.z >= 6.0 && !NOT_BUILDING.iter().any(|k| name.contains(k));
+            let c = w.corners(ei as u32);
+            let (mut mn, mut mx) = (c[0], c[0]);
+            for p in c {
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
+            cands.push((ei, name, mn, mx, core));
+        }
+        let cores: Vec<usize> = (0..cands.len()).filter(|&i| cands[i].4).collect();
+        if cores.is_empty() {
+            continue;
+        }
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); cores.len()];
+        for (i, c) in cands.iter().enumerate() {
+            if c.4 {
+                continue;
+            }
+            // nom qui commence par celui d'un bâtiment (le plus long)
+            let by_name = cores.iter().enumerate().filter(|(_, &k)| c.1.starts_with(&cands[k].1)).max_by_key(|(_, &k)| cands[k].1.len()).map(|(j, _)| j);
+            let chosen = by_name.or_else(|| {
+                let ctr = (c.2 + c.3) * 0.5;
+                let diag = (c.3 - c.2).len();
+                let blk = block_of(&c.1);
+                cores
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &k)| {
+                        let (kmn, kmx) = (cands[k].2 - v3(WHOLE_TOUCH, WHOLE_TOUCH, WHOLE_TOUCH), cands[k].3 + v3(WHOLE_TOUCH, WHOLE_TOUCH, WHOLE_TOUCH));
+                        let touch = c.2.x <= kmx.x && c.3.x >= kmn.x && c.2.y <= kmx.y && c.3.y >= kmn.y && c.2.z <= kmx.z && c.3.z >= kmn.z;
+                        touch && block_of(&cands[k].1) == blk && diag <= (cands[k].3 - cands[k].2).len() * 1.2 && !c.1.contains("decal")
+                    })
+                    .min_by(|(_, &a), (_, &b)| {
+                        let da = ((cands[a].2 + cands[a].3) * 0.5 - ctr).len();
+                        let db = ((cands[b].2 + cands[b].3) * 0.5 - ctr).len();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(j, _)| j)
+            });
+            if let Some(j) = chosen {
+                members[j].push(i);
+            }
+        }
+        for (j, &k) in cores.iter().enumerate() {
+            let (ei, ref name, _, _, _) = cands[k];
+            let e0 = &w.ents[ei];
+            if let Some(b) = map.get_mut(&e0.arch) {
+                b.count += 1;
+                continue;
+            }
+            let inv = e0.rot.inverse();
+            let mut parts = vec![(e0.arch, V3::ZERO, Quat::IDENTITY, e0.sxy, e0.sz)];
+            let (mut mn, mut mx) = (cands[k].2, cands[k].3);
+            for &i in &members[j] {
+                let p = &w.ents[cands[i].0];
+                parts.push((p.arch, inv.rotate(p.pos - e0.pos), inv.mul(p.rot).normalized(), p.sxy, p.sz));
+                mn = mn.min(cands[i].2);
+                mx = mx.max(cands[i].3);
+            }
+            map.insert(e0.arch, WholeBuilding { core: e0.arch, name: name.clone(), parts, size: mx - mn, pos: e0.pos, count: 1, zone: zone_of(name) });
+        }
+    }
+    let mut v: Vec<WholeBuilding> = map.into_values().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
 }
 
 /// Mots des noms de modèles de route du jeu (ss1_rd1_…, id2_rd_r4_03, …) — relevés par la sonde DW_ARCH_GREP.
@@ -165,6 +298,29 @@ impl DwApp {
         self.status = format!("Bâtiment « {name} » copié à {:.0} {:.0} {:.0} (visible jusqu'à {lod:.0} m). À l'export : dépendance vers son .ytyp et collision générée.", at.x, at.y, at.z);
     }
 
+    /// Pose un bâtiment complet : tous ses morceaux, à leur place les uns par rapport aux autres (le principal à
+    /// `at`, orientation 0), sélectionnés ensemble.
+    pub fn whole_place(&mut self, b: &WholeBuilding, at: V3) {
+        let Some(w) = self.game.world.as_ref() else { return };
+        let parts: Vec<(String, V3, Quat, f32, f32, f32)> = b.parts.iter().map(|(h, p, q, sxy, sz)| (w.name_of(*h), *p, *q, *sxy, *sz, w.archetypes.get(h).map(|a| a.lod_dist).unwrap_or(300.0).max(150.0))).collect();
+        self.push_undo();
+        let yi = self.ensure_target_ymap();
+        let mut ids = Vec::new();
+        for (name, p, q, sxy, sz, lod) in parts {
+            let mut e = crate::model::Entity::new(&name, at + p);
+            e.rot = q;
+            e.scale_xy = sxy;
+            e.scale_z = sz;
+            e.lod_dist = lod;
+            ids.push(e.id);
+            self.proj.ymaps[yi].entities.push(e);
+        }
+        let n = ids.len();
+        self.set_selection(ids);
+        self.sync_game_project();
+        self.status = format!("Bâtiment complet « {} » posé : {n} morceau(x), sélectionnés ensemble (déplace-les ou tourne-les d'un bloc). À l'export : dépendances .ytyp et collisions générées.", b.name);
+    }
+
     /// Pose un morceau (de route) du jeu au bout de l'objet sélectionné : même orientation, le long du plus grand
     /// côté de l'objet sélectionné, le bord de départ du nouveau contre le bord d'arrivée de l'ancien (boîtes des
     /// types d'objets du jeu).
@@ -207,21 +363,42 @@ impl DwApp {
         let mut place: Option<(u32, Option<V3>)> = None;
         let mut place_next: Option<u32> = None;
         let mut goto: Option<(V3, f32)> = None;
+        let mut place_whole: Option<(WholeBuilding, Option<V3>)> = None;
         self.show_panel(ctx, "batiments", "Bibliothèque des bâtiments", crate::docking::Dock::Floating, [860.0, 600.0], &mut open, |s, ui| {
                 let Some(w) = s.game.world.as_ref() else {
                     ui.label("Charge d'abord le jeu (onglet Jeu).");
                     return;
                 };
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!s.buildings.roads, RichText::new("Bâtiments").strong()).clicked() {
+                    if ui.selectable_label(!s.buildings.roads && !s.buildings.whole, RichText::new("Bâtiments").strong()).on_hover_text("Chaque modèle du jeu, un par un").clicked() {
                         s.buildings.roads = false;
+                        s.buildings.whole = false;
+                        s.buildings.chosen = None;
+                    }
+                    if ui.selectable_label(s.buildings.whole, RichText::new("Bâtiments complets").strong()).on_hover_text("Chaque bâtiment avec tous ses morceaux (détails, rambardes, enseignes…), posés d'un coup ; seulement des bâtiments").clicked() {
+                        s.buildings.roads = false;
+                        s.buildings.whole = true;
                         s.buildings.chosen = None;
                     }
                     if ui.selectable_label(s.buildings.roads, RichText::new("Morceaux de route du jeu").strong()).on_hover_text("Chaussées, carrefours et virages modelés par Rockstar, à copier et poser bout à bout").clicked() {
                         s.buildings.roads = true;
+                        s.buildings.whole = false;
                         s.buildings.chosen = None;
                     }
                 });
+                if s.buildings.whole {
+                    if s.buildings.whole_list.is_none() {
+                        s.buildings.whole_list = Some(build_whole_list(w));
+                    }
+                    let (p, g) = s.whole_list_ui(ui);
+                    if p.is_some() {
+                        place_whole = p;
+                    }
+                    if g.is_some() {
+                        goto = g;
+                    }
+                    return;
+                }
                 if s.buildings.roads {
                     if s.buildings.road_list.is_none() {
                         s.buildings.road_list = Some(build_road_list(w));
@@ -315,10 +492,90 @@ impl DwApp {
             });
             self.building_place(h, p);
         }
+        if let Some((b, at)) = place_whole {
+            let p = at.unwrap_or_else(|| {
+                let s = self.spawn_pos(&b.name);
+                let z = self.mouse_ground.map(|g| g.z).or_else(|| self.proj.terrain.as_ref().and_then(|t| t.height_at(s.x, s.y))).unwrap_or(s.z);
+                v3(s.x, s.y, z)
+            });
+            self.whole_place(&b, p);
+        }
         if let Some((p, d)) = goto {
             self.game.empty_map = false;
             self.goto(p, d);
         }
+    }
+
+    /// Liste « Bâtiments complets » : recherche, quartiers, aperçu de l'ensemble, pose.
+    /// Rend (bâtiment à poser et où, endroit à aller voir).
+    fn whole_list_ui(&mut self, ui: &mut egui::Ui) -> (Option<(WholeBuilding, Option<V3>)>, Option<(V3, f32)>) {
+        let (mut place, mut goto) = (None, None);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("🔍");
+            ui.add(egui::TextEdit::singleline(&mut self.buildings.filter).hint_text("nom : dt1_05, build, tower…").desired_width(220.0));
+            for (i, (n, _)) in ZONES.iter().enumerate() {
+                let on = self.buildings.zone == i;
+                let b = egui::Button::new(if on { RichText::new(*n).strong().color(Color32::BLACK) } else { RichText::new(*n) }).fill(if on { Color32::from_rgb(120, 190, 255) } else { Color32::from_gray(45) }).corner_radius(10.0);
+                if ui.add(b).clicked() {
+                    self.buildings.zone = i;
+                }
+            }
+        });
+        let f = self.buildings.filter.to_lowercase();
+        let zone = self.buildings.zone;
+        let list = self.buildings.whole_list.take().unwrap_or_default();
+        let idx: Vec<usize> = (0..list.len()).filter(|&i| (zone == 0 || list[i].zone == zone) && (f.is_empty() || list[i].name.contains(&f))).collect();
+        ui.label(RichText::new(format!("{} bâtiments complets · clic : voir · double-clic : poser devant la caméra", idx.len())).small().weak());
+        ui.separator();
+        let mut chosen = self.buildings.chosen;
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(360.0);
+                egui::ScrollArea::vertical().id_salt("bld_whole_list").auto_shrink([false; 2]).max_height(ui.available_height().max(300.0)).show_rows(ui, 22.0, idx.len(), |ui, range| {
+                    for k in range {
+                        let b = &list[idx[k]];
+                        let r = ui.selectable_label(chosen == Some(b.core), format!("{}  ·  {} morceau(x)  ·  {:.0} × {:.0} × {:.0} m", b.name, b.parts.len(), b.size.x, b.size.y, b.size.z));
+                        if r.clicked() {
+                            chosen = Some(b.core);
+                        }
+                        if r.double_clicked() {
+                            place = Some((b.clone(), None));
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                let Some(b) = chosen.and_then(|h| list.iter().find(|b| b.core == h)) else {
+                    ui.label("Choisis un bâtiment dans la liste.");
+                    return;
+                };
+                ui.label(RichText::new(&b.name).strong());
+                ui.label(format!("{} morceau(x) · {:.0} × {:.0} × {:.0} m · {} · posé {} fois dans le jeu", b.parts.len(), b.size.x, b.size.y, b.size.z, ZONES[b.zone].0, b.count));
+                let parts = b.parts.clone();
+                let key = crate::gta::crypto::joaat(&format!("dw_whole_{}", b.name));
+                self.textured_preview_with(ui, key, &b.name, &|w| crate::library::merged_tex_model(w, &parts));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(RichText::new("Poser devant la caméra").strong()).clicked() {
+                        place = Some((b.clone(), None));
+                    }
+                    if ui.button("Poser au centre de la vue").clicked() {
+                        place = Some((b.clone(), Some(self.cam.target)));
+                    }
+                    if ui.button("Aller voir l'original").clicked() {
+                        goto = Some((b.pos, b.size.x.max(b.size.y).max(b.size.z) * 1.6 + 20.0));
+                    }
+                });
+                if let Some(w) = self.game.world.as_ref() {
+                    let names: Vec<String> = b.parts.iter().map(|p| w.name_of(p.0)).collect();
+                    ui.label(RichText::new(format!("Morceaux : {}", names.join(", "))).small().weak());
+                }
+                ui.label(RichText::new("Les morceaux sont posés ensemble et restent sélectionnés : déplace-les ou tourne-les d'un bloc. Si le modèle principal contient aussi un voisin, pose-le puis « Éditer ce bâtiment » pour l'enlever.").small().weak());
+            });
+        });
+        self.buildings.chosen = chosen;
+        self.buildings.whole_list = Some(list);
+        (place, goto)
     }
 
     /// Export : manifeste des dépendances (_manifest.ymf) du projet et collisions des bâtiments du jeu copiés.
@@ -327,7 +584,7 @@ impl DwApp {
         if let Ok(rd) = std::fs::read_dir(stream) {
             for f in rd.flatten() {
                 let n = f.file_name().to_string_lossy().to_lowercase();
-                if (n.starts_with("dw_bcol_") || n.starts_with("_manifest.ymf")) && f.path().is_file() {
+                if (n.starts_with("dw_bcol_") || n.starts_with("_manifest.ymf")) && n.ends_with(".xml") && f.path().is_file() {
                     let _ = std::fs::remove_file(f.path());
                 }
             }
@@ -393,6 +650,7 @@ impl DwApp {
         }
         if self.proj.terrain.is_some() {
             imaps.push(("dw_terrain_placement".into(), false, vec!["dw_terrain_types".into()]));
+            imaps.push(("dw_terrain_lod".into(), false, vec!["dw_terrain_types".into()]));
         }
         let mut ityps: Vec<(String, Vec<String>)> = Vec::new();
         let mut interiors: Vec<String> = Vec::new();

@@ -191,6 +191,8 @@ pub struct GameCtx<'a> {
     pub terrain: Option<(u32, V3, V3, V3)>,
     /// zones d'eau du créateur de terrain (min x, min y, max x, max y, hauteur)
     pub waters: Vec<[f32; 5]>,
+    /// objets en plus à dessiner : (modèle, position, orientation, échelle xy, échelle z)
+    pub extra: Vec<(u32, V3, crate::math::Quat, f32, f32)>,
 }
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -407,8 +409,22 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             bmax: [mx.x, mx.y, mx.z],
         });
     }
+    // objets en plus (aperçu de l'export d'un MLO : façades du jeu modifiées, là où elles seront posées)
+    for (h, p, q, sxy, sz) in &g.extra {
+        gl.want(*h);
+        let (mn, mx) = w.arch_box(*h);
+        insts.push(Inst {
+            arch: *h,
+            m: model_matrix([p.x, p.y, p.z], [q.x, q.y, q.z, q.w], [*sxy, *sxy, *sz]),
+            color: [0.75, 0.7, 0.65],
+            bmin: [mn.x, mn.y, mn.z],
+            bmax: [mx.x, mx.y, mx.z],
+        });
+    }
     // terrain de l'éditeur
     if let (Some((arch, o, mn, mx)), None, None) = (g.terrain, g.isolate, g.only) {
+        // libéré de la carte graphique : renvoyé depuis sa copie en mémoire (gpu.rs custom_src)
+        gl.want(arch);
         insts.push(Inst {
             arch,
             m: model_matrix([o.x, o.y, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),

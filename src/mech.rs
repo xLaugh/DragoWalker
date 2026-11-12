@@ -8,6 +8,16 @@ pub const CAM_FOV: f32 = 1.0;
 pub const CAM_MAX_DIST: f32 = 11000.0;
 pub const CAM_MIN_DIST: f32 = 0.0001;
 pub const CAM_ZOOM_FACTOR: f32 = 1.1;
+/// estimé : en dessous de cette distance à la cible, la molette avance la caméra (vers la souris) au lieu de la
+/// rapprocher encore de la cible
+pub const ZOOM_DOLLY_DIST: f32 = 1.5;
+/// Plan proche le plus petit de la carte graphique : ZNear de CodeWalker (Camera::.ctor 0x06000162, ldc.r4 0.01)
+pub const ZOOM_NEAR_MIN: f32 = 0.01;
+/// Part de l'écart de distance rattrapée à chaque image : ZoomSpeed (Camera::.ctor 0x06000162, ldc.r4 0.1),
+/// appliquée par Camera::UpdateFollow 0x06000166
+pub const CAM_ZOOM_SPEED: f32 = 0.1;
+/// images par seconde auxquelles ZoomSpeed est ramené au temps écoulé (CodeWalker l'applique par image) — estimé
+pub const CAM_ZOOM_SPEED_FPS: f32 = 60.0;
 pub const ORTHO_MAX: f32 = 20000.0;
 pub const ORTHO_MIN: f32 = 1.0;
 /// estimé
@@ -32,6 +42,12 @@ pub const SPAWN_COPY_RADIUS_MULT: f32 = 2.5;
 /// Pas de grille par défaut (réglage SnapGridSize de CodeWalker.exe.config, utilisé par WorldForm::SnapPosition 0x0600027d)
 pub const SNAP_GRID_SIZE: f32 = 10.0;
 pub const ENTITY_FLAGS: u32 = 32;
+/// Bit des drapeaux d'un objet : sa version de loin (parentIndex) est dans la carte parente (CMapData.parent) —
+/// CodeWalker YmapEntityDef::get_LodInParentYmap 0x06002d03 : (flags >> 3) & 1 ; vérifié sur les cartes du jeu.
+pub const LOD_IN_PARENT_YMAP: u32 = 8;
+/// Survol : taille d'une boîte touchée = |max − min| × 0,5 ; la plus petite l'emporte — CodeWalker
+/// WorldForm::UpdateMouseHits(DrawableBase, Archetype, YmapEntityDef) 0x060002ab (IL_05b6–IL_05d4).
+pub const PICK_HALF_DIAG: f32 = 0.5;
 pub const MLO_ENTITY_FLAGS: u32 = 1572872;
 pub const ENTITY_LOD_DIST: f32 = 200.0;
 pub const ENTITY_LOD_LEVEL: &str = "LODTYPES_DEPTH_ORPHANHD";

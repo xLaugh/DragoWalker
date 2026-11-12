@@ -8,10 +8,114 @@ use crate::model::Ymap;
 use crate::xmlio;
 use std::path::{Path, PathBuf};
 
+/// Convertit les XML du dossier stream en fichiers binaires du jeu (CodeWalker) puis range les XML et les dossiers
+/// de textures dans sources_xml. Rend (tout converti sans erreur, compte rendu). Sans DwApp : peut tourner dans un
+/// fil à part.
+pub fn convert_and_tidy(dll: &Path, stream: &Path, out: &Path) -> (bool, Vec<String>) {
+    let mut report = Vec::new();
+    // déjà converti au dernier export : CodeWalker fabrique chaque fichier seulement à partir de son XML et de son
+    // dossier de textures (XmlMeta::GetData 0x06003faf ; GetYdrData 0x06003fb9 / GetYtdData 0x06003fb8 avec le
+    // dossier) ; XML et dossier identiques à ceux rangés dans sources_xml, et binaire présent → binaire gardé
+    let src = out.join("sources_xml");
+    let same_dir = |a: &Path, b: &Path| -> bool {
+        let list = |d: &Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
+            let mut v: Vec<_> = std::fs::read_dir(d).into_iter().flatten().flatten().filter(|e| e.path().is_file()).map(|e| (e.file_name(), std::fs::read(e.path()).unwrap_or_default())).collect();
+            v.sort_by(|x, y| x.0.cmp(&y.0));
+            v
+        };
+        list(a) == list(b)
+    };
+    let mut reused = 0;
+    let parked = std::env::temp_dir().join("dragowalker_cw").join("deja_converti");
+    let _ = std::fs::remove_dir_all(&parked);
+    let _ = std::fs::create_dir_all(&parked);
+    for e in std::fs::read_dir(stream).into_iter().flatten().flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(bin) = name.strip_suffix(".xml") else { continue };
+        let dbg = |why: &str| {
+            if std::env::var("DW_DEBUG_CACHE").is_ok() {
+                println!("   reconverti ({why}) : {name}");
+            }
+        };
+        if !p.is_file() || !stream.join(bin).is_file() {
+            dbg("pas de binaire");
+            continue;
+        }
+        let Ok(prev) = std::fs::read(src.join(&name)) else {
+            dbg("pas d'ancien XML");
+            continue;
+        };
+        if std::fs::read(&p).map(|cur| cur != prev).unwrap_or(true) {
+            if std::env::var("DW_DEBUG_CACHE").is_ok() {
+                println!("   changé : {name}");
+            }
+            continue;
+        }
+        let stem = name.split('.').next().unwrap_or("").to_string();
+        let tex = stream.join(&stem);
+        if tex.is_dir() && !same_dir(&tex, &src.join(&stem)) {
+            dbg("textures changées");
+            continue;
+        }
+        // mis de côté le temps de la conversion des autres, puis rangé avec eux dans sources_xml
+        let _ = std::fs::rename(&p, parked.join(&name));
+        reused += 1;
+    }
+    let result = cwbridge::to_binary(dll, stream);
+    for e in std::fs::read_dir(&parked).into_iter().flatten().flatten() {
+        let _ = std::fs::rename(e.path(), stream.join(e.file_name()));
+    }
+    if reused > 0 {
+        report.push(format!("{reused} fichier(s) inchangé(s) depuis le dernier export, gardés sans reconversion."));
+    }
+    match result {
+        Ok((ok, errs)) => {
+            let binary_ok = errs.is_empty() && (ok > 0 || reused > 0);
+            report.push(format!("{ok} fichier(s) convertis en binaires du jeu par CodeWalker."));
+            for e in errs.iter().take(5) {
+                report.push(format!("Erreur : {e}"));
+            }
+            if binary_ok {
+                // les XML (et dossiers de textures) passent dans « sources_xml »
+                let src = out.join("sources_xml");
+                let _ = std::fs::create_dir_all(&src);
+                if let Ok(rd) = std::fs::read_dir(stream) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let is_xml = p.extension().map(|x| x.eq_ignore_ascii_case("xml")).unwrap_or(false);
+                        if is_xml || p.is_dir() {
+                            let dest = src.join(e.file_name());
+                            if dest.is_dir() {
+                                let _ = std::fs::remove_dir_all(&dest);
+                            }
+                            let _ = std::fs::rename(&p, dest);
+                        }
+                    }
+                }
+            }
+            (binary_ok, report)
+        }
+        Err(e) => {
+            report.push(format!("Conversion en binaires impossible : {e}"));
+            (false, report)
+        }
+    }
+}
+
 impl DwApp {
     /// Ymaps du projet prêts à exporter, avec ce que le fichier d'origine du jeu contenait en plus.
     fn ymaps_for_export(&self, dll: Option<&Path>, report: &mut Vec<String>) -> Vec<Ymap> {
         let mut out: Vec<Ymap> = self.proj.ymaps.iter().filter(|y| !y.sample && (!y.entities.is_empty() || !y.car_gens.is_empty() || y.from_game)).cloned().collect();
+        // test en jeu : parties laissées de côté (cartes d'un MLO, végétation posée au pinceau)
+        let skipped_maps: Vec<String> = self.proj.mlo_res.iter().filter(|r| self.export_skip.contains(&format!("mlo:{}", r.name))).flat_map(|r| r.ymaps.iter().cloned()).collect();
+        out.retain(|y| !skipped_maps.contains(&y.name));
+        if self.export_skip.iter().any(|s| s == "veg") {
+            let veg: std::collections::HashSet<&str> = crate::vegetation::SETS.iter().flat_map(|s| s.props.iter().copied()).collect();
+            for y in out.iter_mut() {
+                y.entities.retain(|e| !veg.contains(e.archetype.to_lowercase().as_str()));
+            }
+        }
         let (Some(dll), Some(w)) = (dll, self.game.world.as_ref()) else {
             if out.iter().any(|y| y.from_game) {
                 report.push("CodeWalker introuvable : les sections d'origine (véhicules, lumières…) des cartes du jeu modifiées ne sont pas reprises.".into());
@@ -29,7 +133,9 @@ impl DwApp {
             }
             if let Some(raw) = w.vfs.raw_resource_file(f) {
                 let bin = tmp.join(format!("{}.ymap", y.name));
-                if std::fs::write(&bin, raw).is_ok() {
+                // même contenu qu'au dernier export : fichier laissé tel quel, pour que sa lecture en XML reste en cache
+                let same = std::fs::read(&bin).map(|old| old == raw).unwrap_or(false);
+                if same || std::fs::write(&bin, raw).is_ok() {
                     pairs.push((bin, tmp.join(format!("{}.orig.ymap.xml", y.name))));
                 }
             }
@@ -67,6 +173,10 @@ impl DwApp {
 
     /// Exporte le projet dans `dir`. Rend le compte rendu affiché à la personne.
     pub fn export_project(&mut self, dir: &Path, fivem: bool) -> String {
+        // marge d'une seconde : précision des dates de fichiers
+        let export_start = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        // intérieurs créés : chaque pièce a son objet « coque » (sol, murs, plafond) avant d'écrire les .ytyp
+        self.ensure_shell_entities();
         let out = if fivem { dir.join(self.proj.name.replace(' ', "_").to_lowercase()) } else { dir.to_path_buf() };
         let stream = if fivem { out.join("stream") } else { out.clone() };
         if let Err(e) = std::fs::create_dir_all(&stream) {
@@ -102,7 +212,10 @@ impl DwApp {
         }
         // les intérieurs des MLO importés sont recopiés tels quels (export_mlos), pas réécrits
         let external = self.mlo_external_ytyps();
-        for t in self.proj.ytyps.iter().filter(|t| !external.contains(&t.name.to_lowercase())) {
+        // test en jeu : .ytyp des MLO laissés de côté
+        let skipped_ytyps: Vec<String> = self.proj.mlo_res.iter().filter(|r| self.export_skip.contains(&format!("mlo:{}", r.name))).flat_map(|r| r.ytyp_files.iter().map(|f| f.0.to_lowercase())).collect();
+        let skip = |k: &str| self.export_skip.iter().any(|s| s == k);
+        for t in self.proj.ytyps.iter().filter(|t| !external.contains(&t.name.to_lowercase()) && !skipped_ytyps.contains(&t.name.to_lowercase())) {
             if std::fs::write(stream.join(format!("{}.ytyp.xml", t.name)), xmlio::write_ytyp(t)).is_ok() {
                 n += 1;
             }
@@ -121,6 +234,11 @@ impl DwApp {
             }
             Ok(_) => {}
             Err(e) => report.push(format!("Export du terrain impossible : {e}")),
+        }
+        if skip("water") {
+            for old in ["dw_water.xml", "dw_water.lua"] {
+                let _ = std::fs::remove_file(out.join(old));
+            }
         }
         // circulation : points de route générés depuis les routes du terrain (nodesNNN.ynd)
         if let Ok(rd) = std::fs::read_dir(&stream) {
@@ -159,40 +277,52 @@ impl DwApp {
             Err(e) => report.push(format!("Export des bâtiments copiés impossible : {e}")),
         }
         // MLO importés : fichiers du créateur, collisions déplacées, crédits
-        let (mlo_report, mlo_manifest) = self.export_mlos(&out, &stream, dll.as_deref());
+        let (mlo_report, mut mlo_manifest) = self.export_mlos(&out, &stream, dll.as_deref());
         report.extend(mlo_report);
-        // conversion en fichiers binaires du jeu par CodeWalker
+        // bâtiments du jeu édités (morceaux retirés à la main) : modèles découpés, types, collisions
+        // intérieurs créés dans DragoWalker : collision (sol de chaque pièce, numéro de pièce)
+        report.extend(self.export_interior_bounds(&stream));
+        // contrôle des intérieurs et compteur de performance (check.rs)
+        report.extend(self.check_report());
+        let (cut_report, cut_manifest) = self.export_cuts(&stream, dll.as_deref());
+        report.extend(cut_report);
+        mlo_manifest += &cut_manifest;
+        // coques des intérieurs créés (shell.rs)
+        let (shell_report, shell_manifest) = self.export_shells(&stream);
+        report.extend(shell_report);
+        mlo_manifest += &shell_manifest;
+        // binaires fabriqués par DragoWalker lors d'un export précédent et qui ne correspondent plus à rien (tuile,
+        // route, collision ou façade disparue) : retirés ; les autres restent, pour être réutilisés s'ils n'ont pas
+        // changé (convert_and_tidy)
+        let res_prefixes: Vec<String> = self.proj.mlo_res.iter().map(|r| r.name.replace(' ', "_").to_lowercase()).flat_map(|r| [format!("{r}_x_"), format!("{r}_exterieur")]).collect();
+        for f in std::fs::read_dir(&stream).into_iter().flatten().flatten() {
+            let n = f.file_name().to_string_lossy().to_lowercase();
+            let ours = ["dw_terrain", "dw_road_", "dw_bcol_", "dw_fx_", "dw_cut", "dw_shell", "_manifest.ymf"].iter().any(|p| n.starts_with(p)) || res_prefixes.iter().any(|p| n.starts_with(p.as_str()));
+            // écrit par cet export (ex. façade copiée en entier, sans XML) : gardé
+            let fresh = f.metadata().and_then(|m| m.modified()).map(|t| t >= export_start).unwrap_or(true);
+            if ours && !fresh && !n.ends_with(".xml") && f.path().is_file() && !stream.join(format!("{}.xml", f.file_name().to_string_lossy())).exists() {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        // conversion en fichiers binaires du jeu par CodeWalker (la partie longue : ≈ 30 s pour une grande map) ;
+        // test en jeu : faite dans un fil à part (server.rs), DragoWalker reste utilisable
         let mut binary_ok = false;
         match &dll {
-            Some(d) => match cwbridge::to_binary(d, &stream) {
-                Ok((ok, errs)) => {
-                    binary_ok = errs.is_empty() && ok > 0;
-                    report.push(format!("{ok} fichier(s) convertis en binaires du jeu par CodeWalker."));
-                    for e in errs.iter().take(5) {
-                        report.push(format!("Erreur : {e}"));
-                    }
-                    if binary_ok {
-                        // les XML (et dossiers de textures) passent dans « sources_xml »
-                        let src = out.join("sources_xml");
-                        let _ = std::fs::create_dir_all(&src);
-                        if let Ok(rd) = std::fs::read_dir(&stream) {
-                            for e in rd.flatten() {
-                                let p = e.path();
-                                let is_xml = p.extension().map(|x| x.eq_ignore_ascii_case("xml")).unwrap_or(false);
-                                if is_xml || p.is_dir() {
-                                    let _ = std::fs::rename(&p, src.join(e.file_name()));
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => report.push(format!("Conversion en binaires impossible : {e}")),
-            },
+            Some(d) if self.export_defer_convert => {
+                self.pending_convert = Some((d.clone(), stream.clone(), out.clone()));
+                binary_ok = true;
+                report.push("Conversion en binaires du jeu en cours (en arrière-plan)…".into());
+            }
+            Some(d) => {
+                let (ok, rep) = convert_and_tidy(d, &stream, &out);
+                binary_ok = ok;
+                report.extend(rep);
+            }
             None => report.push("CodeWalker introuvable : fichiers laissés en XML (indique son dossier dans l'onglet Jeu).".into()),
         }
         if fivem {
             let mut man = String::from("fx_version 'cerulean'\ngame 'gta5'\n\nthis_is_a_map 'yes'\n\nfiles {\n    'stream/*.ytyp'\n}\n\n");
-            for t in &self.proj.ytyps {
+            for t in self.proj.ytyps.iter().filter(|t| !skipped_ytyps.contains(&t.name.to_lowercase())) {
                 man += &format!("data_file 'DLC_ITYP_REQUEST' 'stream/{}.ytyp'\n", t.name);
             }
             if let Some(t) = &terrain_ytyp {
@@ -209,7 +339,7 @@ impl DwApp {
             }
             // voitures de PNJ qui roulent : script client
             let _ = std::fs::remove_file(out.join("dw_traffic.lua"));
-            if let Some(t) = self.proj.terrain.as_ref() {
+            if let Some(t) = self.proj.terrain.as_ref().filter(|_| !skip("traffic")) {
                 match crate::traffic::export_npc_script(t, &out) {
                     Ok(true) => man += "\nclient_script 'dw_traffic.lua'\n",
                     Ok(false) => {}
@@ -217,10 +347,17 @@ impl DwApp {
                 }
             }
             // PNJ : script client
-            match self.export_peds(&out) {
-                Ok(true) => man += "\nclient_script 'dw_peds.lua'\n",
-                Ok(false) => {}
-                Err(e) => report.push(format!("Export des PNJ impossible : {e}")),
+            if skip("peds") {
+                let _ = std::fs::remove_file(out.join("dw_peds.lua"));
+            } else {
+                match self.export_peds(&out) {
+                    Ok(true) => man += "\nclient_script 'dw_peds.lua'\n",
+                    Ok(false) => {}
+                    Err(e) => report.push(format!("Export des PNJ impossible : {e}")),
+                }
+            }
+            if !self.export_skip.is_empty() {
+                report.push(format!("Test en jeu sans : {}.", self.export_skip.join(", ")));
             }
             // eau du terrain : water.xml complet chargé par un script client (native FiveM LoadWaterFromPath)
             if out.join("dw_water.xml").exists() {

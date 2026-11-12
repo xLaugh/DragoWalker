@@ -52,6 +52,71 @@ pub struct MloRes {
     /// cartes du jeu remplacées par la ressource déjà retirées du projet (voir mlo_vanilla_split)
     #[serde(default)]
     pub vanilla_checked: bool,
+    /// choix de la fenêtre « Pièces du MLO » : (nom de fichier en minuscules, pris ou non) ; une pièce absente
+    /// garde son choix par défaut (piece_default)
+    #[serde(default)]
+    pub picks: Vec<(String, bool)>,
+}
+
+/// Sorte de pièce d'une ressource MLO (fenêtre « Pièces du MLO »).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PieceKind {
+    /// modèle du créateur (coque, props…)
+    Model,
+    /// modèle du jeu modifié par le créateur (façade, bâtiment creusé)
+    Facade,
+    /// morceau de route du jeu modifié (« _rd »)
+    Road,
+    /// collision de l'intérieur (même nom que l'intérieur : dans son repère)
+    InteriorCol,
+    /// collision du jeu remplacée (quartier d'origine)
+    GameCol,
+    /// autre collision du créateur (dans le monde)
+    Col,
+}
+
+impl PieceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PieceKind::Model => "Modèle du créateur",
+            PieceKind::Facade => "Façade (bâtiment du jeu modifié)",
+            PieceKind::Road => "Route du jeu modifiée",
+            PieceKind::InteriorCol => "Collision de l'intérieur",
+            PieceKind::GameCol => "Collision du quartier (jeu)",
+            PieceKind::Col => "Collision du créateur",
+        }
+    }
+}
+
+/// Une pièce : fichier du créateur, sa sorte.
+#[derive(Clone, Debug)]
+pub struct Piece {
+    pub path: String,
+    /// nom de fichier en minuscules
+    pub file: String,
+    pub stem: String,
+    pub kind: PieceKind,
+}
+
+/// Choix par défaut d'une pièce. MLO à sa place : tout est pris, comme dans la ressource du créateur. MLO
+/// déplacé : les morceaux de route et les collisions du quartier d'origine ne sont pas pris (ils n'ont rien à
+/// faire au nouvel endroit, la façade reçoit une collision générée) ; le reste l'est — **estimé**.
+pub fn piece_default(kind: PieceKind, moved: bool) -> bool {
+    !moved || !matches!(kind, PieceKind::Road | PieceKind::GameCol)
+}
+
+impl MloRes {
+    /// La pièce est-elle prise à l'export ?
+    pub fn taken(&self, p: &Piece, moved: bool) -> bool {
+        self.picks.iter().find(|x| x.0 == p.file).map(|x| x.1).unwrap_or_else(|| piece_default(p.kind, moved))
+    }
+
+    pub fn set_pick(&mut self, file: &str, v: bool) {
+        match self.picks.iter_mut().find(|x| x.0 == file) {
+            Some(x) => x.1 = v,
+            None => self.picks.push((file.to_string(), v)),
+        }
+    }
 }
 
 /// Nom de fichier qui remplace un fichier du jeu (même nom que dans les archives du jeu) : ces fichiers modifient
@@ -99,6 +164,53 @@ pub struct MloState {
     /// carte graphique à qui les modèles ont été envoyés (adresse), et combien
     pub sent_to: usize,
     pub sent_n: usize,
+    /// fenêtre « Pièces du MLO » ouverte pour ce MLO (nom)
+    pub pieces_open: Option<String>,
+    /// pièce survolée dans cette fenêtre : (image d'egui où elle l'a été, boîtes à surligner : coins, à l'endroit
+    /// d'origine ou non)
+    pub hl: (u64, Vec<([V3; 8], bool)>),
+    /// fenêtre ouverte : voir le MLO seul, tel qu'il sera exporté (case de la fenêtre)
+    pub solo: bool,
+    /// l'isolement en cours a été posé par cette fenêtre (à retirer à sa fermeture)
+    pub solo_owned: bool,
+    /// MLO dont les placements du jeu sont en mémoire : (nom, (fichier, objet du jeu))
+    pub place_cache: (String, Vec<(String, Option<usize>)>),
+    /// pièce sous la souris dans la vue 3D (nom de fichier)
+    pub view_hover: Option<String>,
+    /// pièce cliquée dans la vue : montrée dans la liste
+    pub focus: Option<String>,
+    /// pièces du MLO de la fenêtre : (nom, pièces, jeu chargé quand elles ont été lues)
+    pub pieces_cache: (String, Vec<Piece>, bool),
+}
+
+/// Rayon contre une boîte donnée par ses 8 coins (coin 0, puis +x = 1, +y = 2, +z = 4) : distance d'entrée.
+fn ray_obb(c: &[V3; 8], o: V3, d: V3) -> Option<f32> {
+    let c0 = c[0];
+    let (mut t0, mut t1) = (0.0f32, f32::MAX);
+    for ax in [c[1] - c0, c[2] - c0, c[4] - c0] {
+        let l = ax.len();
+        if l < 1e-6 {
+            continue;
+        }
+        let u = ax * (1.0 / l);
+        let (oo, dd) = ((o - c0).dot(u), d.dot(u));
+        if dd.abs() < 1e-9 {
+            if oo < 0.0 || oo > l {
+                return None;
+            }
+            continue;
+        }
+        let (mut a, mut b) = (-oo / dd, (l - oo) / dd);
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        t0 = t0.max(a);
+        t1 = t1.min(b);
+        if t0 > t1 {
+            return None;
+        }
+    }
+    Some(t0)
 }
 
 const MODEL_EXT: [&str; 3] = ["ydr", "ydd", "yft"];
@@ -508,8 +620,74 @@ pub fn move_ybn_xml(src: &str, mv: Move) -> (String, usize) {
 /// (devanture, trottoir devant la porte, enseignes et rebord du toit).
 pub const FACADE_MARGIN: (f32, f32, f32) = (3.0, 2.0, 6.0);
 
+/// Part des triangles de la façade gardés par la découpe au-dessus de laquelle la version de loin du jeu (bâtiment
+/// entier) lui ressemble assez pour être reprise — **estimé**.
+pub const LOD_KEEP_MIN: f32 = 0.6;
+
+/// Drapeaux d'un objet dont la version de loin est (ou non) dans la carte parente : bit 0x8. CodeWalker
+/// YmapEntityDef::get_LodInParentYmap 0x06002d03 ((flags >> 3) & 1) ; YmapFile::EnsureEntities 0x06002cb0 ne
+/// cherche pas le parent dans la même carte quand il est mis, et EnsureChildYmaps 0x06002cc2 / ConnectToParent
+/// 0x06002cc3 le relient alors à l'objet parentIndex de la carte parente. Relevé dans les cartes du jeu
+/// (sonde DW_LODFLAGS) : 3 270 objets sur 3 270 avec un parent dans la carte parente ont ce bit, 0 sur 1 031 avec
+/// un parent dans la même carte, 0 sur 16 406 sans parent.
+pub fn lod_in_parent_flags(flags: u32, in_parent: bool) -> u32 {
+    if in_parent {
+        flags | crate::mech::LOD_IN_PARENT_YMAP
+    } else {
+        flags & !crate::mech::LOD_IN_PARENT_YMAP
+    }
+}
+
+/// Carte (.ymap XML) écrite à la main : nom, parente, flags, contentFlags, (streaming min, max), (objets min, max),
+/// objets déjà en XML.
+fn raw_ymap(name: &str, parent: &str, flags: u32, content: u32, stream_ext: (V3, V3), ent_ext: (V3, V3), ents: &str) -> String {
+    let vx = |n: &str, p: V3| format!(" <{n} x=\"{}\" y=\"{}\" z=\"{}\" />\n", p.x, p.y, p.z);
+    let parent = if parent.is_empty() { " <parent />\n".to_string() } else { format!(" <parent>{parent}</parent>\n") };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>{name}</name>\n{parent} <flags value=\"{flags}\" />\n <contentFlags value=\"{content}\" />\n{}{}{}{} <entities>\n{ents} </entities>\n <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>{name}</name>\n  <exportedBy>DragoWalker</exportedBy>\n  <owner />\n  <time />\n </block>\n</CMapData>\n",
+        vx("streamingExtentsMin", stream_ext.0),
+        vx("streamingExtentsMax", stream_ext.1),
+        vx("entitiesExtentsMin", ent_ext.0),
+        vx("entitiesExtentsMax", ent_ext.1)
+    )
+}
+
+/// Ajoute « cette carte dépend de ces .ytyp » au _manifest.ymf.xml écrit par DragoWalker (export_buildings) ;
+/// faux s'il n'y en a pas.
+fn add_manifest_imap(stream: &Path, imap: &str, ityps: &[String]) -> bool {
+    let path = stream.join("_manifest.ymf.xml");
+    let Ok(s) = std::fs::read_to_string(&path) else { return false };
+    if ityps.is_empty() || s.contains(&format!("<imapName>{imap}</imapName>")) {
+        return true;
+    }
+    let mut item = format!("    <Item>\n      <imapName>{imap}</imapName>\n      <manifestFlags/>\n      <itypDepArray>\n");
+    for t in ityps {
+        item += &format!("        <Item>{t}</Item>\n");
+    }
+    item += "      </itypDepArray>\n    </Item>\n";
+    let s = if s.contains("<imapDependencies_2/>") {
+        s.replacen("<imapDependencies_2/>", &format!("<imapDependencies_2>\n{item}  </imapDependencies_2>"), 1)
+    } else if s.contains("</imapDependencies_2>") {
+        s.replacen("  </imapDependencies_2>", &format!("{item}  </imapDependencies_2>"), 1)
+    } else {
+        return false;
+    };
+    std::fs::write(&path, s).is_ok()
+}
+
 fn first_f32s(line: &str, n: usize) -> Vec<f32> {
     line.split_whitespace().take(n).filter_map(|s| s.parse().ok()).collect()
+}
+
+/// Drapeau d'un niveau de détail d'après le nom de sa liste de modèles (DrawableBase::ReadXml 0x06004b94).
+fn lod_flags_tag(list: &str) -> Option<&'static str> {
+    match list {
+        "DrawableModelsHigh" => Some("FlagsHigh"),
+        "DrawableModelsMedium" => Some("FlagsMed"),
+        "DrawableModelsLow" => Some("FlagsLow"),
+        "DrawableModelsVeryLow" => Some("FlagsVlow"),
+        _ => None,
+    }
 }
 
 /// Découpe un modèle au format XML de CodeWalker (YdrXml) : dans chaque partie (Geometries / Item), garde les
@@ -623,6 +801,10 @@ pub fn crop_ydr_xml(src: &str, keep: &dyn Fn(V3) -> bool, new_name: &str) -> Opt
             *o = None;
         }
     }
+    // niveaux de détail vidés : leur drapeau passe à 0, comme dans les fichiers du jeu pour un niveau absent
+    // (CodeWalker relit FlagsHigh/Med/Low/Vlow tels quels : DrawableBase::ReadXml 0x06004b94, IL_00d0–IL_011f ;
+    // listes DrawableModelsHigh/Medium/Low/VeryLow, IL_01af–IL_01f1)
+    let mut emptied: Vec<&str> = Vec::new();
     for k in 0..lines.len() {
         let t = lines[k].trim();
         if !(t.starts_with("<DrawableModels") && t.ends_with('>') && !t.ends_with("/>")) || out[k].is_none() {
@@ -633,6 +815,9 @@ pub fn crop_ydr_xml(src: &str, keep: &dyn Fn(V3) -> bool, new_name: &str) -> Opt
         if !(k + 1..end).any(|j| out[j].is_some() && lines[j].trim() == "<Item>") {
             for o in out.iter_mut().take(end + 1).skip(k) {
                 *o = None;
+            }
+            if let Some(f) = lod_flags_tag(tag) {
+                emptied.push(f);
             }
         }
     }
@@ -652,6 +837,8 @@ pub fn crop_ydr_xml(src: &str, keep: &dyn Fn(V3) -> bool, new_name: &str) -> Opt
             out[k] = Some(format!("{pad}<BoundingBoxMin x=\"{}\" y=\"{}\" z=\"{}\" />", all_mn.x, all_mn.y, all_mn.z));
         } else if t.starts_with("<BoundingBoxMax ") {
             out[k] = Some(format!("{pad}<BoundingBoxMax x=\"{}\" y=\"{}\" z=\"{}\" />", all_mx.x, all_mx.y, all_mx.z));
+        } else if let Some(f) = emptied.iter().find(|f| t.starts_with(&format!("<{f} "))) {
+            out[k] = Some(format!("{pad}<{f} value=\"0\" />"));
         }
     }
     let mut s: String = out.into_iter().flatten().collect::<Vec<_>>().join("\n");
@@ -950,6 +1137,111 @@ impl DwApp {
         self.proj.mlo_res.iter().flat_map(|r| r.ytyp_files.iter().filter(|f| !f.1.is_empty() && Path::new(&f.1).is_file()).map(|f| f.0.to_lowercase())).collect()
     }
 
+    /// Hachages des intérieurs définis par les .ytyp de la ressource (une collision du même nom est celle de
+    /// l'intérieur, dans son repère).
+    fn mlo_hashes(&self, r: &MloRes) -> std::collections::HashSet<u32> {
+        self.proj
+            .ytyps
+            .iter()
+            .filter(|t| r.ytyp_files.iter().any(|f| f.0.eq_ignore_ascii_case(&t.name)))
+            .flat_map(|t| t.mlos.iter())
+            .map(|m| {
+                let n = m.name.to_lowercase();
+                n.strip_prefix("hash_").and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| crate::gta::crypto::joaat(&n))
+            })
+            .collect()
+    }
+
+    /// Pièces d'une ressource MLO : ses modèles et ses collisions, rangés par sorte.
+    pub fn mlo_pieces(&self, r: &MloRes) -> Vec<Piece> {
+        let w = self.game.world.as_deref();
+        let hashes = self.mlo_hashes(r);
+        let mut out = Vec::new();
+        for a in r.assets.iter().chain(r.ybns.iter()) {
+            let p = Path::new(a);
+            let ext = ext_of(p);
+            let stem = stem_of(p);
+            let file = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let vanilla = is_vanilla_name(w, &file);
+            let kind = if ext == "ybn" {
+                if hashes.contains(&crate::gta::crypto::joaat(&stem)) {
+                    PieceKind::InteriorCol
+                } else if vanilla {
+                    PieceKind::GameCol
+                } else {
+                    PieceKind::Col
+                }
+            } else if MODEL_EXT.contains(&ext.as_str()) {
+                if !vanilla {
+                    PieceKind::Model
+                } else if stem.contains("_rd") {
+                    PieceKind::Road
+                } else {
+                    PieceKind::Facade
+                }
+            } else {
+                continue;
+            };
+            out.push(Piece { path: a.clone(), file, stem, kind });
+        }
+        out.sort_by(|a, b| (a.kind as u8, &a.file).cmp(&(b.kind as u8, &b.file)));
+        out
+    }
+
+    /// Intérieur à l'endroit d'origine : (centre, rayon, boîte dans le repère de l'intérieur).
+    fn mlo_sphere(&self, r: &MloRes) -> (V3, f32, Option<(V3, V3)>) {
+        let inst = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.id == r.ref_id);
+        let mlo_box = inst.and_then(|e| self.proj.find_mlo(&e.archetype)).map(|m| (m.bb_min(), m.bb_max()));
+        match mlo_box {
+            Some((a, b)) => (r.ref_pos + r.ref_rot.rotate((a + b) * 0.5), (b - a).len() * 0.5, mlo_box),
+            None => (r.ref_pos, 20.0, None),
+        }
+    }
+
+    /// Placement du jeu d'un modèle du jeu modifié par le créateur : celui qui est le plus proche de l'intérieur
+    /// (à l'endroit d'origine), s'il touche l'intérieur (sphères qui se chevauchent, + 5 m) — **estimé**.
+    fn mlo_game_placement(&self, r: &MloRes, stem: &str) -> Option<usize> {
+        let w = self.game.world.as_deref()?;
+        let (c_mlo, r_mlo, _) = self.mlo_sphere(r);
+        let h = crate::gta::crypto::joaat(stem);
+        let arch = w.archetypes.get(&h)?;
+        let ac = (arch.bb_min + arch.bb_max) * 0.5;
+        let ar = (arch.bb_max - arch.bb_min).len() * 0.5;
+        let (ei, e) = w.ents.iter().enumerate().filter(|(_, e)| e.arch == h).min_by(|x, y| x.1.pos.dist2d(c_mlo).partial_cmp(&y.1.pos.dist2d(c_mlo)).unwrap_or(std::cmp::Ordering::Equal))?;
+        ((e.pos + e.rot.rotate(ac) - c_mlo).len() <= r_mlo + ar + 5.0).then_some(ei)
+    }
+
+    /// Boîtes à surligner pour une pièce : (coins, true = à l'endroit d'origine).
+    fn piece_boxes(&self, r: &MloRes, p: &Piece) -> Vec<([V3; 8], bool)> {
+        let mv = self.mlo_move(r);
+        let mut out = Vec::new();
+        match p.kind {
+            PieceKind::Facade | PieceKind::Road => {
+                if let (Some(w), Some(ei)) = (self.game.world.as_deref(), self.mlo_game_placement(r, &p.stem)) {
+                    let c = w.corners(ei as u32);
+                    out.push((c, true));
+                    if !mv.is_identity() {
+                        out.push((c.map(|v| mv.point(v)), false));
+                    }
+                }
+            }
+            PieceKind::Model => {
+                for y in self.proj.ymaps.iter().filter(|y| r.ymaps.contains(&y.name)) {
+                    for e in y.entities.iter().filter(|e| e.archetype.eq_ignore_ascii_case(&p.stem)) {
+                        out.push((e.corners(&self.proj), false));
+                    }
+                }
+            }
+            PieceKind::InteriorCol => {
+                if let Some(e) = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.id == r.ref_id) {
+                    out.push((e.corners(&self.proj), false));
+                }
+            }
+            PieceKind::GameCol | PieceKind::Col => {}
+        }
+        out
+    }
+
     /// Déplacement subi par un MLO depuis son import (d'après son objet de référence).
     pub fn mlo_move(&self, r: &MloRes) -> Move {
         let cur = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.id == r.ref_id);
@@ -968,9 +1260,43 @@ impl DwApp {
         let ours_ymf = stream.join("_manifest.ymf.xml").exists() || stream.join("_manifest.ymf").exists();
         let w = self.game.world.as_deref();
         for r in &self.proj.mlo_res {
+            // test en jeu : MLO laissé de côté — ses fichiers d'un export précédent sont retirés du dossier stream
+            if self.export_skip.contains(&format!("mlo:{}", r.name)) {
+                let res_low = r.name.replace(' ', "_").to_lowercase();
+                let mut names: Vec<String> = r.assets.iter().chain(r.ybns.iter()).filter_map(|a| Path::new(a).file_name().map(|n| n.to_string_lossy().to_lowercase())).collect();
+                names.extend(r.ytyp_files.iter().map(|f| format!("{}.ytyp", f.0.to_lowercase())));
+                names.extend(r.ymaps.iter().map(|y| format!("{}.ymap", y.to_lowercase())));
+                // (le _manifest.ymf de DragoWalker, écrit juste avant, n'est pas à lui)
+                names.retain(|n| n != "_manifest.ymf");
+                names.push(format!("{res_low}_manifest.ymf"));
+                for f in std::fs::read_dir(stream).into_iter().flatten().flatten() {
+                    let n = f.file_name().to_string_lossy().to_lowercase();
+                    let base = n.trim_end_matches(".xml").to_string();
+                    if f.path().is_file() && (names.contains(&base) || n.starts_with(&format!("{res_low}_x_")) || n.starts_with(&format!("{res_low}_exterieur"))) {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+                report.push(format!("MLO « {} » laissé de côté pour ce test.", r.name));
+                continue;
+            }
             let mut copied = 0;
             let mv = self.mlo_move(r);
             let moved_mlo = !mv.is_identity();
+            let res_low = r.name.replace(' ', "_").to_lowercase();
+            // copies (façade, collisions renommées, version de loin) d'un export précédent : réécrites plus bas
+            if let Ok(rd) = std::fs::read_dir(stream) {
+                for f in rd.flatten() {
+                    let n = f.file_name().to_string_lossy().to_lowercase();
+                    if (n.starts_with(&format!("{res_low}_x_")) || n.starts_with(&format!("{res_low}_exterieur"))) && n.ends_with(".xml") && f.path().is_file() {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+            // pièces décochées dans la fenêtre « Pièces du MLO » : pas mises (restes d'un export précédent retirés)
+            let pieces = self.mlo_pieces(r);
+            let left_out: Vec<&Piece> = pieces.iter().filter(|p| !r.taken(p, moved_mlo)).collect();
+            let is_left = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase()).map(|n| left_out.iter().any(|x| x.file == n)).unwrap_or(false);
+            let mut unticked: Vec<String> = Vec::new();
             // fichiers qui remplacent des fichiers du jeu (quartier creusé, collision et occlusion du quartier) :
             // ils modifient la carte du jeu à l'endroit d'origine ; si le MLO a été déplacé, ils n'ont plus rien à y
             // faire (ils laisseraient un trou là-bas et, déplacés, des murs invisibles ici) : on ne les met pas
@@ -979,6 +1305,11 @@ impl DwApp {
             for a in &r.assets {
                 let p = Path::new(a);
                 let Some(fname) = p.file_name() else { continue };
+                if is_left(p) && !(moved_mlo && vanilla(p)) {
+                    unticked.push(fname.to_string_lossy().to_string());
+                    let _ = std::fs::remove_file(stream.join(fname));
+                    continue;
+                }
                 if moved_mlo && vanilla(p) {
                     skipped.push(fname.to_string_lossy().to_string());
                     // reste d'un export précédent dans ce dossier : retiré, sinon FiveM le chargerait encore
@@ -1003,25 +1334,26 @@ impl DwApp {
             // est dans le repère de l'intérieur — relevé sur ma_diner_mlo.ybn : centre (-5,7 ; 0,4 ; 2,4) pour un
             // intérieur posé en (1137 ; -968 ; 45,75) — le jeu la place avec lui : recopiée sans la toucher. Celles du
             // jeu remplacées : voir plus haut. Les autres sont dans le monde : déplacées comme le MLO.
-            let mlo_hashes: std::collections::HashSet<u32> = self
-                .proj
-                .ytyps
-                .iter()
-                .filter(|t| r.ytyp_files.iter().any(|f| f.0.eq_ignore_ascii_case(&t.name)))
-                .flat_map(|t| t.mlos.iter())
-                .map(|m| {
-                    let n = m.name.to_lowercase();
-                    n.strip_prefix("hash_").and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| crate::gta::crypto::joaat(&n))
-                })
-                .collect();
+            let mlo_hashes = self.mlo_hashes(r);
             let mut moved = 0;
             let mut interior_cols = 0;
-            let mut to_move: Vec<&String> = Vec::new();
+            // (collision, nom du fichier écrit) : une collision du quartier d'origine cochée garde son contenu mais
+            // pas son nom du jeu (elle remplacerait celle du jeu là-bas) : « <ressource>_x_<nom> »
+            let mut to_move: Vec<(&String, String)> = Vec::new();
             for b in &r.ybns {
                 let p = Path::new(b);
                 let Some(fname) = p.file_name() else { continue };
                 let interior = mlo_hashes.contains(&crate::gta::crypto::joaat(&stem_of(p)));
-                if moved_mlo && vanilla(p) && !interior {
+                if is_left(p) && !(moved_mlo && vanilla(p) && !interior) {
+                    unticked.push(fname.to_string_lossy().to_string());
+                    let _ = std::fs::remove_file(stream.join(fname));
+                    continue;
+                }
+                if moved_mlo && vanilla(p) && !interior && r.picks.iter().any(|x| x.1 && x.0 == fname.to_string_lossy().to_lowercase()) {
+                    // reste d'un export précédent sous le nom du jeu : retiré
+                    let _ = std::fs::remove_file(stream.join(fname));
+                    to_move.push((b, format!("{res_low}_x_{}", stem_of(p))));
+                } else if moved_mlo && vanilla(p) && !interior {
                     skipped.push(fname.to_string_lossy().to_string());
                     // reste d'un export précédent dans ce dossier : retiré, sinon FiveM le chargerait encore
                     let _ = std::fs::remove_file(stream.join(fname));
@@ -1031,19 +1363,19 @@ impl DwApp {
                         interior_cols += interior as usize;
                     }
                 } else {
-                    to_move.push(b);
+                    to_move.push((b, stem_of(p)));
                 }
             }
             if !to_move.is_empty() {
                 let tmp = std::env::temp_dir().join("dragowalker_cw").join("mlo_ybn");
                 let _ = std::fs::create_dir_all(&tmp);
-                let pairs: Vec<(PathBuf, PathBuf)> = to_move.iter().map(|b| (PathBuf::from(b), tmp.join(format!("{}.ybn.xml", stem_of(Path::new(b)))))).collect();
+                let pairs: Vec<(PathBuf, PathBuf)> = to_move.iter().map(|(b, _)| (PathBuf::from(b), tmp.join(format!("{}.ybn.xml", stem_of(Path::new(b)))))).collect();
                 let ok = dll.map(|d| crate::cwbridge::to_xml(d, &pairs).is_ok()).unwrap_or(false);
-                for (b, x) in &pairs {
+                for ((b, x), (_, out_name)) in pairs.iter().zip(to_move.iter()) {
                     match std::fs::read_to_string(x).ok().filter(|_| ok) {
                         Some(src) => {
                             let (moved_xml, unturned) = move_ybn_xml(&src, mv);
-                            if std::fs::write(stream.join(format!("{}.ybn.xml", stem_of(b))), moved_xml).is_ok() {
+                            if std::fs::write(stream.join(format!("{out_name}.ybn.xml")), moved_xml).is_ok() {
                                 moved += 1;
                             }
                             if unturned > 0 {
@@ -1060,19 +1392,14 @@ impl DwApp {
                 }
             }
             // façade (modèle du jeu modifié) recopiée sous un nouveau nom à côté de l'intérieur déplacé
-            let res_low = r.name.replace(' ', "_").to_lowercase();
-            if let Ok(rd) = std::fs::read_dir(stream) {
-                for f in rd.flatten() {
-                    let n = f.file_name().to_string_lossy().to_lowercase();
-                    if (n.starts_with(&format!("{res_low}_x_")) || n.starts_with(&format!("{res_low}_exterieur."))) && f.path().is_file() {
-                        let _ = std::fs::remove_file(f.path());
-                    }
-                }
-            }
             if moved_mlo {
-                let (rep, lines) = self.export_mlo_exterior(r, mv, stream, dll);
+                let chosen: Vec<&Piece> = pieces.iter().filter(|p| matches!(p.kind, PieceKind::Facade | PieceKind::Road) && r.taken(p, true)).collect();
+                let (rep, lines) = self.export_mlo_exterior(r, mv, stream, dll, &chosen);
                 report.extend(rep);
                 man += &lines;
+            }
+            if !unticked.is_empty() {
+                report.push(format!("MLO « {} » : {} pièce(s) décochée(s) non mise(s) ({}).", r.name, unticked.len(), unticked.join(", ")));
             }
             if !skipped.is_empty() {
                 report.push(format!(
@@ -1144,21 +1471,27 @@ impl DwApp {
     /// MLO a été déplacé, au même décalage qu'à l'origine (placement du jeu de ce modèle le plus proche du MLO,
     /// déplacé comme lui). Type d'objet : boîte, distance d'affichage, drapeaux et dictionnaire de textures du type
     /// du jeu. Collision générée depuis le modèle du créateur, comme pour les bâtiments copiés (buildings.rs).
-    /// Gardés : les .ydr / .yft remplacés dont le placement d'origine touche l'intérieur (sphères qui se
-    /// chevauchent), hors routes (« _rd ») — **estimé**.
+    /// Gardés : les .ydr / .yft remplacés cochés dans « Pièces du MLO » (par défaut les façades, pas les routes
+    /// « _rd ») dont le placement d'origine touche l'intérieur (sphères qui se chevauchent) — **estimé**.
+    /// Version de loin : celle du jeu (parent LOD du placement d'origine, lods.rs) déplacée comme la façade, dans
+    /// une carte « <ressource>_exterieur_lod » parente, si ce parent ne sert qu'à ce bâtiment et que la découpe a
+    /// gardé au moins LOD_KEEP_MIN des triangles ; sinon la façade reste affichée jusqu'à la distance de ce parent
+    /// (1 500 m au plus).
     /// Rend (compte rendu, lignes du fxmanifest).
-    fn export_mlo_exterior(&self, r: &MloRes, mv: Move, stream: &Path, dll: Option<&Path>) -> (Vec<String>, String) {
+    fn export_mlo_exterior(&self, r: &MloRes, mv: Move, stream: &Path, dll: Option<&Path>, chosen: &[&Piece]) -> (Vec<String>, String) {
         let mut report = Vec::new();
         let Some(w) = self.game.world.as_deref() else {
             return (vec![format!("Façade du MLO « {} » non copiée : charge le jeu avant d'exporter (il faut le placement d'origine).", r.name)], String::new());
         };
-        // intérieur à l'endroit d'origine : centre et rayon, boîte (repère de l'intérieur)
-        let inst = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.id == r.ref_id);
-        let mlo_box = inst.and_then(|e| self.proj.find_mlo(&e.archetype)).map(|m| (m.bb_min(), m.bb_max()));
-        let (c_mlo, r_mlo) = match mlo_box {
-            Some((a, b)) => (r.ref_pos + r.ref_rot.rotate((a + b) * 0.5), (b - a).len() * 0.5),
-            None => (r.ref_pos, 20.0),
-        };
+        // intérieur à l'endroit d'origine : boîte (repère de l'intérieur)
+        let (_, _, mlo_box) = self.mlo_sphere(r);
+        // versions de loin copiées (carte « _lod ») : entités XML, coins, distance la plus grande
+        let mut lod_ents = String::new();
+        let mut n_lod = 0i32;
+        let (mut lmn, mut lmx) = (v3(3.0e38, 3.0e38, 3.0e38), v3(-3.0e38, -3.0e38, -3.0e38));
+        let mut lod_far = 0.0f32;
+        let mut lod_ytyps: Vec<String> = Vec::new();
+        let mut lod_notes: Vec<String> = Vec::new();
         // partie du bâtiment gardée : dans la boîte de l'intérieur, élargie de FACADE_MARGIN sur les côtés, en
         // dessous et au-dessus (enseignes, toit)
         let inside = |world: V3| -> bool {
@@ -1175,22 +1508,21 @@ impl DwApp {
         let (mut emn, mut emx) = (v3(big, big, big), v3(-big, -big, -big));
         let mut lod_max = 0.0f32;
         let mut done = Vec::new();
-        for a in &r.assets {
-            let p = Path::new(a);
+        for piece in chosen {
+            let p = Path::new(&piece.path);
             let ext = ext_of(p);
-            let stem = stem_of(p);
-            if !(ext == "ydr" || ext == "yft") || stem.contains("_rd") || !is_vanilla_name(Some(w), &format!("{stem}.{ext}")) {
+            let stem = piece.stem.clone();
+            if !(ext == "ydr" || ext == "yft") {
                 continue;
             }
             let h = crate::gta::crypto::joaat(&stem);
             let Some(arch) = w.archetypes.get(&h) else { continue };
-            let ac = (arch.bb_min + arch.bb_max) * 0.5;
-            let ar = (arch.bb_max - arch.bb_min).len() * 0.5;
-            // placement du jeu de ce modèle le plus proche de l'intérieur
-            let Some(e) = w.ents.iter().filter(|e| e.arch == h).min_by(|x, y| x.pos.dist2d(c_mlo).partial_cmp(&y.pos.dist2d(c_mlo)).unwrap_or(std::cmp::Ordering::Equal)) else { continue };
-            if (e.pos + e.rot.rotate(ac) - c_mlo).len() > r_mlo + ar + 5.0 {
+            // placement du jeu de ce modèle le plus proche de l'intérieur, s'il le touche
+            let Some(ei) = self.mlo_game_placement(r, &stem) else {
+                report.push(format!("Pièce {stem} du MLO « {} » cochée mais trop loin de l'intérieur : non copiée.", r.name));
                 continue;
-            }
+            };
+            let e = &w.ents[ei];
             let Some(model) = self.mlo_state.models.iter().find(|m| m.0 == h).map(|m| &m.1) else {
                 report.push(format!("Façade {stem} du MLO « {} » illisible : non copiée.", r.name));
                 continue;
@@ -1201,12 +1533,14 @@ impl DwApp {
             let orig = |v: V3| e.pos + e.rot.rotate(v.mulv(s));
             // seulement le bâtiment concerné : modèle relu en XML par CodeWalker, parties hors de la zone retirées
             let mut cropped: Option<(V3, V3)> = None;
+            // part des triangles gardés par la découpe (1 = bâtiment entier)
+            let mut kept_ratio = 1.0f32;
             if ext == "ydr" && mlo_box.is_some() {
                 if let Some(d) = dll {
                     let tmp = std::env::temp_dir().join("dragowalker_cw").join("mlo_ext").join(&res);
                     let _ = std::fs::create_dir_all(&tmp);
+                    // relu une seule fois (cache de cwbridge::to_xml : XML plus récent que le .ydr)
                     let x = tmp.join(format!("{stem}.ydr.xml"));
-                    let _ = std::fs::remove_file(&x);
                     if crate::cwbridge::to_xml(d, &[(p.to_path_buf(), x.clone())]).is_ok() {
                         if let Some((xml, mn, mx, kept, total)) = std::fs::read_to_string(&x).ok().and_then(|src| crop_ydr_xml(&src, &|v| inside(orig(v)), &new)) {
                             if std::fs::write(stream.join(format!("{new}.ydr.xml")), xml).is_ok() {
@@ -1217,6 +1551,7 @@ impl DwApp {
                                     let _ = std::fs::copy(f.path(), tdir.join(f.file_name()));
                                 }
                                 cropped = Some((mn, mx));
+                                kept_ratio = kept as f32 / total.max(1) as f32;
                                 report.push(format!("Façade {stem} : {kept} triangle(s) gardé(s) sur {total} (seulement le bâtiment du MLO)."));
                             }
                         }
@@ -1225,13 +1560,77 @@ impl DwApp {
             }
             if cropped.is_none() {
                 report.push(format!("Façade {stem} copiée en entier (découpe impossible{})", if dll.is_none() { " : CodeWalker introuvable" } else { "" }));
-                if std::fs::copy(p, stream.join(format!("{new}.{ext}"))).is_err() {
+                let dest = stream.join(format!("{new}.{ext}"));
+                if std::fs::copy(p, &dest).is_err() {
                     continue;
+                }
+                // la copie garde la date du fichier d'origine : date du jour, pour que le nettoyage des anciens
+                // binaires de l'export (export_project) la reconnaisse comme écrite maintenant
+                if let Ok(f) = std::fs::File::options().write(true).open(&dest) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
                 }
             }
             let pos = mv.point(e.pos);
             let rot = mv.q.mul(e.rot).normalized();
-            let lod = e.lod_dist.max(arch.lod_dist).max(150.0);
+            let mut lod = e.lod_dist.max(arch.lod_dist).max(150.0);
+            // version de loin du jeu (parent LOD du placement d'origine)
+            let mut parent_index = -1i32;
+            let mut lod_level = "LODTYPES_DEPTH_ORPHANHD";
+            if let Some(pi) = w.lod_parent(ei) {
+                let pe = &w.ents[pi];
+                let lname = w.name_of(pe.arch);
+                if pe.nchild == 1 && kept_ratio >= LOD_KEEP_MIN {
+                    // les niveaux au-dessus (SLOD) sont communs au quartier : pas copiés ; la version de loin reste
+                    // affichée jusqu'à la distance du plus haut d'entre eux (3 000 m au plus), comme lods.rs
+                    let mut far = pe.lod_dist;
+                    let mut up = w.lod_parent(pi);
+                    let mut guard = 0;
+                    while let Some(q) = up {
+                        far = far.max(w.ents[q].lod_dist);
+                        up = w.lod_parent(q);
+                        guard += 1;
+                        if guard > 6 {
+                            break;
+                        }
+                    }
+                    let far = far.min(3000.0);
+                    let lp = mv.point(pe.pos);
+                    let lq = mv.q.mul(pe.rot).normalized();
+                    let lfq = lq.inverse().normalized();
+                    lod_ents += &format!(
+                        "  <Item type=\"CEntityDef\">\n   <archetypeName>{lname}</archetypeName>\n   <flags value=\"{}\" />\n   <guid value=\"0\" />\n   <position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <rotation x=\"{}\" y=\"{}\" z=\"{}\" w=\"{}\" />\n   <scaleXY value=\"{}\" />\n   <scaleZ value=\"{}\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{far}\" />\n   <childLodDist value=\"{}\" />\n   <lodLevel>LODTYPES_DEPTH_LOD</lodLevel>\n   <numChildren value=\"1\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
+                        crate::mech::ENTITY_FLAGS,
+                        lp.x, lp.y, lp.z, lfq.x, lfq.y, lfq.z, lfq.w, pe.sxy, pe.sz,
+                        if pe.child_lod_dist > 0.0 { pe.child_lod_dist } else { e.lod_dist }
+                    );
+                    let (amn, amx) = w.arch_box(pe.arch);
+                    let ls = v3(pe.sxy, pe.sxy, pe.sz);
+                    for i in 0..8 {
+                        let k = v3(if i & 1 == 0 { amn.x } else { amx.x }, if i & 2 == 0 { amn.y } else { amx.y }, if i & 4 == 0 { amn.z } else { amx.z });
+                        let wp = lp + lq.rotate(k.mulv(ls));
+                        lmn = lmn.min(wp);
+                        lmx = lmx.max(wp);
+                    }
+                    lod_far = lod_far.max(far);
+                    if let Some(pa) = w.archetypes.get(&pe.arch) {
+                        let yt = w.vfs.files[pa.ytyp_file].name.trim_end_matches(".ytyp").to_string();
+                        if !lod_ytyps.contains(&yt) {
+                            lod_ytyps.push(yt);
+                        }
+                    }
+                    parent_index = n_lod;
+                    n_lod += 1;
+                    lod_level = "LODTYPES_DEPTH_HD";
+                    // la façade laisse la place à la version de loin à sa distance d'origine
+                    lod = if e.lod_dist > 0.0 { e.lod_dist } else { lod };
+                    lod_notes.push(format!("{stem} → {lname} (jusqu'à {far:.0} m)"));
+                } else {
+                    // version de loin commune à plusieurs bâtiments (elle ferait revenir les voisins) ou façade très
+                    // découpée : la façade reste affichée jusqu'à la distance de ce parent
+                    lod = lod.max(pe.lod_dist.min(1500.0));
+                    lod_notes.push(format!("{stem} visible jusqu'à {lod:.0} m (version de loin du jeu {})", if pe.nchild != 1 { "commune à plusieurs bâtiments" } else { "trop différente de la façade découpée" }));
+                }
+            }
             lod_max = lod_max.max(lod);
             let txd = if arch.texture_dict != 0 { w.name_of(arch.texture_dict) } else { String::new() };
             let (bmn, bmx) = cropped.unwrap_or((arch.bb_min, arch.bb_max));
@@ -1248,8 +1647,9 @@ impl DwApp {
             // le fichier range l'inverse de l'orientation réelle (voir model.rs)
             let fq = rot.inverse().normalized();
             ents += &format!(
-                "  <Item type=\"CEntityDef\">\n   <archetypeName>{new}</archetypeName>\n   <flags value=\"{}\" />\n   <guid value=\"0\" />\n   <position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <rotation x=\"{}\" y=\"{}\" z=\"{}\" w=\"{}\" />\n   <scaleXY value=\"{}\" />\n   <scaleZ value=\"{}\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>LODTYPES_DEPTH_ORPHANHD</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
-                crate::mech::ENTITY_FLAGS,
+                "  <Item type=\"CEntityDef\">\n   <archetypeName>{new}</archetypeName>\n   <flags value=\"{}\" />\n   <guid value=\"0\" />\n   <position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <rotation x=\"{}\" y=\"{}\" z=\"{}\" w=\"{}\" />\n   <scaleXY value=\"{}\" />\n   <scaleZ value=\"{}\" />\n   <parentIndex value=\"{parent_index}\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>{lod_level}</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
+                // parent dans la carte parente : bit 0x8 (LOD_IN_PARENT_YMAP)
+                lod_in_parent_flags(crate::mech::ENTITY_FLAGS, parent_index >= 0),
                 pos.x, pos.y, pos.z, fq.x, fq.y, fq.z, fq.w, e.sxy, e.sz
             );
             for i in 0..8 {
@@ -1278,22 +1678,304 @@ impl DwApp {
         let ytyp_name = format!("{res}_exterieur");
         let ytyp = crate::model::Ytyp { name: ytyp_name.clone(), mlos: Vec::new(), visible: true, raw_archetypes: archs };
         let _ = std::fs::write(stream.join(format!("{ytyp_name}.ytyp.xml")), crate::xmlio::write_ytyp(&ytyp));
-        let vx = |n: &str, p: V3| format!(" <{n} x=\"{}\" y=\"{}\" z=\"{}\" />\n", p.x, p.y, p.z);
         let l = v3(lod_max, lod_max, lod_max);
-        let ymap = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>{ytyp_name}</name>\n <parent />\n <flags value=\"0\" />\n <contentFlags value=\"1\" />\n{}{}{}{} <entities>\n{ents} </entities>\n <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>{ytyp_name}</name>\n  <exportedBy>DragoWalker</exportedBy>\n  <owner />\n  <time />\n </block>\n</CMapData>\n",
-            vx("streamingExtentsMin", emn - l),
-            vx("streamingExtentsMax", emx + l),
-            vx("entitiesExtentsMin", emn),
-            vx("entitiesExtentsMax", emx)
-        );
-        let _ = std::fs::write(stream.join(format!("{ytyp_name}.ymap.xml")), ymap);
+        let lod_name = format!("{ytyp_name}_lod");
+        // carte des façades (HD) : parente = carte des versions de loin s'il y en a (CMapData.parent), comme lods.rs ;
+        // drapeaux comme YmapFile::CalcFlags (model.rs calc_flags) : HD → contentFlags 1, LOD → flags 2 et
+        // contentFlags 2
+        let parent = if n_lod > 0 { lod_name.as_str() } else { "" };
+        let _ = std::fs::write(stream.join(format!("{ytyp_name}.ymap.xml")), raw_ymap(&ytyp_name, parent, 0, 1, (emn - l, emx + l), (emn, emx), &ents));
+        if n_lod > 0 {
+            let ll = v3(lod_far, lod_far, lod_far);
+            let _ = std::fs::write(stream.join(format!("{lod_name}.ymap.xml")), raw_ymap(&lod_name, "", 2, 2, (lmn - ll, lmx + ll), (lmn, lmx), &lod_ents));
+            // le .ytyp du jeu qui définit chaque version de loin doit être chargé avec cette carte : dépendance
+            // ajoutée au _manifest.ymf de l'export (comme EditProjectManifestPanel::GenerateProjectManifest
+            // 0x06001194 : chaque carte déclare les .ytyp de ses objets)
+            let ok = add_manifest_imap(stream, &lod_name, &lod_ytyps) && add_manifest_imap(stream, &ytyp_name, &[ytyp_name.clone()]);
+            if !ok {
+                report.push(format!("Version de loin du MLO « {} » : pas de _manifest.ymf de DragoWalker où déclarer {} — elle peut ne pas s'afficher.", r.name, lod_ytyps.join(", ")));
+            }
+        }
+        if !lod_notes.is_empty() {
+            report.push(format!("Vue de loin du MLO « {} » : {}.", r.name, lod_notes.join(" ; ")));
+        }
         report.push(format!(
             "Façade du MLO « {} » copiée à côté de l'intérieur déplacé ({}) sous un nouveau nom, avec une collision générée ; le bâtiment du jeu reste intact à l'endroit d'origine.",
             r.name,
             done.join(", ")
         ));
         (report, format!("data_file 'DLC_ITYP_REQUEST' 'stream/{ytyp_name}.ytyp'\n"))
+    }
+
+    /// Pièces du MLO ouvert dans la fenêtre, gardées en mémoire (reconnaître une pièce du jeu parcourt toute la liste
+    /// des fichiers du jeu) ; avec le placement du jeu de chaque façade / route.
+    fn pieces_cached(&mut self, r: &MloRes) -> Vec<Piece> {
+        let game = self.game.world.is_some();
+        if self.mlo_state.pieces_cache.0 != r.name || self.mlo_state.pieces_cache.2 != game {
+            let pieces = self.mlo_pieces(r);
+            let places = pieces.iter().filter(|p| matches!(p.kind, PieceKind::Facade | PieceKind::Road)).map(|p| (p.file.clone(), self.mlo_game_placement(r, &p.stem))).collect();
+            self.mlo_state.pieces_cache = (r.name.clone(), pieces, game);
+            self.mlo_state.place_cache = (r.name.clone(), places);
+        }
+        self.mlo_state.pieces_cache.1.clone()
+    }
+
+    /// Placement du jeu d'une façade / route (en mémoire si possible).
+    fn cached_placement(&self, r: &MloRes, p: &Piece) -> Option<usize> {
+        if self.mlo_state.place_cache.0 == r.name {
+            if let Some(x) = self.mlo_state.place_cache.1.iter().find(|x| x.0 == p.file) {
+                return x.1;
+            }
+        }
+        self.mlo_game_placement(r, &p.stem)
+    }
+
+    /// Boîtes d'une pièce là où elle sera à l'export (façade / route : déplacée avec le MLO).
+    fn piece_now_boxes(&self, r: &MloRes, p: &Piece) -> Vec<[V3; 8]> {
+        let moved = !self.mlo_move(r).is_identity();
+        let all = self.piece_boxes(r, p);
+        let n = all.len();
+        all.into_iter().filter(|(_, at_origin)| !(moved && *at_origin && n > 1)).map(|(b, _)| b).collect()
+    }
+
+    /// Aperçu de l'export : façades et routes du jeu retouchées par le créateur (modèle du créateur), cochées, là
+    /// où elles seront posées. Seulement quand le MLO est vu seul dans la fenêtre « Pièces du MLO ».
+    pub fn mlo_preview_insts(&self) -> Vec<(u32, V3, Quat, f32, f32)> {
+        let mut out = Vec::new();
+        let (Some(name), Some(w)) = (self.mlo_state.pieces_open.as_ref(), self.game.world.as_deref()) else { return out };
+        if !self.mlo_state.solo || self.mlo_state.pieces_cache.0 != *name {
+            return out;
+        }
+        let Some(r) = self.proj.mlo_res.iter().find(|r| &r.name == name) else { return out };
+        let mv = self.mlo_move(r);
+        let moved = !mv.is_identity();
+        for p in self.mlo_state.pieces_cache.1.iter().filter(|p| matches!(p.kind, PieceKind::Facade | PieceKind::Road) && r.taken(p, moved)) {
+            let Some(ei) = self.cached_placement(r, p) else { continue };
+            let e = &w.ents[ei];
+            out.push((e.arch, mv.point(e.pos), mv.q.mul(e.rot).normalized(), e.sxy, e.sz));
+        }
+        out
+    }
+
+    /// Objets du projet montrés quand le MLO est vu seul : ses cartes et son intérieur, sans les modèles décochés.
+    fn mlo_solo_ids(&self, r: &MloRes, pieces: &[Piece], moved: bool) -> std::collections::HashSet<u64> {
+        let left: Vec<String> = pieces.iter().filter(|p| p.kind == PieceKind::Model && !r.taken(p, moved)).map(|p| p.stem.to_lowercase()).collect();
+        let ytyps: Vec<usize> = self.proj.ytyps.iter().enumerate().filter(|(_, t)| r.ytyp_files.iter().any(|f| f.0.eq_ignore_ascii_case(&t.name))).map(|(i, _)| i).collect();
+        let mut ids = std::collections::HashSet::new();
+        for it in self.proj.all_items() {
+            let mine = match it {
+                crate::model::ItemRef::Ent(y, _) => r.ymaps.contains(&self.proj.ymaps[y].name),
+                crate::model::ItemRef::MloEnt(t, _, _) => ytyps.contains(&t),
+            };
+            if !mine {
+                continue;
+            }
+            let Some(e) = self.proj.ent(it) else { continue };
+            if !left.contains(&e.archetype.to_lowercase()) {
+                ids.insert(e.id);
+            }
+        }
+        ids
+    }
+
+    /// Fenêtre « Pièces du MLO » : chaque morceau de la ressource avec une case « je prends ». Le MLO est vu seul,
+    /// tel qu'il sera exporté (façades du jeu déplacées avec lui, pièces décochées en rouge) ; une pièce survolée
+    /// dans la liste ou dans la vue est surlignée et nommée.
+    pub fn mlo_pieces_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.mlo_state.pieces_open.clone() else { return };
+        let Some(ri) = self.proj.mlo_res.iter().position(|r| r.name == name) else {
+            self.mlo_state.pieces_open = None;
+            return;
+        };
+        let r = self.proj.mlo_res[ri].clone();
+        let moved = !self.mlo_move(&r).is_identity();
+        let pieces = self.pieces_cached(&r);
+        let game = self.game.world.is_some();
+        let mut open = true;
+        let mut changes: Vec<(String, bool)> = Vec::new();
+        let mut reset = false;
+        let mut hovered: Option<usize> = None;
+        let mut goto: Option<V3> = None;
+        let mut ran = false;
+        let mut solo = self.mlo_state.solo;
+        let view_hover = self.mlo_state.view_hover.clone();
+        let focus = self.mlo_state.focus.clone();
+        // une seule fenêtre par image (les panneaux passent deux fois : show_panel ne la montre qu'une fois)
+        self.show_panel(ctx, "mlo_pieces", &format!("Pièces du MLO « {name} »"), crate::docking::Dock::Floating, [440.0, 600.0], &mut open, |s, ui| {
+            ran = true;
+            ui.label(RichText::new(if moved {
+                "MLO déplacé : les pièces cochées sont emportées au nouvel endroit (façades et routes du jeu copiées sous un nouveau nom et découpées autour de l'intérieur)."
+            } else {
+                "MLO à sa place : les pièces cochées sont mises telles quelles, comme dans la ressource du créateur ; une pièce du jeu décochée laisse le jeu d'origine."
+            }).small());
+            if !game {
+                ui.label(RichText::new("Charge le jeu (onglet Jeu) pour reconnaître les façades et les voir.").small().color(Color32::from_rgb(255, 160, 110)));
+            }
+            ui.checkbox(&mut solo, "Voir le MLO seul, tel qu'il sera exporté").on_hover_text("Cache la carte du jeu et le reste du projet ; les façades du jeu sont montrées là où elles seront posées, les pièces retirées en rouge");
+            ui.label(RichText::new("Souris sur une pièce dans la vue : son nom s'affiche · touche X : la retirer / la remettre · clic : la retrouver ici. Survol d'une ligne : orange = endroit d'origine, vert = là où elle sera posée.").small().weak());
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                let mut last: Option<PieceKind> = None;
+                for (i, p) in pieces.iter().enumerate() {
+                    if last != Some(p.kind) {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(p.kind.label()).strong().color(Color32::from_rgb(80, 220, 255)));
+                        last = Some(p.kind);
+                    }
+                    let mut v = r.taken(p, moved);
+                    let lit = view_hover.as_deref() == Some(p.file.as_str()) || focus.as_deref() == Some(p.file.as_str());
+                    let resp = ui
+                        .horizontal(|ui| {
+                            let text = if lit { RichText::new(&p.file).color(Color32::from_rgb(255, 220, 80)).strong() } else { RichText::new(&p.file) };
+                            let c = ui.checkbox(&mut v, text);
+                            let tip = match p.kind {
+                                PieceKind::Facade => "Bâtiment du jeu retouché par le créateur (la devanture du MLO).",
+                                PieceKind::Road => "Morceau de route du jeu retouché : à un autre endroit, il amène un bout de route.",
+                                PieceKind::GameCol => "Collision du quartier d'origine : déplacée, elle peut laisser des murs invisibles ; la façade a déjà sa collision générée.",
+                                PieceKind::InteriorCol => "Sans elle, on traverse les murs et le sol de l'intérieur.",
+                                PieceKind::Col => "Collision ajoutée par le créateur (déplacée avec le MLO).",
+                                PieceKind::Model => "Modèle du créateur (coque de l'intérieur, portes, vitres…).",
+                            };
+                            let c = c.on_hover_text(tip);
+                            if c.changed() {
+                                changes.push((p.file.clone(), v));
+                            }
+                            ui.label(if v { RichText::new("pris").small().color(Color32::from_rgb(120, 220, 120)) } else { RichText::new("retiré").small().color(Color32::from_rgb(255, 110, 90)) });
+                            let go = matches!(p.kind, PieceKind::Facade | PieceKind::Road | PieceKind::Model | PieceKind::InteriorCol);
+                            if go && ui.small_button("Voir").clicked() {
+                                if let Some(b) = s.piece_now_boxes(&r, p).first() {
+                                    goto = Some(b.iter().fold(V3::ZERO, |a, c| a + *c) * 0.125);
+                                }
+                            }
+                            if v != piece_default(p.kind, moved) {
+                                ui.label(RichText::new("(changé)").small().weak());
+                            }
+                        })
+                        .response;
+                    if focus.as_deref() == Some(p.file.as_str()) {
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    if ui.rect_contains_pointer(resp.rect) {
+                        hovered = Some(i);
+                    }
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Choix par défaut").on_hover_text(if moved { "Tout pris sauf les routes et les collisions du quartier d'origine" } else { "Tout pris, comme le créateur" }).clicked() {
+                    reset = true;
+                }
+                ui.label(RichText::new("Appliqué au prochain export (et au prochain test en jeu).").small().weak());
+            });
+        });
+        if !ran && open {
+            return;
+        }
+        self.mlo_state.focus = None;
+        // surlignage dans la vue (lu par view.rs pendant cette image)
+        let frame = ctx.cumulative_pass_nr();
+        self.mlo_state.hl = (frame, hovered.map(|i| self.piece_boxes(&r, &pieces[i])).unwrap_or_default());
+        if !changes.is_empty() || reset {
+            self.push_undo();
+            let m = &mut self.proj.mlo_res[ri];
+            if reset {
+                m.picks.clear();
+            }
+            for (f, v) in changes {
+                m.set_pick(&f, v);
+            }
+        }
+        if let Some(p) = goto {
+            self.goto(p, 50.0);
+        }
+        // « Tout revoir » du bandeau ou Échap : la vue seule est arrêtée
+        if self.mlo_state.solo_owned && self.isolate_sel.is_none() {
+            self.mlo_state.solo_owned = false;
+            solo = false;
+        }
+        self.mlo_state.solo = solo;
+        if !open {
+            self.mlo_state.pieces_open = None;
+            self.mlo_state.hl.1.clear();
+            self.mlo_state.view_hover = None;
+        }
+        if open && solo {
+            let r = self.proj.mlo_res[ri].clone();
+            self.isolate_sel = Some(self.mlo_solo_ids(&r, &pieces, moved));
+            self.mlo_state.solo_owned = true;
+        } else if self.mlo_state.solo_owned {
+            self.isolate_sel = None;
+            self.mlo_state.solo_owned = false;
+        }
+    }
+
+    /// Dans la vue, fenêtre « Pièces du MLO » ouverte : pièce survolée dans la liste (orange / vert), pièces retirées
+    /// (rouge), pièce sous la souris nommée (jaune) ; touche X : la retirer / la remettre ; clic : la montrer
+    /// dans la liste.
+    pub fn mlo_pieces_view(&mut self, painter: &egui::Painter, hover_pos: Option<egui::Pos2>, ctx: &egui::Context) {
+        let (f, boxes) = &self.mlo_state.hl;
+        if !boxes.is_empty() && ctx.cumulative_pass_nr().saturating_sub(*f) <= 1 {
+            for (b, at_origin) in boxes {
+                let col = if *at_origin { Color32::from_rgb(255, 150, 40) } else { Color32::from_rgb(90, 255, 120) };
+                crate::render::draw_box_edges(painter, &self.cam, b, egui::Stroke::new(2.5, col));
+            }
+        }
+        self.mlo_state.view_hover = None;
+        let Some(name) = self.mlo_state.pieces_open.clone() else { return };
+        let Some(ri) = self.proj.mlo_res.iter().position(|r| r.name == name) else { return };
+        if self.mlo_state.pieces_cache.0 != name {
+            return;
+        }
+        let r = self.proj.mlo_res[ri].clone();
+        let moved = !self.mlo_move(&r).is_identity();
+        let pieces = self.mlo_state.pieces_cache.1.clone();
+        let visible = |p: &Piece| matches!(p.kind, PieceKind::Facade | PieceKind::Road | PieceKind::Model);
+        // pièces retirées : en rouge, là où elles auraient été
+        for p in pieces.iter().filter(|p| visible(p) && !r.taken(p, moved)) {
+            for b in self.piece_now_boxes(&r, p) {
+                crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(1.5, Color32::from_rgb(255, 80, 70)));
+            }
+        }
+        // mode test : DW_TEST_PIECE_HOVER="x,y" fait comme si la souris était là
+        let test_hp = std::env::var("DW_TEST_PIECE_HOVER").ok().and_then(|v| v.split_once(',').and_then(|(a, b)| Some(egui::pos2(a.trim().parse().ok()?, b.trim().parse().ok()?))));
+        let Some(hp) = test_hp.or(hover_pos) else { return };
+        if test_hp.is_none() && ctx.is_pointer_over_area() {
+            return;
+        }
+        // pièce sous la souris : comme CodeWalker WorldForm::UpdateMouseHits(DrawableBase, Archetype, YmapEntityDef)
+        // 0x060002ab (IL_05b6–IL_05d4), parmi les boîtes touchées par le rayon (distance > 0), celle dont la
+        // demi-diagonale |max − min| × échelle × 0,5 est la plus petite l'emporte (une porte plutôt que la coque qui
+        // la contient) ; à taille égale, la plus proche
+        let (o, d) = self.cam.ray(hp);
+        let mut best: Option<(f32, f32, usize, [V3; 8])> = None;
+        for (i, p) in pieces.iter().enumerate().filter(|(_, p)| visible(p)) {
+            for b in self.piece_now_boxes(&r, p) {
+                let Some(t) = ray_obb(&b, o, d) else { continue };
+                let half_diag = (b[7] - b[0]).len() * crate::mech::PICK_HALF_DIAG;
+                if best.map(|x| (half_diag, t) < (x.0, x.1)).unwrap_or(true) {
+                    best = Some((half_diag, t, i, b));
+                }
+            }
+        }
+        let Some((_, _, i, b)) = best else { return };
+        let p = &pieces[i];
+        let taken = r.taken(p, moved);
+        crate::render::draw_box_edges(painter, &self.cam, &b, egui::Stroke::new(3.0, Color32::from_rgb(255, 220, 60)));
+        let text = format!("{}\n{} · {}\nX : {} · clic : la retrouver dans la liste", p.file, p.kind.label(), if taken { "prise à l'export" } else { "retirée de l'export" }, if taken { "la retirer" } else { "la remettre" });
+        let galley = painter.layout(text, egui::FontId::proportional(13.0), Color32::WHITE, 420.0);
+        let at = hp + egui::vec2(18.0, 14.0);
+        painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(6.0, 4.0), galley.size() + egui::vec2(12.0, 8.0)), 5.0, Color32::from_rgba_unmultiplied(20, 20, 24, 235));
+        painter.galley(at, galley, Color32::WHITE);
+        self.mlo_state.view_hover = Some(p.file.clone());
+        let (x, click) = ctx.input(|inp| (inp.key_pressed(egui::Key::X) && !inp.modifiers.command, inp.pointer.primary_clicked()));
+        if x && !ctx.wants_keyboard_input() {
+            self.push_undo();
+            self.proj.mlo_res[ri].set_pick(&p.file, !taken);
+            self.status = format!("{} {} de l'export du MLO « {name} ».", p.file, if taken { "retirée" } else { "remise" });
+        }
+        if click {
+            self.mlo_state.focus = Some(p.file.clone());
+        }
     }
 
     /// Liste des MLO importés (panneau Projet).
@@ -1304,6 +1986,7 @@ impl DwApp {
         let mut select: Option<Vec<u64>> = None;
         let mut remove = None;
         let mut goto = None;
+        let mut open_pieces = None;
         egui::CollapsingHeader::new(RichText::new(format!("MLO importés ({})", self.proj.mlo_res.len())).color(Color32::from_rgb(80, 220, 255))).id_salt("mlo_res").default_open(true).show(ui, |ui| {
             for (i, r) in self.proj.mlo_res.iter().enumerate() {
                 ui.label(RichText::new(&r.name).strong());
@@ -1327,6 +2010,10 @@ impl DwApp {
                     if ui.small_button("Aller voir").clicked() {
                         goto = Some(mv.p1);
                     }
+                    if ui.small_button("Pièces…").on_hover_text("Voir le MLO seul, tel qu'il sera exporté, et choisir ses pièces (intérieur, façades, route, collisions)").clicked() {
+                        open_pieces = Some(r.name.clone());
+                        goto = Some(mv.p1);
+                    }
                     if ui.small_button("Ouvrir le dossier").clicked() {
                         let _ = std::process::Command::new("explorer").arg(&r.dir).spawn();
                     }
@@ -1342,6 +2029,10 @@ impl DwApp {
         }
         if let Some(p) = goto {
             self.goto(p, 60.0);
+        }
+        if open_pieces.is_some() {
+            self.mlo_state.pieces_open = open_pieces;
+            self.mlo_state.solo = true;
         }
         if let Some(i) = remove {
             self.push_undo();

@@ -17,6 +17,11 @@ pub struct Camera {
     pub cur_ortho: f32,
     pub fov: f32,
     pub near: f32,
+    /// déplacement de la cible encore à faire (zoom vers la souris), appliqué en douceur comme la distance
+    pub pan_left: V3,
+    /// cible après le dernier lissage : si elle a changé entre-temps (Aller voir, glisser…), le reste du zoom
+    /// vers la souris est abandonné
+    seen_target: V3,
     // calculés
     pub eye: V3,
     pub fwd: V3,
@@ -39,7 +44,9 @@ impl Camera {
             ortho: 400.0,
             cur_ortho: 400.0,
             fov: mech::CAM_FOV,
-            near: 0.5,
+            near: 0.1,
+            pan_left: V3::ZERO,
+            seen_target: V3::ZERO,
             eye: V3::ZERO,
             fwd: V3::ZERO,
             right: V3::ZERO,
@@ -69,6 +76,44 @@ impl Camera {
         }
     }
 
+    /// Molette vers le point `at` sous la souris : ce point reste sous la souris (cible et distance mises à
+    /// l'échelle autour de lui, même facteur ×1,1 / ÷1,1 que Camera::MouseZoom). Tout près (moins de
+    /// ZOOM_DOLLY_DIST), la distance ne diminue plus : la caméra avance vers le point, pour pouvoir zoomer sans fin
+    /// (sinon chaque cran rapproche de moins en moins d'un point qu'on n'atteint jamais) — **estimé**.
+    pub fn zoom_at(&mut self, steps: f32, at: Option<V3>) {
+        let zoom_in = steps > 0.0;
+        let f = if zoom_in { 1.0 / mech::CAM_ZOOM_FACTOR } else { mech::CAM_ZOOM_FACTOR };
+        let n = steps.abs().max(1.0) as i32;
+        for _ in 0..n {
+            let goal = self.target + self.pan_left;
+            if self.map_view {
+                let new_ortho = (self.ortho * f).clamp(mech::ORTHO_MIN, mech::ORTHO_MAX);
+                if let Some(p) = at {
+                    let k = new_ortho / self.ortho;
+                    let d = goal - p;
+                    self.pan_left = self.pan_left + v3(d.x * (k - 1.0), d.y * (k - 1.0), 0.0);
+                }
+                self.ortho = new_ortho;
+                continue;
+            }
+            if zoom_in && self.dist * f < mech::ZOOM_DOLLY_DIST {
+                // tout près : on avance (vers la souris), la distance reste
+                let dir = at.map(|p| (p - self.eye).norm()).filter(|d| d.len() > 0.5).unwrap_or(self.fwd);
+                let step = self.dist.max(mech::ZOOM_DOLLY_DIST) * (1.0 - f);
+                self.pan_left = self.pan_left + dir * step;
+                self.dist = self.dist.max(mech::ZOOM_DOLLY_DIST);
+                continue;
+            }
+            let new_dist = (self.dist * f).clamp(mech::CAM_MIN_DIST, mech::CAM_MAX_DIST);
+            if let Some(p) = at {
+                // le point visé reste sous la souris : cible rapprochée (ou éloignée) de lui du même facteur
+                let k = new_dist / self.dist;
+                self.pan_left = self.pan_left + (goal - p) * (k - 1.0);
+            }
+            self.dist = new_dist;
+        }
+    }
+
     /// Lissage (Camera::UpdateFollow).
     pub fn update(&mut self, dt: f32) {
         self.pitch = self.pitch.clamp(-mech::CAM_PITCH_LIMIT, mech::CAM_PITCH_LIMIT);
@@ -77,12 +122,31 @@ impl Camera {
         let k = (mech::CAM_SMOOTHNESS * dt).min(1.0);
         self.cur_yaw += (self.yaw - self.cur_yaw) * k;
         self.cur_pitch += (self.pitch - self.cur_pitch) * k;
-        self.cur_dist += (self.dist - self.cur_dist) * k;
+        // distance : Camera::UpdateFollow 0x06000166 (IL_00eb–IL_0125) : CurrentDistance += (TargetDistance −
+        // CurrentDistance) × ZoomSpeed (0,1, Camera::.ctor 0x06000162) à chaque image ; ramené au temps écoulé
+        // (= 0,1 à 60 images/s). L'adoucissement t³ du recul n'y joue que pendant les 2 s (ZoomTargetTime) qui
+        // suivent la création de la caméra : ZoomCurrentTime n'est jamais remis à zéro
+        let kz = 1.0 - (1.0 - mech::CAM_ZOOM_SPEED).powf(dt * mech::CAM_ZOOM_SPEED_FPS);
+        self.cur_dist += (self.dist - self.cur_dist) * kz;
         self.cur_ortho += (self.ortho - self.cur_ortho) * k;
+        if (self.target - self.seen_target).len() > 1e-4 {
+            self.pan_left = V3::ZERO;
+        }
+        if self.pan_left.len() > 1e-5 {
+            // même pas que la distance : le point visé reste sous la souris pendant le mouvement
+            let m = self.pan_left * if self.map_view { k } else { kz };
+            self.target = self.target + m;
+            self.pan_left = self.pan_left - m;
+        } else {
+            self.pan_left = V3::ZERO;
+        }
+        self.seen_target = self.target;
         self.update_vectors();
     }
 
     pub fn snap(&mut self) {
+        self.target = self.target + self.pan_left;
+        self.pan_left = V3::ZERO;
         self.cur_yaw = self.yaw;
         self.cur_pitch = self.pitch;
         self.cur_dist = self.dist;
@@ -196,7 +260,7 @@ impl Camera {
         if self.map_view {
             (1.0, 12000.0)
         } else {
-            ((self.cur_dist * 0.01).clamp(0.3, 20.0), 30000.0)
+            ((self.cur_dist * 0.01).clamp(mech::ZOOM_NEAR_MIN, 20.0), 30000.0)
         }
     }
 
@@ -251,5 +315,40 @@ impl Camera {
             set(3, [f.x, f.y, f.z, -f.dot(e)]);
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settle(c: &mut Camera) {
+        for _ in 0..400 {
+            c.update(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn zoom_goes_through_and_keeps_point_under_mouse() {
+        let mut c = Camera::new();
+        settle(&mut c);
+        let p = v3(30.0, 80.0, 0.0);
+        let s0 = c.project(p).unwrap().0;
+        // 10 crans : le point visé reste à peu près sous la souris
+        for _ in 0..10 {
+            c.zoom_at(1.0, Some(p));
+        }
+        settle(&mut c);
+        let s1 = c.project(p).unwrap().0;
+        assert!((s1 - s0).length() < 3.0, "point déplacé à l'écran : {s0:?} → {s1:?}");
+        // 120 crans de plus : on arrive tout près du point (moins de 2 m), sans rester bloqué loin
+        let d0 = (c.eye - p).len();
+        for _ in 0..120 {
+            c.zoom_at(1.0, Some(p));
+            c.update(1.0 / 60.0);
+        }
+        settle(&mut c);
+        let d1 = (c.eye - p).len();
+        assert!(d1 < 2.0 && d1 < d0, "distance au point {d0} → {d1}");
     }
 }

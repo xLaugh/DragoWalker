@@ -26,6 +26,10 @@ impl DwApp {
         let mut lod = Ymap::new(&format!("{}_lod", y.name));
         let mut cache: std::collections::HashMap<u32, Option<usize>> = std::collections::HashMap::new();
         for e in hd.entities.iter_mut() {
+            // sans parent : pas de bit 0x8 (aucun objet du jeu sans parent ne l'a, sonde DW_LODFLAGS)
+            if e.parent_index < 0 {
+                e.flags = crate::mlo::lod_in_parent_flags(e.flags, false);
+            }
             if e.mlo.is_some() {
                 continue;
             }
@@ -73,6 +77,9 @@ impl DwApp {
             l.num_children = 1;
             l.parent_index = -1;
             e.parent_index = lod.entities.len() as i32;
+            // version de loin dans la carte parente « _lod » : bit 0x8 (YmapEntityDef::get_LodInParentYmap
+            // 0x06002d03), comme tous les objets du jeu dans ce cas
+            e.flags = crate::mlo::lod_in_parent_flags(e.flags, true);
             e.lod_level = "LODTYPES_DEPTH_HD".into();
             e.lod_dist = o.lod_dist;
             lod.entities.push(l);

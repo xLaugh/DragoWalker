@@ -487,8 +487,10 @@ impl GameWorld {
             for e in &y.entities {
                 let pos = v3(e.pos[0], e.pos[1], e.pos[2]);
                 let q = Quat { x: e.rot[0], y: e.rot[1], z: e.rot[2], w: e.rot[3] };
-                // le fichier stocke l'inverse de l'orientation (YmapEntityDef)
-                let rot = if q.is_identity() { q } else { q.inverse().normalized() };
+                // le fichier stocke l'inverse de l'orientation pour un objet (YmapEntityDef::.ctor(CEntityDef)
+                // 0x06002d06), mais l'orientation telle quelle pour un placement d'intérieur (.ctor(CMloInstanceDef)
+                // 0x06002d07)
+                let rot = if q.is_identity() || e.mlo { q.normalized() } else { q.inverse().normalized() };
                 mn = mn.min(pos);
                 mx = mx.max(pos);
                 ents.push(WEnt {

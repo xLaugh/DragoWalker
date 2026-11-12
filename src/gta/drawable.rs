@@ -495,3 +495,59 @@ pub fn find_texture(r: &Resource, dict: usize, name_hash: u32, max_size: u32) ->
         Some(out)
     }
 }
+
+/// Lumière rangée dans un modèle (LightAttributes, 168 octets : LightAttributes::get_BlockLength 0x06004add),
+/// champs dans l'ordre de la classe de CodeWalker. Liste à +0xB0 du Drawable (Drawable::Read 0x06004bad : après
+/// DrawableBase, 0xA8 octets, et le nom ; Drawable::get_BlockLength 0x06004b9e = 0xD0).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GameLight {
+    pub pos: [f32; 3],
+    pub color: [u8; 3],
+    pub flashiness: u8,
+    pub intensity: f32,
+    pub flags: u32,
+    pub kind: u8,
+    pub time_flags: u32,
+    pub falloff: f32,
+    pub falloff_exp: f32,
+    pub corona_size: f32,
+    pub corona_intensity: f32,
+    pub volume_intensity: f32,
+    pub shadow_near_clip: f32,
+    pub light_fade: u8,
+    pub dir: [f32; 3],
+    pub cone_inner: f32,
+    pub cone_outer: f32,
+    pub extent: [f32; 3],
+}
+
+/// Lumières d'un modèle simple (ydr / ydd ; les yft rangent les leurs ailleurs).
+pub fn read_lights(r: &Resource, d: usize) -> Vec<GameLight> {
+    let Some(p) = r.ptr(r.u64(d + 0xB0)) else { return Vec::new() };
+    let n = r.u16(d + 0xB8) as usize;
+    (0..n.min(512))
+        .map(|i| {
+            let a = p + i * 168;
+            GameLight {
+                pos: r.v3(a + 0x08),
+                color: [r.u8(a + 0x18), r.u8(a + 0x19), r.u8(a + 0x1A)],
+                flashiness: r.u8(a + 0x1B),
+                intensity: r.f32(a + 0x1C),
+                flags: r.u32(a + 0x20),
+                kind: r.u8(a + 0x26),
+                time_flags: r.u32(a + 0x28),
+                falloff: r.f32(a + 0x2C),
+                falloff_exp: r.f32(a + 0x30),
+                volume_intensity: r.f32(a + 0x4C),
+                corona_size: r.f32(a + 0x5C),
+                light_fade: r.u8(a + 0x64),
+                shadow_near_clip: r.f32(a + 0x68),
+                corona_intensity: r.f32(a + 0x6C),
+                dir: r.v3(a + 0x74),
+                cone_inner: r.f32(a + 0x8C),
+                cone_outer: r.f32(a + 0x90),
+                extent: r.v3(a + 0x94),
+            }
+        })
+        .collect()
+}

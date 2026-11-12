@@ -80,9 +80,11 @@ pub fn write_ymap(y: &Ymap, proj: &Project) -> String {
                     entity_fields(&mut o, "   ", e, true);
                 }
                 Some(m) => {
-                    // un placement d'intérieur : le fichier stocke l'inverse de l'orientation, comme pour les objets
+                    // un placement d'intérieur : contrairement aux objets, le fichier stocke l'orientation telle quelle
+                    // (CodeWalker YmapEntityDef::.ctor(CMloInstanceDef) 0x06002d07 : Orientation = rotation, sans
+                    // Quaternion.Invert ; .ctor(CEntityDef) 0x06002d06 l'inverse)
                     o.push_str("  <Item type=\"CMloInstanceDef\">\n");
-                    entity_fields(&mut o, "   ", e, true);
+                    entity_fields(&mut o, "   ", e, false);
                     val(&mut o, "   ", "groupId", m.group_id);
                     val(&mut o, "   ", "floorId", m.floor_id);
                     if m.default_entity_sets.is_empty() {
@@ -118,6 +120,18 @@ pub fn write_ymap(y: &Ymap, proj: &Project) -> String {
         ("DistantLODLightsSOA", " <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n"),
     ];
     for (tag, def) in defaults {
+        // boîtes d'occlusion du projet (avec celles d'origine d'une carte du jeu copiée)
+        if *tag == "boxOccluders" && !y.occluders.is_empty() {
+            let ours = crate::occlusion::occluders_xml(&y.occluders);
+            match y.raw_sections.iter().find(|(t, _)| t == tag).map(|(_, r)| r.trim().to_string()).filter(|r| r.contains("</boxOccluders>")) {
+                Some(raw) => {
+                    let items = ours.trim().trim_start_matches("<boxOccluders>").trim_end_matches("</boxOccluders>").to_string();
+                    let _ = writeln!(o, " {}", raw.replacen("</boxOccluders>", &format!("{items}</boxOccluders>"), 1));
+                }
+                None => o.push_str(&ours),
+            }
+            continue;
+        }
         // véhicules garés du projet (avec ceux d'origine d'une carte du jeu copiée)
         if *tag == "carGenerators" && !y.car_gens.is_empty() {
             let ours = crate::life::cargens_xml(&y.car_gens);
@@ -379,7 +393,8 @@ pub fn read_ymap(src: &str, fallback_name: &str) -> Result<Ymap, String> {
         for it in ents.children().filter(|c| c.is_element()) {
             let ty = it.attribute("type").unwrap_or("CEntityDef");
             if ty == "CMloInstanceDef" {
-                let mut e = read_entity(src, it, true);
+                // orientation non inversée dans le fichier (YmapEntityDef::.ctor(CMloInstanceDef) 0x06002d07)
+                let mut e = read_entity(src, it, false);
                 let mut m = MloInstData {
                     group_id: cval_i(it, "groupId", 0) as u32,
                     floor_id: cval_i(it, "floorId", 0) as u32,

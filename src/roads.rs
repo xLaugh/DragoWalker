@@ -1014,6 +1014,13 @@ fn collision_chunks(tris: &[(u32, u32, u32, u8)]) -> Vec<&[(u32, u32, u32, u8)]>
 /// GeometryBVH par paquet d'au plus 20 000 triangles et 32 000 sommets, sommets relatifs au centre de la pièce (GetVertexPos
 /// 0x0600410f), marge 0,04, une liste de types de surface `types` (index `m` de chaque triangle).
 pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u32]) -> String {
+    let mats: Vec<(u32, u32)> = types.iter().map(|t| (*t, 0)).collect();
+    mesh_collision_xml_rooms(verts, tris, &mats)
+}
+
+/// Même chose, chaque matériau avec sa pièce d'intérieur : (type de surface, RoomID). Dans une collision
+/// d'intérieur, le RoomID de la surface sous le joueur dit au jeu dans quelle pièce il se trouve (0 = dehors).
+pub fn mesh_collision_xml_rooms(verts: &[V3], tris: &[(u32, u32, u32, u8)], mats: &[(u32, u32)]) -> String {
     use std::fmt::Write;
     let xyz = |tag: &str, v: V3| format!("<{tag} x=\"{}\" y=\"{}\" z=\"{}\" />", v.x, v.y, v.z);
     let head = |s: &mut String, ind: &str, a: V3, b: V3, margin: f32| {
@@ -1050,8 +1057,8 @@ pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u
         s.push_str("   <Item type=\"GeometryBVH\">\n");
         head(&mut s, "    ", bmn, bmx, 0.04);
         let _ = writeln!(s, "    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n    {}\n    <UnkFloat1 value=\"0\" />\n    <UnkFloat2 value=\"0.0025\" />\n    <Materials>", xyz("GeometryCenter", gc));
-        for t in types {
-            let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
+        for (t, room) in mats {
+            let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"{room}\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
         }
         s.push_str("    </Materials>\n    <Vertices>\n");
         for i in &order {
