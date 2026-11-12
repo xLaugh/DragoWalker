@@ -142,6 +142,8 @@ impl DwApp {
                 let mut v = Vec::new();
                 if auto {
                     for (name, p, q) in junction_props(j) {
+                        // pied posé sur ce qu'il y a vraiment dessous (trottoir, chaussée, accotement ou terrain)
+                        let p = v3(p.x, p.y, t.surface_at(p.x, p.y).unwrap_or(p.z));
                         let mut e = crate::model::Entity::new(name, p);
                         e.rot = q;
                         e.lod_dist = lod_of(name, self.game.world.as_deref());

@@ -378,12 +378,18 @@ impl DwApp {
         if !self.opts.show_perf {
             return;
         }
-        let mut lines = vec![format!("{:.0} images/s  ({:.1} ms)", self.fps, 1000.0 / self.fps.max(0.1))];
+        let idle = painter.ctx().input(|i| i.time) - self.last_active > 1.5;
+        let mut lines = vec![if idle { "au repos : vue redessinée lentement (bouge la souris pour mesurer)".to_string() } else { format!("{:.0} images/s  ({:.1} ms)", self.fps, 1000.0 / self.fps.max(0.1)) }];
         if let Some(g) = &self.game.gpu {
             if let Ok(g) = g.lock() {
                 let (m, t) = g.memory_mb();
                 lines.push(format!("{} modèles · {} boîtes · {} k triangles", g.stats.0, g.stats.1, g.stats.2 / 1000));
-                lines.push(format!("mémoire graphique : {m} Mo de modèles, {t} Mo de textures"));
+                let (bm, bt) = g.budget.map(|(a, b)| (a >> 20, b >> 20)).unwrap_or((0, 0));
+                lines.push(format!("mémoire graphique : {m} / {bm} Mo de modèles, {t} / {bt} Mo de textures"));
+                lines.push(match g.vram_mb {
+                    Some(v) => format!("carte graphique : {v} Mo"),
+                    None => "carte graphique : mémoire inconnue (1 Go supposé)".to_string(),
+                });
             }
         }
         let objs: usize = self.proj.ymaps.iter().filter(|y| !y.sample).map(|y| y.entities.len()).sum();
@@ -394,7 +400,7 @@ impl DwApp {
         let r = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(w, h));
         painter.rect_filled(r, 5.0, egui::Color32::from_black_alpha(170));
         for (i, l) in lines.iter().enumerate() {
-            let col = if i == 0 && self.fps < 25.0 { egui::Color32::from_rgb(255, 130, 100) } else { egui::Color32::from_rgb(210, 235, 210) };
+            let col = if i == 0 && self.fps < 25.0 && !idle { egui::Color32::from_rgb(255, 130, 100) } else { egui::Color32::from_rgb(210, 235, 210) };
             painter.text(r.min + egui::vec2(8.0, 6.0 + i as f32 * 16.0), egui::Align2::LEFT_TOP, l, font.clone(), col);
         }
     }

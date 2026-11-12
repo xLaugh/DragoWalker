@@ -36,7 +36,7 @@ pub struct NpcTraffic {
 impl Default for NpcTraffic {
     fn default() -> Self {
         NpcTraffic {
-            enabled: true,
+            enabled: false,
             count: 10,
             models: vec!["asea".into(), "premier".into(), "blista".into(), "sultan".into(), "granger".into()],
             drivers: vec!["a_m_y_business_01".into(), "a_f_y_business_01".into(), "a_m_y_hipster_01".into(), "a_m_m_beach_01".into()],

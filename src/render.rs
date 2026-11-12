@@ -303,18 +303,18 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         if w.hidden_archs.contains(&e.arch) || g.hidden.contains(&ei) {
             continue;
         }
-        if !g.hidden_lod.is_empty() && g.hidden_lod.contains(&(e.lod_level.min(5), crate::lists::lod_bucket(e.lod_dist))) {
+        if !g.hidden_lod.is_empty() && g.hidden_lod.contains(&(e.lod_level.min(5), crate::lists::lod_bucket(e.lod_dist()))) {
             continue;
         }
         let (mn, mx) = w.arch_box(e.arch);
-        let rad = (mx - mn).len() * 0.5 * e.sxy.max(e.sz) + 0.5;
+        let rad = (mx - mn).len() * 0.5 * e.sxy().max(e.sz()) + 0.5;
         // entièrement au-dessus de la coupe : inutile de le dessiner
         if let Some(cz) = g.cut_z {
             if e.pos.z - rad > cz {
                 continue;
             }
         }
-        let ctr = e.pos + e.rot.rotate((mn + mx) * 0.5);
+        let ctr = e.pos + e.rot().rotate((mn + mx) * 0.5);
         let c = cam.to_cam(ctr);
         let size = if cam.map_view {
             if c.x.abs() > cam.cur_ortho * aspect + rad || c.y.abs() > cam.cur_ortho + rad {
@@ -352,7 +352,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             match def {
                 Some(def) if near && interior_budget > 0 => {
                     let defaults = w.mlo_inst_sets.get(&ei).map(|v| v.as_slice()).unwrap_or(&[]);
-                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, e.rot, defaults, eye, g.lod_scale, &mut interior_budget);
+                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, e.rot(), defaults, eye, g.lod_scale, &mut interior_budget);
                 }
                 Some(_) => {}
                 None => mlo_boxes.push(w.corners(ei)),
@@ -364,7 +364,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         let col = w.color_of(e.arch);
         insts.push(Inst {
             arch: e.arch,
-            m: model_matrix([e.pos.x, e.pos.y, e.pos.z], [e.rot.x, e.rot.y, e.rot.z, e.rot.w], [e.sxy, e.sxy, e.sz]),
+            m: model_matrix([e.pos.x, e.pos.y, e.pos.z], [e.rot().x, e.rot().y, e.rot().z, e.rot().w], [e.sxy(), e.sxy(), e.sz()]),
             color: [col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0],
             bmin: [mn.x, mn.y, mn.z],
             bmax: [mx.x, mx.y, mx.z],
@@ -566,8 +566,8 @@ fn push_game(faces: &mut Vec<Face>, painter: &Painter, cam: &Camera, g: &GameCtx
         if (mx - mn).len() > 700.0 {
             continue;
         }
-        let rad = (mx - mn).len() * 0.5 * e.sxy.max(e.sz) + 0.5;
-        let ctr = e.pos + e.rot.rotate((mn + mx) * 0.5);
+        let rad = (mx - mn).len() * 0.5 * e.sxy().max(e.sz()) + 0.5;
+        let ctr = e.pos + e.rot().rotate((mn + mx) * 0.5);
         let c = cam.to_cam(ctr);
         let size = if cam.map_view {
             let half_w = cam.cur_ortho * aspect + rad;

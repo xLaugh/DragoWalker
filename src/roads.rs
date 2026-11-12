@@ -517,9 +517,10 @@ impl Road {
         // side : None = chaussée (jamais ouverte), Some(-1 / 1) = bord gauche / droit
         let mut strip = |cols: &[(f32, f32, f32)], vlen: f32, key: u64, coll: u8, side: Option<f32>| {
             let base = pos.len() as u32;
-            for (p, r, d) in &frames {
-                for (off, dz, u) in cols {
-                    pos.push(*p + *r * *off + v3(0.0, 0.0, *dz));
+            let lines: Vec<Vec<V3>> = cols.iter().map(|c| offset_line(&frames, c.0)).collect();
+            for (i, (_, _, d)) in frames.iter().enumerate() {
+                for (c, (_, dz, u)) in cols.iter().enumerate() {
+                    pos.push(lines[c][i] + v3(0.0, 0.0, *dz));
                     uv.push([*u, *d / vlen]);
                 }
             }
@@ -578,9 +579,10 @@ impl Road {
         for l in k.lines.iter().filter(|_| game_tex) {
             let base = pos.len() as u32;
             let (a, b) = (l.off - l.w * 0.5, l.off + l.w * 0.5);
-            for (p, r, d) in &frames {
-                for (off, u) in [(a, 0.0f32), (b, 1.0)] {
-                    pos.push(*p + *r * off + v3(0.0, 0.0, lift + LINE_LIFT));
+            let (la, lb) = (offset_line(&frames, a), offset_line(&frames, b));
+            for (i, (_, _, d)) in frames.iter().enumerate() {
+                for (q, u) in [(la[i], 0.0f32), (lb[i], 1.0)] {
+                    pos.push(q + v3(0.0, 0.0, lift + LINE_LIFT));
                     uv.push([u, *d / 4.0]);
                 }
             }
@@ -602,6 +604,47 @@ impl Road {
         }
         (pos, uv, parts)
     }
+}
+
+/// Début du passage piéton d'une branche (distance au centre du carrefour) : juste après la chaussée de chaque
+/// route croisée, sur toute la largeur de la chaussée de la branche. Une route qui arrive en biais repousse le
+/// passage (sinon il tombe en travers sur l'autre chaussée) ; à angle droit, c'est le bord de l'autre chaussée,
+/// dans l'alignement de son trottoir.
+pub fn crosswalk_start(j: &Junction, a: &JArm) -> f32 {
+    let mut s: Option<f32> = None;
+    for b in &j.arms {
+        let cos = a.dir[0] * b.dir[0] + a.dir[1] * b.dir[1];
+        let sin = (a.dir[0] * b.dir[1] - a.dir[1] * b.dir[0]).abs();
+        if sin < 0.25 {
+            continue; // même route (ou presque parallèle)
+        }
+        let need = (b.hw + a.hw * cos.abs()) / sin + 0.1;
+        s = Some(s.map_or(need, |v: f32| v.max(need)));
+    }
+    s.unwrap_or(a.len - 3.4)
+}
+
+/// Bord décalé de `off` (à droite si positif) le long des repères (point, droite, distance) d'une route.
+/// Dans un virage plus serré que le décalage, le bord intérieur repartirait en arrière et le trottoir se
+/// replierait sur lui-même : tant qu'un point recule par rapport au dernier gardé (dans le sens de la route),
+/// il est ramené sur ce point (bord en éventail, sans repli).
+fn offset_line(frames: &[(V3, V3, f32)], off: f32) -> Vec<V3> {
+    let mut out: Vec<V3> = Vec::with_capacity(frames.len());
+    for (p, r, _) in frames {
+        let q = *p + *r * off;
+        if off != 0.0 {
+            if let Some(last) = out.last().copied() {
+                let t = v3(-r.y, r.x, 0.0);
+                let dxy = v3(q.x - last.x, q.y - last.y, 0.0);
+                if dxy.dot(t) < 0.01 {
+                    out.push(v3(last.x, last.y, q.z));
+                    continue;
+                }
+            }
+        }
+        out.push(q);
+    }
+    out
 }
 
 /// Disque du carrefour (sommets relatifs à `origin`), à +9,5 cm : au-dessus de la chaussée (+8 cm) pour cacher
@@ -651,7 +694,8 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
         quad(&mut pos, &mut uv, &mut plain, corners, u);
         if crosswalks && a.cross && a.len > 3.6 {
             let z = v3(0.0, 0.0, 0.1);
-            let (d0, d1) = (a.len - 3.4, a.len - 0.4);
+            let d0 = crosswalk_start(j, a);
+            let d1 = d0 + 3.0;
             let q = [c + z - r * a.hw + d * d0, c + z + r * a.hw + d * d0, c + z + r * a.hw + d * d1, c + z - r * a.hw + d * d1];
             let u = [[0.0, 0.0], [a.hw * 2.0, 0.0], [a.hw * 2.0, 1.0], [0.0, 1.0]];
             quad(&mut pos, &mut uv, &mut zebra, q, u);

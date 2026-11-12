@@ -24,10 +24,18 @@ pub struct FileEntry {
     pub archive: u32,
     /// nom en minuscules, avec extension
     pub name: String,
-    /// chemin complet en minuscules (archives comprises)
-    pub path: String,
+    /// dossier du fichier (archives comprises), partagé par tous les fichiers du dossier : le chemin complet n'est
+    /// plus gardé pour chacun des ~390 000 fichiers ; path() le recompose
+    pub dir: std::sync::Arc<str>,
     pub offset: u32,
     pub kind: Kind,
+}
+
+impl FileEntry {
+    /// Chemin complet en minuscules (archives comprises).
+    pub fn path(&self) -> String {
+        format!("{}\\{}", self.dir, self.name)
+    }
 }
 
 pub struct Archive {
@@ -142,7 +150,7 @@ impl Vfs {
             self.errors.push(format!("{logical} : table des entrées illisible (clé ?)"));
             return;
         }
-        let mut stack: Vec<(usize, String)> = vec![(0, logical.to_string())];
+        let mut stack: Vec<(usize, std::sync::Arc<str>)> = vec![(0, std::sync::Arc::from(logical))];
         let mut nested: Vec<(u64, String, u32, String)> = Vec::new();
         while let Some((di, dpath)) = stack.pop() {
             let e = &entries[di * 16..di * 16 + 16];
@@ -153,7 +161,7 @@ impl Vfs {
                 let h2 = u32le(e, 4);
                 if h2 == DIR_MARKER {
                     let nm = read_name(u32le(e, 0) as usize);
-                    stack.push((i, format!("{dpath}\\{nm}")));
+                    stack.push((i, std::sync::Arc::from(format!("{dpath}\\{nm}"))));
                     continue;
                 }
                 let raw = u64::from_le_bytes(e[0..8].try_into().unwrap());
@@ -164,12 +172,11 @@ impl Vfs {
                     let usize_ = u32le(e, 8);
                     let encrypted = u32le(e, 12) == 1;
                     let nm = read_name(name_off);
-                    let path = format!("{dpath}\\{nm}");
                     if nm.ends_with(".rpf") {
                         let inner_size = if fsize > 0 { fsize } else { usize_ };
-                        nested.push((start + offset as u64 * 512, nm.clone(), inner_size, path.clone()));
+                        nested.push((start + offset as u64 * 512, nm.clone(), inner_size, format!("{dpath}\\{nm}")));
                     }
-                    self.files.push(FileEntry { archive: arch_idx, name: nm, path, offset, kind: Kind::Binary { size: fsize, usize: usize_, encrypted } });
+                    self.files.push(FileEntry { archive: arch_idx, name: nm, dir: dpath.clone(), offset, kind: Kind::Binary { size: fsize, usize: usize_, encrypted } });
                 } else {
                     let name_off = u16::from_le_bytes([e[0], e[1]]) as usize;
                     let mut fsize = e[2] as u32 | (e[3] as u32) << 8 | (e[4] as u32) << 16;
@@ -182,8 +189,7 @@ impl Vfs {
                         }
                     }
                     let nm = read_name(name_off);
-                    let path = format!("{dpath}\\{nm}");
-                    self.files.push(FileEntry { archive: arch_idx, name: nm, path, offset, kind: Kind::Resource { size: fsize, sys, gfx } });
+                    self.files.push(FileEntry { archive: arch_idx, name: nm, dir: dpath.clone(), offset, kind: Kind::Resource { size: fsize, sys, gfx } });
                 }
             }
         }

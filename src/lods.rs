@@ -49,22 +49,22 @@ impl DwApp {
             let p = &w.ents[pi];
             if p.nchild != 1 {
                 // parent commun à plusieurs bâtiments : on garde la version détaillée jusqu'à sa distance
-                e.lod_dist = e.lod_dist.max(p.lod_dist.min(1500.0));
+                e.lod_dist = e.lod_dist.max(p.lod_dist().min(1500.0));
                 continue;
             }
             // copie de la version lointaine, déplacée et tournée comme la copie du bâtiment
-            let dq = e.rot.mul(o.rot.inverse()).normalized();
+            let dq = e.rot.mul(o.rot().inverse()).normalized();
             let mut l = Entity::new(&w.name_of(p.arch), e.pos + dq.rotate(p.pos - o.pos));
-            l.rot = dq.mul(p.rot).normalized();
-            l.scale_xy = p.sxy;
-            l.scale_z = p.sz;
+            l.rot = dq.mul(p.rot()).normalized();
+            l.scale_xy = p.sxy();
+            l.scale_z = p.sz();
             // les niveaux au-dessus (SLOD) sont communs à tout un quartier et ne sont pas copiés : la version
             // lointaine reste affichée jusqu'à la distance du plus haut d'entre eux (3 000 m au plus)
-            let mut far = p.lod_dist;
+            let mut far = p.lod_dist();
             let mut up = w.lod_parent(pi);
             let mut guard = 0;
             while let Some(q) = up {
-                far = far.max(w.ents[q].lod_dist);
+                far = far.max(w.ents[q].lod_dist());
                 up = w.lod_parent(q);
                 guard += 1;
                 if guard > 6 {
@@ -72,7 +72,7 @@ impl DwApp {
                 }
             }
             l.lod_dist = far.min(3000.0);
-            l.child_lod_dist = p.child_lod_dist;
+            l.child_lod_dist = p.child_lod_dist();
             l.lod_level = "LODTYPES_DEPTH_LOD".into();
             l.num_children = 1;
             l.parent_index = -1;
@@ -81,7 +81,7 @@ impl DwApp {
             // 0x06002d03), comme tous les objets du jeu dans ce cas
             e.flags = crate::mlo::lod_in_parent_flags(e.flags, true);
             e.lod_level = "LODTYPES_DEPTH_HD".into();
-            e.lod_dist = o.lod_dist;
+            e.lod_dist = o.lod_dist();
             lod.entities.push(l);
         }
         let n = lod.entities.len();

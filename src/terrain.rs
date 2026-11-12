@@ -125,6 +125,9 @@ pub struct TerrainState {
     /// végétation : ensemble choisi, densité (0..1), dernier point semé
     pub veg_set: usize,
     pub veg_density: f32,
+    /// écart minimal entre deux objets de végétation (m), réglé par la personne ; 0 = celui de l'ensemble
+    /// selon la densité
+    pub veg_spacing: f32,
     pub veg_last: Option<V3>,
     /// pinceau végétation : 0 objets (arbres, buissons…), 1 herbe du jeu ; herbe choisie (grass::KINDS) ; biome
     pub veg_mode: u8,
@@ -160,6 +163,7 @@ impl Default for TerrainState {
             road_pts: Vec::new(),
             veg_set: 0,
             veg_density: 0.5,
+            veg_spacing: 0.0,
             veg_last: None,
             veg_mode: 0,
             grass_kind: 0,
@@ -328,23 +332,70 @@ impl Terrain {
             let v = self.h[k];
             std::sync::Arc::make_mut(&mut self.h)[k] = v + (target - v) * w;
         }
+        // couleur du sol sous la route (vue de loin, version simplifiée) : seulement les cases entièrement
+        // couvertes par la route, trottoirs ou accotements compris — une case de 2 m à moitié dessous dépassait
+        // du bord en marches d'escalier
         let m = if r.kind().dirt { 1 } else { ROAD };
-        let hw = r.kind().width * 0.5;
+        let cover = half - 0.05;
         for j in 0..ny - 1 {
             for i in 0..nx - 1 {
-                let x = self.origin.x + (i as f32 + 0.5) * self.cell;
-                let y = self.origin.y + (j as f32 + 0.5) * self.cell;
                 let k = j * nx + i;
                 if best[k].0 > reach {
                     continue;
                 }
-                if let Some((d, _)) = r.nearest(x, y) {
-                    if d <= hw {
-                        std::sync::Arc::make_mut(&mut self.mat)[j * (nx - 1) + i] = m;
-                    }
+                let x0 = self.origin.x + i as f32 * self.cell;
+                let y0 = self.origin.y + j as f32 * self.cell;
+                let inside = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+                    .iter()
+                    .all(|(a, b)| r.nearest(x0 + a * self.cell, y0 + b * self.cell).map(|(d, _)| d <= cover).unwrap_or(false));
+                if inside {
+                    std::sync::Arc::make_mut(&mut self.mat)[j * (nx - 1) + i] = m;
                 }
             }
         }
+    }
+
+    /// Plus haute surface dessinée sous (x, y) : terrain, chaussées, trottoirs, accotements et carrefours
+    /// (triangles des routes, sans les marquages). None hors du terrain et des routes.
+    pub fn surface_at(&self, x: f32, y: f32) -> Option<f32> {
+        let mut best = self.height_at(x, y);
+        let o = v3(x, y, 0.0);
+        let mut scan = |pos: &[V3], parts: &[(u64, Vec<u32>, u8)]| {
+            for (_, idx, coll) in parts {
+                if *coll == crate::roads::NO_COLLISION {
+                    continue;
+                }
+                for t in idx.chunks_exact(3) {
+                    let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+                    // point (0, 0) dans le triangle, à plat (coordonnées barycentriques)
+                    let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+                    if det.abs() < 1e-6 {
+                        continue; // face verticale (bordure, jupe)
+                    }
+                    let u = ((0.0 - a.x) * (c.y - a.y) - (c.x - a.x) * (0.0 - a.y)) / det;
+                    let v = ((b.x - a.x) * (0.0 - a.y) - (0.0 - a.x) * (b.y - a.y)) / det;
+                    if u < -1e-4 || v < -1e-4 || u + v > 1.0 + 1e-4 {
+                        continue;
+                    }
+                    let z = a.z + (b.z - a.z) * u + (c.z - a.z) * v;
+                    best = Some(best.map_or(z, |m: f32| m.max(z)));
+                }
+            }
+        };
+        for r in &self.roads {
+            if r.nearest(x, y).map(|(d, _)| d <= r.half_total() + 1.0).unwrap_or(false) {
+                let (pos, _, parts) = r.mesh(o);
+                scan(&pos, &parts);
+            }
+        }
+        for j in &self.junctions {
+            let reach = j.arms.iter().map(|a| a.len + a.total).fold(j.r, f32::max) + 2.0;
+            if (j.pos[0] - x).powi(2) + (j.pos[1] - y).powi(2) <= reach * reach {
+                let (pos, _, parts) = crate::roads::junction_mesh(j, o);
+                scan(&pos, &parts);
+            }
+        }
+        best
     }
 
     /// Morceau du terrain (sommets i0..=i1, j0..=j1) comme un terrain à part, coin bas-gauche décalé.
@@ -1479,8 +1530,9 @@ impl DwApp {
                 let b = egui::Button::new(RichText::new(s.name).color(if self.terrain.veg_set == i { Color32::BLACK } else { Color32::from_rgb(140, 210, 120) }))
                     .min_size(egui::vec2(140.0, 26.0))
                     .fill(if self.terrain.veg_set == i { Color32::from_rgb(140, 210, 120) } else { Color32::from_gray(40) });
-                if ui.add(b).on_hover_text(format!("{} · {n} modèles du jeu · écart {:.0} m", s.tip, s.spacing)).clicked() {
+                if ui.add(b).on_hover_text(format!("{} · {n} modèles du jeu · écart proposé {:.1} m", s.tip, crate::vegetation::default_spacing(i))).clicked() {
                     self.terrain.veg_set = i;
+                    self.terrain.veg_spacing = 0.0; // reprend l'écart de cet ensemble
                     self.terrain.veg_mode = 0;
                     self.set_terrain_brush(Brush::Vegetation);
                 }
@@ -1493,8 +1545,12 @@ impl DwApp {
             ui.label("Rayon");
             ui.add(egui::Slider::new(&mut self.terrain.radius, 2.0..=120.0).suffix(" m"));
             ui.end_row();
-            ui.label("Densité");
-            ui.add(egui::Slider::new(&mut self.terrain.veg_density, 0.05..=1.0).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+            if self.terrain.veg_spacing <= 0.0 {
+                self.terrain.veg_spacing = crate::vegetation::default_spacing(self.terrain.veg_set);
+            }
+            ui.label("Écart entre les objets");
+            ui.add(egui::Slider::new(&mut self.terrain.veg_spacing, 1.0..=40.0).step_by(0.5).suffix(" m"))
+                .on_hover_text("Distance minimale entre deux arbres (ou buissons, rochers…) : plus petit = plus serré. Compte aussi la végétation déjà posée. Repris à chaque changement d'ensemble.");
             ui.end_row();
         });
         let s = &crate::vegetation::SETS[self.terrain.veg_set];

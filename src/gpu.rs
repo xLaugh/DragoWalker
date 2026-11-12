@@ -120,6 +120,10 @@ pub struct Gpu {
     custom_src: HashMap<u32, Loaded>,
     /// leurs textures : jamais libérées (un modèle resté chargé ne saurait pas les redemander)
     pinned_tex: HashSet<u64>,
+    /// mémoire de la carte graphique (Mo) si elle est connue, et mémoire visée (modèles, textures), lues au premier
+    /// dessin
+    pub vram_mb: Option<usize>,
+    pub budget: Option<(usize, usize)>,
 }
 
 /// Côté de la carte des ombres (pixels) — choix de DragoWalker.
@@ -127,9 +131,47 @@ pub const SHADOW_SIZE: i32 = 2048;
 
 /// Requêtes en cours au plus (les plus proches d'abord).
 const MAX_IN_FLIGHT: usize = 256;
-/// Mémoire graphique visée pour les modèles et les textures.
-const MESH_BUDGET: usize = 1_400_000_000;
-const TEX_BUDGET: usize = 700_000_000;
+/// Mémoire graphique visée au plus pour les modèles et les textures (les valeurs d'avant, fixes pour tous les PC).
+const MESH_BUDGET_MAX: usize = 1_400_000_000;
+const TEX_BUDGET_MAX: usize = 700_000_000;
+/// Part de la mémoire de la carte graphique laissée aux modèles et textures de la vue (le reste : pilote, ombres,
+/// fenêtre, autres programmes, FiveM ouvert à côté) — **estimé**.
+const VRAM_SHARE: f32 = 0.55;
+/// Mémoire supposée quand la carte ne la donne pas (cartes Intel, graphique intégré) : 1 Go — **estimé**, prudent.
+const VRAM_UNKNOWN_MB: usize = 1024;
+/// Plancher de la mémoire visée (Mo) : en dessous, la vue passerait son temps à recharger.
+const BUDGET_MIN_MB: usize = 384;
+
+/// Mémoire de la carte graphique (Mo) d'après OpenGL : NVIDIA (GL_NVX_gpu_memory_info, mémoire dédiée totale),
+/// AMD (GL_ATI_meminfo, mémoire libre pour les textures au démarrage). None si la carte ne la donne pas.
+pub unsafe fn detect_vram_mb(gl: &glow::Context) -> Option<usize> {
+    let ext = gl.supported_extensions();
+    if ext.contains("GL_NVX_gpu_memory_info") {
+        // GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX (Ko)
+        let kb = gl.get_parameter_i32(0x9047);
+        if kb > 0 {
+            return Some(kb as usize / 1024);
+        }
+    }
+    if ext.contains("GL_ATI_meminfo") {
+        // TEXTURE_FREE_MEMORY_ATI : [libre, plus grand bloc, libre partagée, plus grand bloc partagé] (Ko)
+        let mut v = [0i32; 4];
+        gl.get_parameter_i32_slice(0x87FC, &mut v);
+        if v[0] > 0 {
+            return Some(v[0] as usize / 1024);
+        }
+    }
+    None
+}
+
+/// Mémoire visée (modèles, textures) en octets : réglage « gpu_budget_mb » s'il est donné (Mo, 0 = automatique),
+/// sinon une part de la mémoire de la carte ; deux tiers pour les modèles, un tiers pour les textures, comme avant.
+pub fn budget_for(vram_mb: Option<usize>) -> (usize, usize) {
+    let manual = crate::app::load_settings()["gpu_budget_mb"].as_u64().unwrap_or(0) as usize;
+    let total_mb = if manual > 0 { manual } else { (vram_mb.unwrap_or(VRAM_UNKNOWN_MB) as f32 * VRAM_SHARE) as usize };
+    let total = total_mb.max(BUDGET_MIN_MB) << 20;
+    ((total * 2 / 3).min(MESH_BUDGET_MAX), (total / 3).min(TEX_BUDGET_MAX))
+}
 
 impl Gpu {
     /// Mémoire graphique prise par les modèles et les textures (Mo).
@@ -163,7 +205,14 @@ impl Gpu {
             shadow_tex: None,
             custom_src: HashMap::new(),
             pinned_tex: HashSet::new(),
+            vram_mb: None,
+            budget: None,
         }
+    }
+
+    /// Recalcule la mémoire visée (après un changement du réglage).
+    pub fn reset_budget(&mut self) {
+        self.budget = Some(budget_for(self.vram_mb));
     }
 
     /// Demande le modèle d'un type d'objet s'il n'est pas déjà connu. Rend vrai s'il est prêt.
@@ -482,11 +531,19 @@ void main() {{
 
     /// Libère les modèles et textures les moins utilisés quand la mémoire visée est dépassée.
     unsafe fn evict(&mut self, gl: &glow::Context) {
-        if self.mesh_bytes > MESH_BUDGET {
+        if self.budget.is_none() {
+            self.vram_mb = detect_vram_mb(gl);
+            self.budget = Some(budget_for(self.vram_mb));
+            if std::env::var("DW_DEBUG_GPU").is_ok() {
+                println!("carte graphique : {:?} Mo, mémoire visée {:?} (modèles, textures en Mo)", self.vram_mb, self.budget.map(|b| (b.0 >> 20, b.1 >> 20)));
+            }
+        }
+        let (mesh_budget, tex_budget) = self.budget.unwrap_or((MESH_BUDGET_MAX, TEX_BUDGET_MAX));
+        if self.mesh_bytes > mesh_budget {
             let mut v: Vec<(u64, u32)> = self.slots.iter().filter_map(|(k, s)| if let Slot::Ready(m) = s { Some((m.last, *k)) } else { None }).collect();
             v.sort();
             for (last, k) in v {
-                if self.mesh_bytes <= MESH_BUDGET * 8 / 10 || last + 30 > self.frame {
+                if self.mesh_bytes <= mesh_budget * 8 / 10 || last + 30 > self.frame {
                     break;
                 }
                 if let Some(Slot::Ready(m)) = self.slots.remove(&k) {
@@ -497,11 +554,11 @@ void main() {{
                 }
             }
         }
-        if self.tex_bytes > TEX_BUDGET {
+        if self.tex_bytes > tex_budget {
             let mut v: Vec<(u64, u64)> = self.textures.iter().filter(|(k, _)| !self.pinned_tex.contains(k)).map(|(k, t)| (t.last, *k)).collect();
             v.sort();
             for (last, k) in v {
-                if self.tex_bytes <= TEX_BUDGET * 8 / 10 || last + 30 > self.frame {
+                if self.tex_bytes <= tex_budget * 8 / 10 || last + 30 > self.frame {
                     break;
                 }
                 if let Some(t) = self.textures.remove(&k) {

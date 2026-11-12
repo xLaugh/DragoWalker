@@ -161,18 +161,18 @@ pub fn probe(game: &str, cw: &str) {
                 println!("visibles près de Legion Square : {}", near.len());
                 for &i in near.iter().take(5) { let e = &w.ents[i as usize]; println!("   {} {:?} lod {} box {:?}", w.name_of(e.arch), e.pos, e.lod_level, w.arch_box(e.arch)); }
                 for h in w.catalog.iter().take(5) { println!("   cat {}", w.name_of(*h)); }
-                for k in ["mpheist4", "mpheist"] { let pre = format!("dlcpacks\\{k}\\"); let n = w.vfs.files.iter().filter(|f| f.path.starts_with(&pre)).count(); let ny = w.vfs.files.iter().filter(|f| f.path.starts_with(&pre) && f.name.ends_with(".ymap")).count(); println!("fichiers {k} : {n} dont ymap {ny}"); }
+                for k in ["mpheist4", "mpheist"] { let pre = format!("dlcpacks\\{k}\\"); let n = w.vfs.files.iter().filter(|f| f.path().starts_with(&pre)).count(); let ny = w.vfs.files.iter().filter(|f| f.path().starts_with(&pre) && f.name.ends_with(".ymap")).count(); println!("fichiers {k} : {n} dont ymap {ny}"); }
                 println!("ordre : {:?}", w.groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>());
                 for f in w.vfs.files.iter().filter(|f| f.name.starts_with("heightmap") && f.name.ends_with(".dat")) {
                     let d = w.vfs.read_binary(f, &w.keys);
                     match d.as_ref().and_then(|d| heightmap::Heightmap::parse(d)) {
                         Some(hm) => {
-                            println!("{} : {}x{} {:?}..{:?}", f.path, hm.w, hm.h, hm.min, hm.max);
+                            println!("{} : {}x{} {:?}..{:?}", f.path(), hm.w, hm.h, hm.min, hm.max);
                             for (n, x, y) in [("Legion Square", 195.0, -934.0), ("Chiliad", 501.0, 5593.0), ("ocean", -3000.0, 0.0), ("Sandy", 1900.0, 3700.0), ("Cayo", 4890.0, -5170.0), ("NY", 3360.0, -4849.0)] {
                                 println!("   {n:<14} {:?}", hm.height(x, y));
                             }
                         }
-                        None => println!("{} : illisible ({} octets) {:02x?}", f.path, d.as_ref().map(|d| d.len()).unwrap_or(0), d.as_ref().map(|d| d[..64.min(d.len())].to_vec())),
+                        None => println!("{} : illisible ({} octets) {:02x?}", f.path(), d.as_ref().map(|d| d.len()).unwrap_or(0), d.as_ref().map(|d| d[..64.min(d.len())].to_vec())),
                     }
                 }
                 for n in ["prop_bench_01a", "prop_streetlight_01", "prop_tree_pine_01", "prop_bin_01a", "prop_dumpster_01a", "prop_barrier_work05"] {
@@ -180,7 +180,7 @@ pub fn probe(game: &str, cw: &str) {
                     let t = std::time::Instant::now();
                     match w.load_model(h, 20000) {
                         Some(m) => println!("modèle {n} : {} sommets {} triangles, boîte {:?}..{:?} (type {:?}) {:.0} ms", m.pos.len(), m.tris.len(), m.min, m.max, w.arch_box(h), t.elapsed().as_millis()),
-                        None => println!("modèle {n} : introuvable (fichiers {:?})", w.models.get(&h).map(|v| v.iter().map(|&i| w.vfs.files[i].path.clone()).collect::<Vec<_>>())),
+                        None => println!("modèle {n} : introuvable (fichiers {:?})", w.models.get(&h).map(|v| v.iter().map(|&i| w.vfs.files[i].path().clone()).collect::<Vec<_>>())),
                     }
                 }
                 for (lbl, x, y, ez) in [("legion", 195.0f32, -934.0f32, 600.0f32), ("cayo", 4890.0, -5170.0, 2000.0), ("carte", 0.0, 0.0, 6000.0)] {
@@ -240,13 +240,13 @@ pub fn probe(game: &str, cw: &str) {
                     let (mut n, mut ok_as_is, mut ok_inv) = (0usize, 0usize, 0usize);
                     let mut ex = Vec::new();
                     for (mi, m) in w.ents.iter().enumerate().filter(|(_, e)| e.mlo && e.lod_level == 0) {
-                        let ym = m.rot.heading_deg();
+                        let ym = m.rot().heading_deg();
                         if m90(ym) < 3.0 {
                             continue;
                         }
                         let best = w.ents.iter().filter(|b| !b.mlo && b.lod_level == 0 && (b.pos - m.pos).len() < 20.0).filter(|b| { let n = w.name_of(b.arch); !crate::buildings::is_prop_name(&n) && !n.contains("tree") && !n.contains("bush") && !n.contains("decal") }).filter(|b| { let (a, c) = w.arch_box(b.arch); let s = c - a; s.x.max(s.y) > 8.0 && s.z > 4.0 }).min_by(|a, b| (a.pos - m.pos).len().partial_cmp(&(b.pos - m.pos).len()).unwrap_or(std::cmp::Ordering::Equal));
                         let Some(b) = best else { continue };
-                        let yb = b.rot.heading_deg();
+                        let yb = b.rot().heading_deg();
                         let d_as_is = m90(ym - yb);
                         let d_inv = m90(-ym - yb);
                         n += 1;
@@ -318,8 +318,8 @@ pub fn probe(game: &str, cw: &str) {
                             }
                             groups += 1;
                             let c = g.iter().fold(v3(0.0, 0.0, 0.0), |a, o| a + o.pos) * (1.0 / g.len() as f32);
-                            let f = e.rot.rotate(v3(0.0, -1.0, 0.0));
-                            let arm = e.rot.rotate(v3(-1.0, 0.0, 0.0));
+                            let f = e.rot().rotate(v3(0.0, -1.0, 0.0));
+                            let arm = e.rot().rotate(v3(-1.0, 0.0, 0.0));
                             let rel = e.pos - c;
                             let along = rel.x * f.x + rel.y * f.y;
                             let side = rel.x * arm.x + rel.y * arm.y;
@@ -358,7 +358,7 @@ pub fn probe(game: &str, cw: &str) {
                             }
                         }
                         if !hits.is_empty() && shown < 600 {
-                            println!("   {} : {}", f.path, hits.join(", "));
+                            println!("   {} : {}", f.path(), hits.join(", "));
                             shown += 1;
                         }
                     }
@@ -374,9 +374,9 @@ pub fn probe(game: &str, cw: &str) {
                             Some(d) => {
                                 let out = dir.join(format!("{i}_{}", f.name));
                                 let _ = std::fs::write(&out, &d);
-                                println!("   {} ({} octets) -> {}", f.path, d.len(), out.display());
+                                println!("   {} ({} octets) -> {}", f.path(), d.len(), out.display());
                             }
-                            None => println!("   {} illisible", f.path),
+                            None => println!("   {} illisible", f.path()),
                         }
                     }
                 }
@@ -399,7 +399,7 @@ pub fn probe(game: &str, cw: &str) {
                         if m.blocks.iter().any(|b| b.0 == want) {
                             if let Some(raw) = w.vfs.raw_resource_file(f) {
                                 let _ = std::fs::write(dir.join(&f.name), raw);
-                                println!("   {} ", f.path);
+                                println!("   {} ", f.path());
                                 n += 1;
                             }
                         }
@@ -469,12 +469,12 @@ pub fn probe(game: &str, cw: &str) {
                 }
                 // DW_SCEN=1 : blocs d'un fichier de scénarios (.ymt)
                 if std::env::var("DW_SCEN").is_ok() {
-                    let files: Vec<&rpf::FileEntry> = w.vfs.files.iter().filter(|f| f.name.ends_with(".ymt") && f.path.to_lowercase().contains("scenario")).collect();
+                    let files: Vec<&rpf::FileEntry> = w.vfs.files.iter().filter(|f| f.name.ends_with(".ymt") && f.path().to_lowercase().contains("scenario")).collect();
                     println!("scénarios : {} fichiers .ymt", files.len());
                     for f in files.iter().take(2) {
                         if let Some(r) = w.vfs.read_resource(f, &w.keys) {
                             if let Some(m) = meta::Meta::parse(&r) {
-                                println!("  {} : {:?}", f.path, m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
+                                println!("  {} : {:?}", f.path(), m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>());
                             }
                         }
                     }
@@ -543,6 +543,44 @@ pub fn probe(game: &str, cw: &str) {
                         println!("  ex. {} : {:?}", w.name_of(*a), l);
                     }
                 }
+                // DW_MEM=1 : place en mémoire des grosses structures du monde chargé (estimation)
+                if std::env::var("DW_MEM").is_ok() {
+                    let mo = |b: usize| b as f64 / 1048576.0;
+                    let s_ents = w.ents.capacity() * std::mem::size_of::<world::WEnt>();
+                    // dossiers partagés : comptés une fois chacun
+                    let dirs: std::collections::HashSet<*const u8> = w.vfs.files.iter().map(|f| f.dir.as_ptr()).collect();
+                    let dirs_bytes: usize = {
+                        let mut seen = std::collections::HashSet::new();
+                        w.vfs.files.iter().filter(|f| seen.insert(f.dir.as_ptr())).map(|f| f.dir.len() + 16).sum()
+                    };
+                    let s_files: usize = w.vfs.files.capacity() * std::mem::size_of::<rpf::FileEntry>() + w.vfs.files.iter().map(|f| f.name.capacity()).sum::<usize>() + dirs_bytes;
+                    let s_arch = w.archetypes.capacity() * (std::mem::size_of::<world::Arch>() + 4 + 8);
+                    let s_names: usize = w.names.iter().map(|(_, n)| n.capacity() + 24 + 4 + 8).sum();
+                    let s_cols = w.colors.capacity() * (4 + 3 + 9);
+                    let s_mlo: usize = w.mlo_defs.values().map(|d| d.children.capacity() * std::mem::size_of::<world::MloChild>()).sum();
+                    let s_ymaps: usize = w.ymaps.iter().map(|y| std::mem::size_of::<world::WYmap>() + y.name.capacity()).sum();
+                    let s_maps: usize = (w.models.capacity() + w.txds.capacity()) * 40 + w.arch_dicts.capacity() * 16 + w.txd_parents.capacity() * 12;
+                    let s_hm: usize = w.heightmaps.iter().map(|h| std::mem::size_of_val(h)).sum();
+                    println!("mémoire (estimation) :");
+                    println!("   objets placés     {:>9} × {} o = {:7.1} Mo", w.ents.len(), std::mem::size_of::<world::WEnt>(), mo(s_ents));
+                    println!("   fichiers (archives) {:>7}     = {:7.1} Mo (nom de chaque fichier, {} dossiers partagés)", w.vfs.files.len(), mo(s_files), dirs.len());
+                    println!("   types d'objets    {:>9} × {} o = {:7.1} Mo", w.archetypes.len(), std::mem::size_of::<world::Arch>(), mo(s_arch));
+                    println!("   noms              {:>9}     = {:7.1} Mo", w.names.len(), mo(s_names));
+                    println!("   couleurs          {:>9}     = {:7.1} Mo", w.colors.len(), mo(s_cols));
+                    println!("   intérieurs        {:>9}     = {:7.1} Mo", w.mlo_defs.len(), mo(s_mlo));
+                    println!("   cartes (ymap)     {:>9}     = {:7.1} Mo", w.ymaps.len(), mo(s_ymaps));
+                    println!("   index modèles/textures      = {:7.1} Mo", mo(s_maps));
+                    println!("   reliefs                     = {:7.1} Mo (structures seules)", mo(s_hm));
+                }
+                // DW_MLO_KIDS=nom : objets d'un intérieur (modèle, variante, taille)
+                if let Ok(n) = std::env::var("DW_MLO_KIDS") {
+                    if let Some(d) = w.mlo_defs.get(&crypto::joaat(n.trim())) {
+                        for c in &d.children {
+                            let (mn, mx) = w.arch_box(c.arch);
+                            println!("   {} set {} taille {:.1} × {:.1} × {:.1} à ({:.1} {:.1} {:.1})", w.name_of(c.arch), c.set, mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, c.pos.x, c.pos.y, c.pos.z);
+                        }
+                    }
+                }
                 // DW_MODEL="nom1,nom2" : détail d'un modèle du jeu (parties, triangles, découpe, fichiers)
                 if let Ok(list) = std::env::var("DW_MODEL") {
                     let src = w.model_source();
@@ -550,7 +588,7 @@ pub fn probe(game: &str, cw: &str) {
                     let mut cache = Vec::new();
                     for n in list.split(',') {
                         let h = crypto::joaat(n.trim());
-                        println!("modèle {n} : fichiers {:?}, type {:?}", w.models.get(&h).map(|v| v.iter().map(|&i| w.vfs.files[i].path.clone()).collect::<Vec<_>>()), w.archetypes.get(&h).map(|a| (w.name_of(a.drawable_dict), w.name_of(a.texture_dict), a.asset_type)));
+                        println!("modèle {n} : fichiers {:?}, type {:?}", w.models.get(&h).map(|v| v.iter().map(|&i| w.vfs.files[i].path().clone()).collect::<Vec<_>>()), w.archetypes.get(&h).map(|a| (w.name_of(a.drawable_dict), w.name_of(a.texture_dict), a.asset_type)));
                         let l = src.load(h, &claimed, &mut cache);
                         match &l.model {
                             Some(m) => {
@@ -632,7 +670,7 @@ pub fn probe(game: &str, cw: &str) {
                                     for &ei in all.iter().filter(|&&ei| covers(ei)).take(6) {
                                         let e = &w.ents[ei as usize];
                                         let d = (e.pos - eye).len();
-                                        println!("    {:<34} lod {} lodDist {:.0} childLod {:.0} enfants {} dist {:.0} ymap {} visible {}", w.name_of(e.arch), e.lod_level, e.lod_dist, e.child_lod_dist, e.nchild, d, w.ymaps[e.ymap as usize].name, w.ymaps[e.ymap as usize].visible);
+                                        println!("    {:<34} lod {} lodDist {:.0} childLod {:.0} enfants {} dist {:.0} ymap {} visible {}", w.name_of(e.arch), e.lod_level, e.lod_dist(), e.child_lod_dist(), e.nchild, d, w.ymaps[e.ymap as usize].name, w.ymaps[e.ymap as usize].visible);
                                     }
                                 }
                             }
@@ -658,7 +696,7 @@ pub fn probe(game: &str, cw: &str) {
                     println!("gtxd : {} fichiers, {} parents", g.len(), w.txd_parents.len());
                     for f in g.iter().take(6) {
                         let d = w.vfs.read_binary(f, &w.keys);
-                        println!("  {} {:?} {:02x?}", f.path, d.as_ref().map(|d| d.len()), d.as_ref().map(|d| d[..d.len().min(220)].to_vec()));
+                        println!("  {} {:?} {:02x?}", f.path(), d.as_ref().map(|d| d.len()), d.as_ref().map(|d| d[..d.len().min(220)].to_vec()));
                     }
                 }
                 {
@@ -670,7 +708,7 @@ pub fn probe(game: &str, cw: &str) {
                         let e = &w.ents[*i];
                         if let Some(d) = w.mlo_defs.get(&e.arch) {
                             let n = d.children.len().max(1) as f32;
-                            let c = d.children.iter().fold(crate::math::v3(0.0, 0.0, 0.0), |a, k| a + e.pos + e.rot.rotate(k.pos)) * (1.0 / n);
+                            let c = d.children.iter().fold(crate::math::v3(0.0, 0.0, 0.0), |a, k| a + e.pos + e.rot().rotate(k.pos)) * (1.0 / n);
                             println!("   centre des objets de {} : {:?}", w.name_of(e.arch), c);
                         }
                     }
@@ -685,7 +723,7 @@ pub fn probe(game: &str, cw: &str) {
                             continue;
                         }
                         let in_sets = d.children.iter().filter(|c| c.set >= 0 && d.sets.get(c.set as usize).map(|h| sets.contains(h) || sets.contains(&(c.set as u32))).unwrap_or(false)).count();
-                        let center = d.children.iter().fold(crate::math::v3(0.0, 0.0, 0.0), |a, k| a + e.pos + e.rot.rotate(k.pos)) * (1.0 / d.children.len().max(1) as f32);
+                        let center = d.children.iter().fold(crate::math::v3(0.0, 0.0, 0.0), |a, k| a + e.pos + e.rot().rotate(k.pos)) * (1.0 / d.children.len().max(1) as f32);
                         let by_name: Vec<bool> = sets.iter().map(|h| d.sets.contains(h)).collect();
                         println!("groupes {} à {:?} centre {:?} : {} groupes {:?}, défaut {:?} (noms trouvés {:?}), {} objets activés par les groupes", w.name_of(e.arch), e.pos, center, d.sets.len(), d.sets.iter().map(|h| w.name_of(*h)).collect::<Vec<_>>(), sets.iter().map(|h| w.name_of(*h)).collect::<Vec<_>>(), by_name, in_sets);
                         shown += 1;
@@ -720,15 +758,15 @@ pub fn probe(game: &str, cw: &str) {
     println!("ymap {ymaps} ytyp {ytyps}");
     if let Some(f) = vfs.files.iter().find(|f| f.name == "dlclist.xml") {
         match vfs.read_binary(f, &keys) {
-            Some(d) => println!("{} :\n{}", f.path, String::from_utf8_lossy(&d[..d.len().min(400)])),
-            None => println!("{} illisible", f.path),
+            Some(d) => println!("{} :\n{}", f.path(), String::from_utf8_lossy(&d[..d.len().min(400)])),
+            None => println!("{} illisible", f.path()),
         }
     }
     println!("hachages : CMapData {} CEntityDef {} CMloInstanceDef {} CMapTypes {}", meta::struct_hash("CMapData"), meta::struct_hash("CEntityDef"), meta::struct_hash("CMloInstanceDef"), meta::struct_hash("CMapTypes"));
-    for f in vfs.files.iter().filter(|f| f.name.ends_with(".ymap") && !f.path.contains("lodlights")).take(3) {
-        let Some(r) = vfs.read_resource(f, &keys) else { println!("{} illisible", f.path); continue };
+    for f in vfs.files.iter().filter(|f| f.name.ends_with(".ymap") && !f.path().contains("lodlights")).take(3) {
+        let Some(r) = vfs.read_resource(f, &keys) else { println!("{} illisible", f.path()); continue };
         let m = meta::Meta::parse(&r);
-        println!("{} : blocs {:?}", f.path, m.as_ref().map(|m| m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>()));
+        println!("{} : blocs {:?}", f.path(), m.as_ref().map(|m| m.blocks.iter().map(|b| (b.0, b.2)).collect::<Vec<_>>()));
         if let Some(y) = meta::parse_ymap(&r) {
             println!("  name {:08x} entités {} ext {:?}..{:?}", y.name, y.entities.len(), y.streaming_min, y.streaming_max);
             for e in y.entities.iter().take(3) { println!("   {:?}", e); }
@@ -737,7 +775,7 @@ pub fn probe(game: &str, cw: &str) {
     for f in vfs.files.iter().filter(|f| f.name.ends_with(".ytyp")).take(2) {
         let Some(r) = vfs.read_resource(f, &keys) else { continue };
         let a = meta::parse_ytyp(&r);
-        println!("{} : {} archétypes", f.path, a.len());
+        println!("{} : {} archétypes", f.path(), a.len());
         for x in a.iter().take(3) { println!("   {:?}", x); }
     }
 }

@@ -113,7 +113,7 @@ impl DwApp {
     fn load_scenarios(&mut self) {
         let Some(w) = self.game.world.as_ref() else { return };
         let mut out = Vec::new();
-        for f in w.vfs.files.iter().filter(|f| f.name.ends_with(".ymt") && f.path.to_lowercase().contains("scenario")) {
+        for f in w.vfs.files.iter().filter(|f| f.name.ends_with(".ymt") && f.path().to_lowercase().contains("scenario")) {
             if let Some(r) = w.vfs.read_resource(f, &w.keys) {
                 if let Some(s) = parse_scenarios(&r, f.name.trim_end_matches(".ymt")) {
                     out.push(s);
@@ -234,7 +234,7 @@ impl DwApp {
                 let mut groups: std::collections::BTreeMap<(u8, u32), usize> = std::collections::BTreeMap::new();
                 for e in w.ents.iter() {
                     if w.ymaps[e.ymap as usize].visible && e.pos.dist2d(t) <= 600.0 {
-                        *groups.entry((e.lod_level.min(5), lod_bucket(e.lod_dist))).or_insert(0) += 1;
+                        *groups.entry((e.lod_level.min(5), lod_bucket(e.lod_dist()))).or_insert(0) += 1;
                     }
                 }
                 ui.label(RichText::new("Par distance d'apparition (décoche pour cacher dans la vue) :").strong());

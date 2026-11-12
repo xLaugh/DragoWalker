@@ -45,6 +45,7 @@ mod mech;
 mod model;
 mod render;
 mod sample;
+mod secret;
 mod server;
 mod signals;
 mod safety;

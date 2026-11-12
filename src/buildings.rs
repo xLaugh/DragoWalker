@@ -156,12 +156,12 @@ pub fn build_whole_list(w: &crate::gta::world::GameWorld) -> Vec<WholeBuilding> 
                 b.count += 1;
                 continue;
             }
-            let inv = e0.rot.inverse();
-            let mut parts = vec![(e0.arch, V3::ZERO, Quat::IDENTITY, e0.sxy, e0.sz)];
+            let inv = e0.rot().inverse();
+            let mut parts = vec![(e0.arch, V3::ZERO, Quat::IDENTITY, e0.sxy(), e0.sz())];
             let (mut mn, mut mx) = (cands[k].2, cands[k].3);
             for &i in &members[j] {
                 let p = &w.ents[cands[i].0];
-                parts.push((p.arch, inv.rotate(p.pos - e0.pos), inv.mul(p.rot).normalized(), p.sxy, p.sz));
+                parts.push((p.arch, inv.rotate(p.pos - e0.pos), inv.mul(p.rot()).normalized(), p.sxy(), p.sz()));
                 mn = mn.min(cands[i].2);
                 mx = mx.max(cands[i].3);
             }

@@ -169,6 +169,162 @@ pub fn merged_tex_model(w: &crate::gta::world::GameWorld, parts: &[(u32, V3, cra
     Some(out)
 }
 
+/// Comme `merged_tex_model`, en plus léger pour un intérieur (des centaines de morceaux) : chaque modèle n'est
+/// chargé et ses petites textures décodées qu'une fois, même posé 30 fois ; pas de grande texture ni de calcul
+/// de ce qui se voit de l'extérieur (tout est gardé).
+pub fn merged_tex_model_lite(parts: &[(u32, V3, crate::math::Quat, f32, f32)], load: &mut dyn FnMut(u32) -> Option<std::sync::Arc<TexModel>>) -> Option<TexModel> {
+    let mut out = TexModel { pos: Vec::new(), uv: Vec::new(), tris: Vec::new(), small: Vec::new(), big: Vec::new(), min: [0.0; 3], max: [0.0; 3], outside: Vec::new() };
+    // modèle chargé et numéro de sa première partie dans `out.small`
+    let mut cache: HashMap<u32, Option<(std::sync::Arc<TexModel>, u16)>> = HashMap::new();
+    for (h, p, q, sxy, sz) in parts {
+        let entry = cache.entry(*h).or_insert_with(|| {
+            let m = load(*h)?;
+            let base = out.small.len() as u16;
+            out.small.extend(m.small.iter().cloned());
+            out.big.extend(m.small.iter().map(|_| None));
+            Some((m, base))
+        });
+        let Some((m, pb)) = entry.as_ref() else { continue };
+        let base = out.pos.len() as u32;
+        out.pos.extend(m.pos.iter().map(|v| {
+            let r = *p + q.rotate(v3(v[0] * sxy, v[1] * sxy, v[2] * sz));
+            [r.x, r.y, r.z]
+        }));
+        out.uv.extend(m.uv.iter().copied());
+        out.tris.extend(m.tris.iter().map(|(t, pi)| ([t[0] + base, t[1] + base, t[2] + base], pi + pb)));
+    }
+    if out.tris.is_empty() {
+        return None;
+    }
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for v in &out.pos {
+        for k in 0..3 {
+            mn[k] = mn[k].min(v[k]);
+            mx[k] = mx[k].max(v[k]);
+        }
+    }
+    out.min = mn;
+    out.max = mx;
+    out.outside = vec![true; out.tris.len()];
+    Some(out)
+}
+
+/// Vignette « maison de poupée » d'un intérieur : vue de trois quarts plongeante, seules les faces tournées vers
+/// la caméra sont dessinées — les murs côté caméra et les plafonds (vus de dos) disparaissent, on voit les pièces
+/// et les meubles. `max_tris` : les plus grands triangles gardés.
+pub fn make_thumb_cutaway(m: &TexModel, frame: u64, max_tris: usize) -> Thumb {
+    let c = [(m.min[0] + m.max[0]) * 0.5, (m.min[1] + m.max[1]) * 0.5, (m.min[2] + m.max[2]) * 0.5];
+    let ext = ((m.max[0] - m.min[0]).powi(2) + (m.max[1] - m.min[1]).powi(2) + (m.max[2] - m.min[2]).powi(2)).sqrt().max(0.01);
+    let (sy, cy) = 0.6f32.sin_cos();
+    let (sp, cp) = CUTAWAY_PITCH.sin_cos();
+    let pts: Vec<[f32; 3]> = m
+        .pos
+        .iter()
+        .map(|p| {
+            let (x, y, z) = (p[0] - c[0], p[1] - c[1], p[2] - c[2]);
+            let rx = x * cy - y * sy;
+            let ry = x * sy + y * cy;
+            [rx / ext * 1.9, (z * cp - ry * sp) / ext * 1.9, ry * cp + z * sp]
+        })
+        .collect();
+    let light = v3(-0.4, 0.6, -0.7).norm();
+    let front = std::env::var("DW_CUT_SIGN").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(CUTAWAY_FRONT);
+    // coupe au-dessus du sol principal (comme la touche C) : sol = tranche de 50 cm où il y a le plus de surface
+    // tournée vers le haut ; ce qui est entièrement plus haut que sol + CUTAWAY_HEIGHT n'est pas dessiné
+    // (plafonds, lampes, étages du dessus)
+    let floor = {
+        let mut bins: HashMap<i32, f32> = HashMap::new();
+        for (t, _) in &m.tris {
+            let (a, b, cc) = (m.pos[t[0] as usize], m.pos[t[1] as usize], m.pos[t[2] as usize]);
+            let n = v3(b[0] - a[0], b[1] - a[1], b[2] - a[2]).cross(v3(cc[0] - a[0], cc[1] - a[1], cc[2] - a[2]));
+            let area = n.len() * 0.5;
+            if area > 1e-4 && n.z / (2.0 * area) > 0.9 {
+                *bins.entry(((a[2] + b[2] + cc[2]) / 3.0 / 0.5).floor() as i32).or_default() += area;
+            }
+        }
+        if std::env::var("DW_DEBUG_CUT").is_ok() {
+            let mut v: Vec<(i32, f32)> = bins.iter().map(|(k, a)| (*k, *a)).collect();
+            v.sort_by_key(|x| x.0);
+            println!("coupe : z de {:.1} à {:.1}, surfaces vers le haut par tranche : {:?}", m.min[2], m.max[2], v.iter().filter(|x| x.1 > 5.0).map(|x| (x.0 as f32 * 0.5, x.1 as i32)).collect::<Vec<_>>());
+        }
+        bins.into_iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(k, _)| k as f32 * 0.5)
+    };
+    let cut = floor.map(|f| f + 0.5 + CUTAWAY_HEIGHT).unwrap_or(f32::MAX);
+    let mut tris: Vec<(f32, f32, [Pos2; 3], [Color32; 3])> = Vec::with_capacity(m.tris.len());
+    for (t, part) in &m.tris {
+        if t.iter().all(|i| m.pos[*i as usize][2] > cut) {
+            continue;
+        }
+        let (a, b, cc) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
+        // aire signée à l'écran (y vers le haut) : négative = face vue de dos
+        let signed = (b[0] - a[0]) * (cc[1] - a[1]) - (cc[0] - a[0]) * (b[1] - a[1]);
+        if signed * front <= 0.0 {
+            continue;
+        }
+        let n = v3(b[0] - a[0], b[1] - a[1], b[2] - a[2]).cross(v3(cc[0] - a[0], cc[1] - a[1], cc[2] - a[2])).norm();
+        let k = (0.62 + 0.55 * n.dot(light).abs()).min(1.15);
+        let img = m.small.get(*part as usize).and_then(|x| x.as_ref());
+        let mut cols = [Color32::BLACK; 3];
+        let mut transparent = 0;
+        for (j, vi) in t.iter().enumerate() {
+            let s = match img {
+                Some(im) => {
+                    let uv = m.uv[*vi as usize];
+                    im.sample(uv[0], uv[1])
+                }
+                None => [184, 184, 184, 255],
+            };
+            if s[3] < 60 {
+                transparent += 1;
+            }
+            cols[j] = Color32::from_rgb((s[0] as f32 * k).min(255.0) as u8, (s[1] as f32 * k).min(255.0) as u8, (s[2] as f32 * k).min(255.0) as u8);
+        }
+        if transparent == 3 {
+            continue;
+        }
+        // sol principal : dessiné avant tout le reste (un grand triangle de sol trié par distance passerait
+        // par-dessus les meubles posés au fond de la pièce)
+        let (wa, wb, wc) = (m.pos[t[0] as usize], m.pos[t[1] as usize], m.pos[t[2] as usize]);
+        let wn = v3(wb[0] - wa[0], wb[1] - wa[1], wb[2] - wa[2]).cross(v3(wc[0] - wa[0], wc[1] - wa[1], wc[2] - wa[2])).norm();
+        let wz = (wa[2] + wb[2] + wc[2]) / 3.0;
+        let is_floor = wn.z > 0.8 && floor.map(|f| wz > f - 0.3 && wz < f + 0.8).unwrap_or(false);
+        let depth = if is_floor { f32::MAX } else { (a[2] + b[2] + cc[2]) / 3.0 };
+        tris.push((signed.abs(), depth, [Pos2::new(a[0], -a[1]), Pos2::new(b[0], -b[1]), Pos2::new(cc[0], -cc[1])], cols));
+    }
+    tris.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+    tris.truncate(max_tris);
+    tris.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    // cadrage : ce qui est dessiné remplit le cadre (un intérieur vu en plongée est plus large que haut)
+    let (mut lo, mut hi) = (Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN));
+    for t in &tris {
+        for q in &t.2 {
+            lo = lo.min(*q);
+            hi = hi.max(*q);
+        }
+    }
+    let span = (hi.x - lo.x).max(hi.y - lo.y);
+    if span > 1e-6 && span.is_finite() {
+        let mid = Pos2::new((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5);
+        let k = 1.9 / span;
+        for t in tris.iter_mut() {
+            for q in t.2.iter_mut() {
+                *q = Pos2::new((q.x - mid.x) * k, (q.y - mid.y) * k);
+            }
+        }
+    }
+    Thumb { tris: tris.into_iter().map(|t| (t.2, t.3)).collect(), last: frame, dims: v3(m.max[0] - m.min[0], m.max[1] - m.min[1], m.max[2] - m.min[2]) }
+}
+
+/// Hauteur gardée au-dessus du sol principal dans la vue « maison de poupée » (m) — **estimé** (sous les plafonds
+/// et les lampes des garages et appartements du jeu).
+const CUTAWAY_HEIGHT: f32 = 2.5;
+/// Plongée de la vue « maison de poupée » (radians) — **estimé**.
+const CUTAWAY_PITCH: f32 = 0.95;
+/// Sens des faces avant à l'écran : +1 si les triangles du jeu sont dans le sens inverse des aiguilles d'une
+/// montre vus de face, −1 sinon (relevé sur les captures, voir la variable DW_CUT_SIGN des tests).
+const CUTAWAY_FRONT: f32 = -1.0;
+
 /// Aperçu texturé : le modèle et ses textures envoyées à egui.
 pub struct TexPreview {
     pub model: TexModel,
@@ -177,10 +333,14 @@ pub struct TexPreview {
 
 /// Charge un modèle du jeu avec ses textures (comme la vue 3D : textures du modèle, du dictionnaire et des parents).
 pub fn load_tex_model(w: &crate::gta::world::GameWorld, h: u32, small_px: u32, big_px: u32) -> Option<TexModel> {
-    let src = w.model_source();
+    load_tex_model_src(&w.model_source(), h, small_px, big_px, &mut Vec::new(), false)
+}
+
+/// Comme `load_tex_model`, depuis une source de modèles (utilisable dans un autre fil) et avec un cache des
+/// dictionnaires de textures partagé entre plusieurs chargements.
+pub fn load_tex_model_src(src: &crate::gta::loader::ModelSource, h: u32, small_px: u32, big_px: u32, ytd_cache: &mut Vec<(u32, std::sync::Arc<crate::gta::rpf::Resource>)>, opaque_only: bool) -> Option<TexModel> {
     let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
-    let mut cache = Vec::new();
-    let l = src.load(h, &claimed, &mut cache);
+    let l = src.load(h, &claimed, ytd_cache);
     let m = l.model?;
     if m.verts.is_empty() || m.idx.len() < 3 {
         return None;
@@ -194,6 +354,20 @@ pub fn load_tex_model(w: &crate::gta::world::GameWorld, h: u32, small_px: u32, b
         let t = texmap.get(&key);
         small.push(t.and_then(|t| crate::texdecode::decode_level(t, small_px)));
         big.push(if big_px > 0 { t.and_then(|t| crate::texdecode::decode_level(t, big_px)) } else { None });
+        if std::env::var("DW_DEBUG_MAGENTA").is_ok() {
+            if let Some(im) = small.last().and_then(|x| x.as_ref()) {
+                let n = (im.px.len() / 4).max(1) as u64;
+                let (r, gg, b) = im.px.chunks_exact(4).fold((0u64, 0u64, 0u64), |a, p| (a.0 + p[0] as u64, a.1 + p[1] as u64, a.2 + p[2] as u64));
+                let (r, gg, b) = (r / n, gg / n, b / n);
+                if r > 150 && b > 150 && gg < 100 {
+                    println!("magenta : modèle {h:08x} partie {gi} terrain {} blend {} tex {:08x} couleur ({r} {gg} {b})", g.terrain, g.blend, g.tex);
+                }
+            }
+        }
+        // opaque_only : sans vitres, décalques ni parties transparentes (vignettes d'intérieurs)
+        if opaque_only && (g.blend != 0 || g.glass) {
+            continue;
+        }
         let end = (g.first + g.count).min(m.idx.len() as u32);
         let mut i = g.first;
         while i + 2 < end {

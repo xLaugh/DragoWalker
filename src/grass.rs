@@ -50,7 +50,7 @@ const _: () = assert!((KINDS.len() + 1) * 7 <= 256);
 pub fn proc_tags(w: Option<&crate::gta::world::GameWorld>) -> Vec<String> {
     let Some(w) = w else { return Vec::new() };
     let mut files: Vec<&crate::gta::rpf::FileEntry> = w.vfs.files.iter().filter(|f| f.name.eq_ignore_ascii_case("procedural.meta")).collect();
-    files.sort_by_key(|f| !f.path.contains("update"));
+    files.sort_by_key(|f| !f.path().contains("update"));
     let Some(d) = files.first().and_then(|f| w.vfs.read_binary(f, &w.keys)) else { return Vec::new() };
     let s = String::from_utf8_lossy(&d);
     let Some(a) = s.find("<procTagTable>") else { return Vec::new() };
@@ -174,7 +174,8 @@ impl DwApp {
                 }
             }
         }
-        let (old_set, old_d) = (self.terrain.veg_set, self.terrain.veg_density);
+        let (old_set, old_d, old_sp) = (self.terrain.veg_set, self.terrain.veg_density, self.terrain.veg_spacing);
+        self.terrain.veg_spacing = 0.0; // les biomes règlent la densité de chaque ensemble
         let mut n = 0;
         let (w, h) = ((nx - 1) as f32 * cell, (ny - 1) as f32 * cell);
         for &(set, d) in b.sets {
@@ -192,6 +193,7 @@ impl DwApp {
         }
         self.terrain.veg_set = old_set;
         self.terrain.veg_density = old_d;
+        self.terrain.veg_spacing = old_sp;
         self.terrain.dirty = true;
         format!("Biome « {} » : {n} objet(s) de végétation semé(s), herbe du jeu sur {cells} case(s). Ctrl+Z pour annuler.", b.name)
     }

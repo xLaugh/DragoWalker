@@ -130,6 +130,12 @@ pub const SETS: [VegSet; 13] = [
 ];
 
 /// Vrai si ce type d'objet fait partie d'un ensemble de végétation.
+/// Écart proposé pour un ensemble (celui qu'on avait avec la densité par défaut de 50 %), arrondi au demi-mètre.
+pub fn default_spacing(set: usize) -> f32 {
+    let s = &SETS[set.min(SETS.len() - 1)];
+    ((s.spacing / 0.5f32.sqrt()) * 2.0).round() / 2.0
+}
+
 pub fn is_vegetation(arch: &str) -> bool {
     SETS.iter().any(|s| s.props.iter().any(|p| p.eq_ignore_ascii_case(arch)))
 }
@@ -158,7 +164,7 @@ impl DwApp {
             return 0;
         }
         let s = &SETS[set];
-        let spacing = s.spacing / self.terrain.veg_density.clamp(0.05, 1.0).sqrt();
+        let spacing = if self.terrain.veg_spacing > 0.0 { self.terrain.veg_spacing } else { s.spacing / self.terrain.veg_density.clamp(0.05, 1.0).sqrt() };
         let Some(t) = self.proj.terrain.as_ref() else { return 0 };
         // objets de végétation déjà là, près du disque
         let mut near: Vec<V3> = self
@@ -170,7 +176,7 @@ impl DwApp {
             .map(|e| e.pos)
             .collect();
         let area = std::f32::consts::PI * r * r;
-        let tries = ((area / (spacing * spacing)) * 1.5).ceil().clamp(1.0, 120.0) as usize;
+        let tries = ((area / (spacing * spacing)) * 1.5).ceil().clamp(1.0, 400.0) as usize;
         let mut new: Vec<Entity> = Vec::new();
         for _ in 0..tries {
             let a = self.rng.range(0.0, std::f32::consts::TAU);

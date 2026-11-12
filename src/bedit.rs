@@ -316,7 +316,7 @@ impl DwApp {
             let l = src.load(h_src, &claimed, &mut cache);
             // la version de loin du jeu montre le bloc entier : le modèle découpé n'en a pas et reste affiché
             // jusqu'à la distance de cette version de loin (1 500 m au plus), comme les façades de MLO
-            let lod = w.ents.iter().position(|x| x.arch == h_src && x.lod_level == 0).and_then(|oi| w.lod_parent(oi)).map(|pi| w.ents[pi].lod_dist.min(1500.0)).unwrap_or(0.0);
+            let lod = w.ents.iter().position(|x| x.arch == h_src && x.lod_level == 0).and_then(|oi| w.lod_parent(oi)).map(|pi| w.ents[pi].lod_dist().min(1500.0)).unwrap_or(0.0);
             (l, lod)
         };
         if loaded.model.is_none() {
@@ -381,7 +381,7 @@ impl DwApp {
             let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
             let mut cache = Vec::new();
             let l = src.load(h, &claimed, &mut cache);
-            let lod = w.ents.iter().position(|x| x.arch == h && x.lod_level == 0).and_then(|oi| w.lod_parent(oi)).map(|pi| w.ents[pi].lod_dist.min(1500.0)).unwrap_or(0.0);
+            let lod = w.ents.iter().position(|x| x.arch == h && x.lod_level == 0).and_then(|oi| w.lod_parent(oi)).map(|pi| w.ents[pi].lod_dist().min(1500.0)).unwrap_or(0.0);
             (l, lod)
         };
         let m = l.model.as_ref().ok_or("modèle illisible")?;

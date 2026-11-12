@@ -133,6 +133,10 @@ pub struct DwApp {
     pub check_open: bool,
     /// images par seconde (lissé) pour le compteur de performance
     pub fps: f32,
+    /// dernier instant d'activité (souris, clavier, caméra qui bouge, travail en cours) et position de la caméra à
+    /// l'image précédente : sans activité, la vue est redessinée lentement (frame.rs, fin de run_frame)
+    pub last_active: f64,
+    pub last_cam_sig: [f32; 7],
     /// analyse de plantage FiveM (crashlog.rs)
     pub crash: crate::crashlog::CrashState,
     /// résultat du dernier « Contrôler un dossier » (check.rs)
@@ -229,16 +233,25 @@ pub fn save_setting(key: &str, value: serde_json::Value) {
     }
 }
 
+/// Retire un réglage.
+pub fn remove_setting(key: &str) {
+    if let Some(p) = settings_path() {
+        let mut v = load_settings();
+        if let Some(o) = v.as_object_mut() {
+            if o.remove(key).is_some() {
+                let _ = std::fs::write(p, v.to_string());
+            }
+        }
+    }
+}
+
+/// Clé API Claude : chiffrée dans les réglages (secret.rs), sinon la variable ANTHROPIC_API_KEY.
 fn load_api_key() -> String {
-    load_settings()["api_key"]
-        .as_str()
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .unwrap_or_default()
+    Some(crate::secret::load_secret("api_key")).filter(|k| !k.is_empty()).or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()).unwrap_or_default()
 }
 
 pub fn save_api_key(k: &str) {
-    save_setting("api_key", serde_json::json!(k));
+    crate::secret::save_secret("api_key", k);
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -309,11 +322,13 @@ impl DwApp {
             claude_code: ai::find_claude_code(),
             cc_model: load_settings()["ai_cc_model"].as_str().unwrap_or("").to_string(),
             oa_base: load_settings()["ai_oa_base"].as_str().unwrap_or("http://localhost:11434/v1").to_string(),
-            oa_key: load_settings()["ai_oa_key"].as_str().unwrap_or("").to_string(),
+            oa_key: crate::secret::load_secret("ai_oa_key"),
             oa_model: load_settings()["ai_oa_model"].as_str().unwrap_or("").to_string(),
             cli_cmd: load_settings()["ai_cli_cmd"].as_str().unwrap_or("").to_string(),
             cli_tools: ai::find_cli_tools(),
             pending: None,
+            last_active: 0.0,
+            last_cam_sig: [0.0; 7],
             mlo_name: "dw_interieur_1".into(),
             mlo_cols: 2,
             mlo_rows: 2,
@@ -353,7 +368,7 @@ impl DwApp {
             gizmo_object_space: false,
             library: crate::library::Library::new(),
             lists: crate::lists::Lists::default(),
-            intlib: crate::intlib::IntLib { open: std::env::var("DW_INTLIB").is_ok(), filter: std::env::var("DW_INTLIB_FILTER").unwrap_or_default(), chosen: None },
+            intlib: crate::intlib::IntLib::new(std::env::var("DW_INTLIB").is_ok(), std::env::var("DW_INTLIB_FILTER").unwrap_or_default()),
             terrain: crate::terrain::TerrainState::default(),
             terrain_last_upload: 0.0,
             clipboard: Vec::new(),

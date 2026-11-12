@@ -1530,7 +1530,7 @@ impl DwApp {
                     ui.end_row();
                     ui.label("Clé");
                     if ui.add(egui::TextEdit::singleline(&mut self.oa_key).password(true).desired_width(210.0).hint_text("vide pour Ollama / LM Studio")).lost_focus() {
-                        save_setting("ai_oa_key", serde_json::json!(self.oa_key));
+                        crate::secret::save_secret("ai_oa_key", &self.oa_key);
                     }
                     ui.end_row();
                 });
@@ -1595,5 +1595,42 @@ impl DwApp {
         ui.checkbox(&mut self.opts.show_grid, "Grille au sol");
         ui.checkbox(&mut self.opts.show_rooms, "Pièces et portails des intérieurs");
         ui.checkbox(&mut self.opts.show_sample, "Carte d'exemple (ville générée)");
+        ui.separator();
+        ui.label(RichText::new("Mémoire graphique").strong());
+        let (vram, budget) = self.game.gpu.as_ref().and_then(|g| g.lock().ok().map(|g| (g.vram_mb, g.budget))).unwrap_or((None, None));
+        let mut mb = crate::app::load_settings()["gpu_budget_mb"].as_u64().unwrap_or(0) as u32;
+        let mut auto = mb == 0;
+        let mut changed = false;
+        if ui
+            .checkbox(&mut auto, "Automatique (selon la carte graphique)")
+            .on_hover_text("La vue garde les modèles et textures du jeu dans la carte graphique jusqu'à cette limite, puis libère les moins utilisés. Automatique : un peu plus de la moitié de la mémoire de la carte, 1 Go supposé si elle est inconnue.")
+            .changed()
+        {
+            mb = if auto { 0 } else { budget.map(|b| ((b.0 + b.1) >> 20) as u32).unwrap_or(1024) };
+            changed = true;
+        }
+        if !auto {
+            ui.horizontal(|ui| {
+                ui.label("Limite");
+                changed |= ui.add(egui::Slider::new(&mut mb, 384..=2100).step_by(64.0).suffix(" Mo")).changed();
+            });
+        }
+        ui.label(
+            RichText::new(match (vram, budget) {
+                (Some(v), Some(b)) => format!("Carte graphique : {v} Mo · limite actuelle {} Mo (modèles {} + textures {}).", (b.0 + b.1) >> 20, b.0 >> 20, b.1 >> 20),
+                (None, Some(b)) => format!("Mémoire de la carte inconnue · limite actuelle {} Mo.", (b.0 + b.1) >> 20),
+                _ => "Connue une fois la vue 3D du jeu affichée.".to_string(),
+            })
+            .weak()
+            .small(),
+        );
+        if changed {
+            crate::app::save_setting("gpu_budget_mb", serde_json::json!(mb));
+            if let Some(g) = &self.game.gpu {
+                if let Ok(mut g) = g.lock() {
+                    g.reset_budget();
+                }
+            }
+        }
     }
 }

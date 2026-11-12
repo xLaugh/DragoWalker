@@ -906,7 +906,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dragowalker"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aes",
  "eframe",
@@ -920,6 +920,7 @@ dependencies = [
  "sha1",
  "sha2",
  "ureq",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

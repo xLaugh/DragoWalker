@@ -1208,7 +1208,7 @@ impl DwApp {
         let ac = (arch.bb_min + arch.bb_max) * 0.5;
         let ar = (arch.bb_max - arch.bb_min).len() * 0.5;
         let (ei, e) = w.ents.iter().enumerate().filter(|(_, e)| e.arch == h).min_by(|x, y| x.1.pos.dist2d(c_mlo).partial_cmp(&y.1.pos.dist2d(c_mlo)).unwrap_or(std::cmp::Ordering::Equal))?;
-        ((e.pos + e.rot.rotate(ac) - c_mlo).len() <= r_mlo + ar + 5.0).then_some(ei)
+        ((e.pos + e.rot().rotate(ac) - c_mlo).len() <= r_mlo + ar + 5.0).then_some(ei)
     }
 
     /// Boîtes à surligner pour une pièce : (coins, true = à l'endroit d'origine).
@@ -1528,9 +1528,9 @@ impl DwApp {
                 continue;
             };
             let new = format!("{res}_x_{stem}");
-            let s = v3(e.sxy, e.sxy, e.sz);
+            let s = v3(e.sxy(), e.sxy(), e.sz());
             // point du modèle (repère du modèle) → monde, à l'endroit d'origine
-            let orig = |v: V3| e.pos + e.rot.rotate(v.mulv(s));
+            let orig = |v: V3| e.pos + e.rot().rotate(v.mulv(s));
             // seulement le bâtiment concerné : modèle relu en XML par CodeWalker, parties hors de la zone retirées
             let mut cropped: Option<(V3, V3)> = None;
             // part des triangles gardés par la découpe (1 = bâtiment entier)
@@ -1571,8 +1571,8 @@ impl DwApp {
                 }
             }
             let pos = mv.point(e.pos);
-            let rot = mv.q.mul(e.rot).normalized();
-            let mut lod = e.lod_dist.max(arch.lod_dist).max(150.0);
+            let rot = mv.q.mul(e.rot()).normalized();
+            let mut lod = e.lod_dist().max(arch.lod_dist).max(150.0);
             // version de loin du jeu (parent LOD du placement d'origine)
             let mut parent_index = -1i32;
             let mut lod_level = "LODTYPES_DEPTH_ORPHANHD";
@@ -1582,11 +1582,11 @@ impl DwApp {
                 if pe.nchild == 1 && kept_ratio >= LOD_KEEP_MIN {
                     // les niveaux au-dessus (SLOD) sont communs au quartier : pas copiés ; la version de loin reste
                     // affichée jusqu'à la distance du plus haut d'entre eux (3 000 m au plus), comme lods.rs
-                    let mut far = pe.lod_dist;
+                    let mut far = pe.lod_dist();
                     let mut up = w.lod_parent(pi);
                     let mut guard = 0;
                     while let Some(q) = up {
-                        far = far.max(w.ents[q].lod_dist);
+                        far = far.max(w.ents[q].lod_dist());
                         up = w.lod_parent(q);
                         guard += 1;
                         if guard > 6 {
@@ -1595,16 +1595,16 @@ impl DwApp {
                     }
                     let far = far.min(3000.0);
                     let lp = mv.point(pe.pos);
-                    let lq = mv.q.mul(pe.rot).normalized();
+                    let lq = mv.q.mul(pe.rot()).normalized();
                     let lfq = lq.inverse().normalized();
                     lod_ents += &format!(
                         "  <Item type=\"CEntityDef\">\n   <archetypeName>{lname}</archetypeName>\n   <flags value=\"{}\" />\n   <guid value=\"0\" />\n   <position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <rotation x=\"{}\" y=\"{}\" z=\"{}\" w=\"{}\" />\n   <scaleXY value=\"{}\" />\n   <scaleZ value=\"{}\" />\n   <parentIndex value=\"-1\" />\n   <lodDist value=\"{far}\" />\n   <childLodDist value=\"{}\" />\n   <lodLevel>LODTYPES_DEPTH_LOD</lodLevel>\n   <numChildren value=\"1\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
                         crate::mech::ENTITY_FLAGS,
-                        lp.x, lp.y, lp.z, lfq.x, lfq.y, lfq.z, lfq.w, pe.sxy, pe.sz,
-                        if pe.child_lod_dist > 0.0 { pe.child_lod_dist } else { e.lod_dist }
+                        lp.x, lp.y, lp.z, lfq.x, lfq.y, lfq.z, lfq.w, pe.sxy(), pe.sz(),
+                        if pe.child_lod_dist() > 0.0 { pe.child_lod_dist() } else { e.lod_dist() }
                     );
                     let (amn, amx) = w.arch_box(pe.arch);
-                    let ls = v3(pe.sxy, pe.sxy, pe.sz);
+                    let ls = v3(pe.sxy(), pe.sxy(), pe.sz());
                     for i in 0..8 {
                         let k = v3(if i & 1 == 0 { amn.x } else { amx.x }, if i & 2 == 0 { amn.y } else { amx.y }, if i & 4 == 0 { amn.z } else { amx.z });
                         let wp = lp + lq.rotate(k.mulv(ls));
@@ -1622,12 +1622,12 @@ impl DwApp {
                     n_lod += 1;
                     lod_level = "LODTYPES_DEPTH_HD";
                     // la façade laisse la place à la version de loin à sa distance d'origine
-                    lod = if e.lod_dist > 0.0 { e.lod_dist } else { lod };
+                    lod = if e.lod_dist() > 0.0 { e.lod_dist() } else { lod };
                     lod_notes.push(format!("{stem} → {lname} (jusqu'à {far:.0} m)"));
                 } else {
                     // version de loin commune à plusieurs bâtiments (elle ferait revenir les voisins) ou façade très
                     // découpée : la façade reste affichée jusqu'à la distance de ce parent
-                    lod = lod.max(pe.lod_dist.min(1500.0));
+                    lod = lod.max(pe.lod_dist().min(1500.0));
                     lod_notes.push(format!("{stem} visible jusqu'à {lod:.0} m (version de loin du jeu {})", if pe.nchild != 1 { "commune à plusieurs bâtiments" } else { "trop différente de la façade découpée" }));
                 }
             }
@@ -1650,7 +1650,7 @@ impl DwApp {
                 "  <Item type=\"CEntityDef\">\n   <archetypeName>{new}</archetypeName>\n   <flags value=\"{}\" />\n   <guid value=\"0\" />\n   <position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <rotation x=\"{}\" y=\"{}\" z=\"{}\" w=\"{}\" />\n   <scaleXY value=\"{}\" />\n   <scaleZ value=\"{}\" />\n   <parentIndex value=\"{parent_index}\" />\n   <lodDist value=\"{lod}\" />\n   <childLodDist value=\"0\" />\n   <lodLevel>{lod_level}</lodLevel>\n   <numChildren value=\"0\" />\n   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n   <ambientOcclusionMultiplier value=\"255\" />\n   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n",
                 // parent dans la carte parente : bit 0x8 (LOD_IN_PARENT_YMAP)
                 lod_in_parent_flags(crate::mech::ENTITY_FLAGS, parent_index >= 0),
-                pos.x, pos.y, pos.z, fq.x, fq.y, fq.z, fq.w, e.sxy, e.sz
+                pos.x, pos.y, pos.z, fq.x, fq.y, fq.z, fq.w, e.sxy(), e.sz()
             );
             for i in 0..8 {
                 let k = v3(if i & 1 == 0 { bmn.x } else { bmx.x }, if i & 2 == 0 { bmn.y } else { bmx.y }, if i & 4 == 0 { bmn.z } else { bmx.z });
@@ -1752,7 +1752,7 @@ impl DwApp {
         for p in self.mlo_state.pieces_cache.1.iter().filter(|p| matches!(p.kind, PieceKind::Facade | PieceKind::Road) && r.taken(p, moved)) {
             let Some(ei) = self.cached_placement(r, p) else { continue };
             let e = &w.ents[ei];
-            out.push((e.arch, mv.point(e.pos), mv.q.mul(e.rot).normalized(), e.sxy, e.sz));
+            out.push((e.arch, mv.point(e.pos), mv.q.mul(e.rot()).normalized(), e.sxy(), e.sz()));
         }
         out
     }

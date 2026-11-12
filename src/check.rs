@@ -41,7 +41,7 @@ const POOLS: [(&str, &str); 6] = [
 pub fn game_pools(w: Option<&crate::gta::world::GameWorld>) -> Vec<(String, u32)> {
     let Some(w) = w else { return Vec::new() };
     let mut files: Vec<&crate::gta::rpf::FileEntry> = w.vfs.files.iter().filter(|f| f.name.eq_ignore_ascii_case("gameconfig.xml")).collect();
-    files.sort_by_key(|f| !f.path.contains("update"));
+    files.sort_by_key(|f| !f.path().contains("update"));
     let Some(d) = files.first().and_then(|f| w.vfs.read_binary(f, &w.keys)) else { return Vec::new() };
     let s = String::from_utf8_lossy(&d);
     let mut out = Vec::new();

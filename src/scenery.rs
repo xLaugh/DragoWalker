@@ -405,7 +405,7 @@ impl DwApp {
         // eau
         if !t.waters.is_empty() {
             let base = self.game.world.as_ref().and_then(|w| {
-                w.vfs.files.iter().find(|f| f.name.eq_ignore_ascii_case("water.xml") && f.path.to_lowercase().contains("levels\\gta5")).and_then(|f| w.vfs.read_binary(f, &w.keys))
+                w.vfs.files.iter().find(|f| f.name.eq_ignore_ascii_case("water.xml") && f.path().to_lowercase().contains("levels\\gta5")).and_then(|f| w.vfs.read_binary(f, &w.keys))
             });
             let mut s = base.map(|d| String::from_utf8_lossy(&d).to_string()).unwrap_or_else(|| "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<WaterData>\n <WaterQuads>\n </WaterQuads>\n <CalmingQuads />\n <WaveQuads />\n</WaterData>\n".to_string());
             let mut items = String::new();

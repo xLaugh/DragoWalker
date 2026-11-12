@@ -199,8 +199,8 @@ pub fn ray_box_pub(w: &GameWorld, ei: u32, o: V3, d: V3) -> Option<f32> {
 fn ray_box(w: &GameWorld, ei: u32, o: V3, d: V3) -> Option<f32> {
     let e = &w.ents[ei as usize];
     let (mn, mx) = w.arch_box(e.arch);
-    let s = v3(e.sxy.max(0.001), e.sxy.max(0.001), e.sz.max(0.001));
-    let inv = e.rot.inverse();
+    let s = v3(e.sxy().max(0.001), e.sxy().max(0.001), e.sz().max(0.001));
+    let inv = e.rot().inverse();
     let lo = inv.rotate(o - e.pos);
     let ld = inv.rotate(d);
     let lo = v3(lo.x / s.x, lo.y / s.y, lo.z / s.z);
@@ -368,6 +368,9 @@ impl DwApp {
                             for i in 0..6 {
                                 self.place_prop("dw_caisse", v3(c.x + i as f32 * 1.6 - 4.0, c.y, gz), Some(i as f32 * 15.0));
                             }
+                        }
+                        if t == "options" {
+                            self.tab = Tab::Options;
                         }
                         if t == "props" {
                             self.tab = Tab::Props;
@@ -542,8 +545,8 @@ impl DwApp {
                 }
                 let e = &w.ents[ei as usize];
                 let (mn, mx) = w.arch_box(e.arch);
-                let l = e.rot.inverse().rotate(p - e.pos);
-                let (sx, sz) = (e.sxy.max(0.01), e.sz.max(0.01));
+                let l = e.rot().inverse().rotate(p - e.pos);
+                let (sx, sz) = (e.sxy().max(0.01), e.sz().max(0.01));
                 let l = crate::math::v3(l.x / sx, l.y / sx, l.z / sz);
                 let m = 0.15;
                 if l.x >= mn.x - m && l.x <= mx.x + m && l.y >= mn.y - m && l.y <= mx.y + m && l.z >= mn.z - m && l.z <= mx.z + m {
@@ -695,13 +698,13 @@ impl DwApp {
                 let Some(t) = ray_box(w, ei, o, d) else { continue };
                 let e = &w.ents[ei as usize];
                 let (mn, mx) = w.arch_box(e.arch);
-                let Some(t) = after_cut(t, e.pos.z + mn.z.min(0.0) * e.sz) else { continue };
-                if surf.map(|p| inside(p, e.pos, e.rot, e.sxy, e.sz, mn, mx)).unwrap_or(false) {
+                let Some(t) = after_cut(t, e.pos.z + mn.z.min(0.0) * e.sz()) else { continue };
+                if surf.map(|p| inside(p, e.pos, e.rot(), e.sxy(), e.sz(), mn, mx)).unwrap_or(false) {
                     c.push((0, (mx - mn).len(), Under::Game(ei)));
                 } else {
                     let _ = t;
                     let r = w.archetypes.get(&e.arch).map(|a| a.radius).filter(|r| *r > 0.0).unwrap_or((mx - mn).len() * 0.5);
-                    c.push((1, r * e.sxy.max(e.sz), Under::Game(ei)));
+                    c.push((1, r * e.sxy().max(e.sz()), Under::Game(ei)));
                 }
             }
         }

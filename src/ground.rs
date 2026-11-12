@@ -63,15 +63,9 @@ impl DwApp {
             }
         };
         if let Some(t) = self.proj.terrain.as_ref() {
-            if let Some(h) = t.height_at(x, y) {
+            // terrain, chaussées, trottoirs et carrefours (vrais triangles)
+            if let Some(h) = t.surface_at(x, y) {
                 take(h, &mut best);
-            }
-            for r in &t.roads {
-                if let Some((d, z)) = r.nearest(x, y) {
-                    if d <= r.kind().width * 0.5 {
-                        take(z + 0.08, &mut best);
-                    }
-                }
             }
         }
         // objets : du projet, puis du jeu (ceux affichés), triangle par triangle
@@ -95,11 +89,11 @@ impl DwApp {
                     continue;
                 }
                 let (mn, mx) = w.arch_box(e.arch);
-                let r = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2)).sqrt() * 0.5 * e.sxy + 1.0;
-                if (e.pos.x - x).powi(2) + (e.pos.y - y).powi(2) > r * r || e.pos.z + mn.z * e.sz > z_from {
+                let r = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2)).sqrt() * 0.5 * e.sxy() + 1.0;
+                if (e.pos.x - x).powi(2) + (e.pos.y - y).powi(2) > r * r || e.pos.z + mn.z * e.sz() > z_from {
                     continue;
                 }
-                cands.push((e.arch, e.pos, e.rot, v3(e.sxy, e.sxy, e.sz)));
+                cands.push((e.arch, e.pos, e.rot(), v3(e.sxy(), e.sxy(), e.sz())));
             }
         }
         for (h, pos, rot, s) in cands {

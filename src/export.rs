@@ -129,7 +129,7 @@ impl DwApp {
             let Some(wy) = w.ymaps.iter().filter(|g| g.name == y.name.to_lowercase()).max_by_key(|g| (g.in_project, g.prio)) else { continue };
             let f = &w.vfs.files[wy.file];
             if std::env::var("DW_TEST_EXPORT").is_ok() {
-                println!("origine {} : {} ({:?})", y.name, f.path, w.vfs.raw_resource_file(f).map(|r| (r.len(), r[..8].to_vec())));
+                println!("origine {} : {} ({:?})", y.name, f.path(), w.vfs.raw_resource_file(f).map(|r| (r.len(), r[..8].to_vec())));
             }
             if let Some(raw) = w.vfs.raw_resource_file(f) {
                 let bin = tmp.join(format!("{}.ymap", y.name));

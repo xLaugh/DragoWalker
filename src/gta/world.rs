@@ -31,20 +31,121 @@ pub struct Group {
 }
 
 #[derive(Clone, Copy)]
+/// Un objet placé de la carte du jeu (3 millions en mémoire) : rangé serré, 44 octets au lieu de 60.
+/// Orientation sur 4 × 16 bits (erreur ≈ 0,002°), échelles et distances en demi-précision (erreur ≈ 0,05 %) ;
+/// position exacte. Lire avec rot(), sxy(), sz(), lod_dist(), child_lod_dist().
 pub struct WEnt {
     pub pos: V3,
-    pub rot: Quat,
-    pub sxy: f32,
-    pub sz: f32,
+    prot: [i16; 4],
+    psxy: u16,
+    psz: u16,
+    plod: u16,
+    pclod: u16,
     pub arch: u32,
-    pub lod_dist: f32,
-    pub child_lod_dist: f32,
     pub lod_level: u8,
-    pub nchild: u16,
     pub mlo: bool,
+    pub nchild: u16,
     pub ymap: u32,
     /// index du parent (niveau de détail plus grossier) dans le ymap parent, -1 sinon
     pub parent: i32,
+}
+
+impl WEnt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(pos: V3, rot: Quat, sxy: f32, sz: f32, arch: u32, lod_dist: f32, child_lod_dist: f32, lod_level: u8, nchild: u16, mlo: bool, ymap: u32, parent: i32) -> WEnt {
+        WEnt { pos, prot: pack_quat(rot), psxy: f32_to_f16(sxy), psz: f32_to_f16(sz), plod: f32_to_f16(lod_dist), pclod: f32_to_f16(child_lod_dist), arch, lod_level, mlo, nchild, ymap, parent }
+    }
+    #[inline]
+    pub fn rot(&self) -> Quat {
+        unpack_quat(self.prot)
+    }
+    #[inline]
+    pub fn sxy(&self) -> f32 {
+        f16_to_f32(self.psxy)
+    }
+    #[inline]
+    pub fn sz(&self) -> f32 {
+        f16_to_f32(self.psz)
+    }
+    #[inline]
+    pub fn lod_dist(&self) -> f32 {
+        f16_to_f32(self.plod)
+    }
+    #[inline]
+    pub fn child_lod_dist(&self) -> f32 {
+        f16_to_f32(self.pclod)
+    }
+}
+
+/// Orientation (unitaire) sur 4 entiers de 16 bits.
+fn pack_quat(q: Quat) -> [i16; 4] {
+    let q = q.normalized();
+    let f = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+    [f(q.x), f(q.y), f(q.z), f(q.w)]
+}
+
+#[inline]
+fn unpack_quat(p: [i16; 4]) -> Quat {
+    let f = |v: i16| v as f32 / 32767.0;
+    Quat { x: f(p[0]), y: f(p[1]), z: f(p[2]), w: f(p[3]) }.normalized()
+}
+
+/// Flottant 32 bits -> demi-précision IEEE 754 (arrondi au plus proche ; hors limites : ±65504 ou infini).
+pub fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let r = if rest > mid || (rest == mid && half & 1 == 1) { half + 1 } else { half };
+        return sign | r as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rest = man & 0x1fff;
+    let r = if rest > 0x1000 || (rest == 0x1000 && half & 1 == 1) { half + 1 } else { half };
+    sign | r as u16
+}
+
+/// Demi-précision IEEE 754 -> flottant 32 bits.
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let man = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            // sous-normal : on le renormalise
+            let mut e = 127 - 15 + 1;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (man << 13)
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (man << 13)
+    };
+    f32::from_bits(bits)
 }
 
 pub struct WYmap {
@@ -397,7 +498,7 @@ impl GameWorld {
         for (fi, list) in parsed_types {
             let f = &vfs.files[fi];
             let disk = vfs.archives[f.archive as usize].disk;
-            let (g, prio) = classify(fi, &f.path, disk);
+            let (g, prio) = classify(fi, &f.path(), disk);
             for a in list {
                 if a.mlo && !a.mlo_children.is_empty() && mlo_defs.get(&a.name).map(|d| d.0 <= prio).unwrap_or(true) {
                     let children = a
@@ -474,7 +575,7 @@ impl GameWorld {
             }
             let f = &vfs.files[fi];
             let disk = vfs.archives[f.archive as usize].disk;
-            let (mut g, prio) = classify(fi, &f.path, disk);
+            let (mut g, prio) = classify(fi, &f.path(), disk);
             let stem = file_stem(&f.name).to_string();
             if g == 0 && (stem.starts_with("prologue") || stem.starts_with("plg_")) {
                 g = 1;
@@ -495,20 +596,7 @@ impl GameWorld {
                 let rot = if q.is_identity() || e.mlo { q.normalized() } else { q.inverse().normalized() };
                 mn = mn.min(pos);
                 mx = mx.max(pos);
-                ents.push(WEnt {
-                    pos,
-                    rot,
-                    sxy: e.scale_xy,
-                    sz: e.scale_z,
-                    arch: e.arch,
-                    lod_dist: e.lod_dist,
-                    child_lod_dist: e.child_lod_dist,
-                    lod_level: e.lod_level,
-                    nchild: e.num_children,
-                    mlo: e.mlo,
-                    ymap: yi,
-                    parent: e.parent,
-                });
+                ents.push(WEnt::new(pos, rot, e.scale_xy, e.scale_z, e.arch, e.lod_dist, e.child_lod_dist, e.lod_level, e.num_children, e.mlo, yi, e.parent));
             }
             groups[g].ymaps += 1;
             ymaps.push(WYmap { name: stem, file: fi, group: g, prio, first, count: ents.len() - first, min: mn, max: mx, visible: false, in_project: false, parent: y.parent });
@@ -546,7 +634,7 @@ impl GameWorld {
         let mut water = Vec::new();
         let mut water_files: HashMap<String, usize> = HashMap::new();
         for (i, f) in vfs.files.iter().enumerate() {
-            if f.name.starts_with("water") && f.name.ends_with(".xml") && f.path.contains("levels") {
+            if f.name.starts_with("water") && f.name.ends_with(".xml") && f.path().contains("levels") {
                 water_files.insert(f.name.clone(), i);
             }
         }
@@ -573,7 +661,11 @@ impl GameWorld {
         }
         let mut w = GameWorld {
             game_dir: game_dir.to_path_buf(),
-            vfs: Arc::new(vfs),
+            vfs: Arc::new({
+                let mut vfs = vfs;
+                vfs.files.shrink_to_fit();
+                vfs
+            }),
             keys: Arc::new(keys),
             txds: Arc::new(txds),
             arch_dicts: Arc::new(arch_dicts),
@@ -598,6 +690,13 @@ impl GameWorld {
             water: Arc::new(water),
         };
         set(&prog, "Préparation de l'affichage…", 0.97);
+        // listes remplies en grandissant : rendre la place réservée en trop (≈ 56 Mo pour les 3 millions d'objets)
+        w.ents.shrink_to_fit();
+        w.ymaps.shrink_to_fit();
+        w.catalog.shrink_to_fit();
+        w.archetypes.shrink_to_fit();
+        w.names.shrink_to_fit();
+        w.colors.shrink_to_fit();
         w.refresh_visibility();
         set(&prog, "Terminé", 1.0);
         Ok(w)
@@ -716,14 +815,14 @@ impl GameWorld {
     fn visit_lod(&self, ei: u32, eye: V3, scale: f32, out: &mut Vec<u32>, depth: u32) {
         let e = &self.ents[ei as usize];
         let d = (e.pos - eye).len();
-        let lod_of = |x: &WEnt| if x.lod_dist > 0.0 { x.lod_dist } else { 200.0 };
+        let lod_of = |x: &WEnt| if x.lod_dist() > 0.0 { x.lod_dist() } else { 200.0 };
         if depth == 0 && d > lod_of(e) * scale {
             return;
         }
         let kids = self.children(ei as usize);
         if !kids.is_empty() && kids.len() >= e.nchild as usize && depth < 8 {
             let go_down = if depth > 0 {
-                d <= e.child_lod_dist * scale
+                d <= e.child_lod_dist() * scale
             } else {
                 kids.iter().any(|&k| {
                     let c = &self.ents[k as usize];
@@ -795,12 +894,12 @@ impl GameWorld {
     pub fn corners(&self, ei: u32) -> [V3; 8] {
         let e = &self.ents[ei as usize];
         let (mn, mx) = self.arch_box(e.arch);
-        let s = v3(e.sxy, e.sxy, e.sz);
+        let s = v3(e.sxy(), e.sxy(), e.sz());
         let (mn, mx) = (mn.mulv(s), mx.mulv(s));
         let mut out = [V3::ZERO; 8];
         for (i, c) in out.iter_mut().enumerate() {
             let p = v3(if i & 1 == 0 { mn.x } else { mx.x }, if i & 2 == 0 { mn.y } else { mx.y }, if i & 4 == 0 { mn.z } else { mx.z });
-            *c = e.pos + e.rot.rotate(p);
+            *c = e.pos + e.rot().rotate(p);
         }
         out
     }
@@ -1014,4 +1113,32 @@ pub fn parse_water(s: &str) -> Vec<[f32; 5]> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    #[test]
+    fn demi_precision_aller_retour() {
+        for v in [0.0f32, 1.0, 0.5, 1.25, 0.8, 150.0, 300.0, 1500.0, 7000.0, 12000.0, 0.001, -2.5, 65504.0] {
+            let r = f16_to_f32(f32_to_f16(v));
+            assert!((r - v).abs() <= v.abs() * 0.0005 + 1e-6, "{v} -> {r}");
+        }
+        assert_eq!(f16_to_f32(f32_to_f16(1.0)), 1.0);
+        assert!(f16_to_f32(f32_to_f16(1.0e6)).is_infinite());
+    }
+
+    #[test]
+    fn orientation_compactee() {
+        let qs = [Quat::from_z(0.0), Quat::from_z(1.234), Quat::from_z(-3.1), Quat { x: 0.1, y: -0.2, z: 0.7, w: 0.68 }.normalized()];
+        for q in qs {
+            let e = WEnt::new(V3::ZERO, q, 1.0, 1.0, 0, 100.0, 0.0, 0, 0, false, 0, -1);
+            let r = e.rot();
+            // même rotation (au signe près) : angle d'écart < 0,01°
+            let dot = (q.x * r.x + q.y * r.y + q.z * r.z + q.w * r.w).abs().min(1.0);
+            assert!(2.0 * dot.acos() < 0.01f32.to_radians(), "écart {}", 2.0 * dot.acos());
+        }
+        assert!(std::mem::size_of::<WEnt>() <= 44);
+    }
 }

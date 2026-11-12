@@ -7,6 +7,10 @@ use crate::math::{v3, V3};
 use crate::mech;
 use eframe::egui::{self, Color32, RichText};
 
+/// Secondes sans activité avant de redessiner moins souvent, puis encore moins — choix de DragoWalker.
+const IDLE_AFTER: f64 = 1.5;
+const IDLE_SLOW_AFTER: f64 = 20.0;
+
 impl DwApp {
     pub fn run_frame(&mut self, ctx: &egui::Context) {
         self.frame += 1;
@@ -65,7 +69,7 @@ impl DwApp {
                     let c = self.game.world.as_ref().map(|w| {
                         let e = &w.ents[pl as usize];
                         let d = w.mlo_defs.get(&e.arch);
-                        d.filter(|d| !d.children.is_empty()).map(|d| d.children.iter().fold(V3::ZERO, |a, k| a + e.pos + e.rot.rotate(k.pos)) * (1.0 / d.children.len() as f32)).unwrap_or(e.pos)
+                        d.filter(|d| !d.children.is_empty()).map(|d| d.children.iter().fold(V3::ZERO, |a, k| a + e.pos + e.rot().rotate(k.pos)) * (1.0 / d.children.len() as f32)).unwrap_or(e.pos)
                     }).unwrap_or(self.cam.target);
                     self.cam.target = c;
                     self.cam.dist = 22.0;
@@ -140,6 +144,49 @@ impl DwApp {
                         self.cam.snap();
                     }
                 }
+                // DW_TEST_TJOIN="angle,type principal,type branche[,courbe]" : une route qui finit en T sur une autre,
+                // en biais ; courbe = 1 ajoute un virage serré à la branche ; la caméra regarde le carrefour
+                if let Ok(spec) = std::env::var("DW_TEST_TJOIN") {
+                    let v: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    let (ang, km, kb) = (v.first().copied().unwrap_or(60.0), v.get(1).copied().unwrap_or(0.0) as u8, v.get(2).copied().unwrap_or(0.0) as u8);
+                    let curve = v.get(3).copied().unwrap_or(0.0) > 0.5;
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    self.terrain.road_kind = km;
+                    self.terrain.road_pts = vec![v3(c.x - 90.0, c.y, h(self, c.x - 90.0, c.y)), v3(c.x + 90.0, c.y, h(self, c.x + 90.0, c.y))];
+                    self.finish_road();
+                    println!("{}", self.status);
+                    let a = ang.to_radians();
+                    let far = v3(c.x - 70.0 * a.cos(), c.y - 70.0 * a.sin(), 0.0);
+                    self.terrain.road_kind = kb;
+                    let mut pts = vec![v3(far.x, far.y, h(self, far.x, far.y))];
+                    if curve {
+                        // virage serré : 30 m plus loin, la route repart à angle droit
+                        let k = v3(far.x - 30.0 * a.sin(), far.y + 30.0 * a.cos(), 0.0);
+                        pts.insert(0, v3(k.x, k.y, h(self, k.x, k.y)));
+                    }
+                    pts.push(v3(c.x, c.y, h(self, c.x, c.y)));
+                    self.terrain.road_pts = pts;
+                    self.finish_road();
+                    println!("{}", self.status);
+                    let (l, s) = self.signals_count();
+                    println!("signalisation : {l} feu(x), {s} stop(s)");
+                    if let Some(j) = self.proj.terrain.as_ref().and_then(|t| t.junctions.first()).cloned() {
+                        println!("   branches {:?}", j.arms.iter().map(|a| (a.dir, a.hw, a.total, a.len)).collect::<Vec<_>>());
+                        for (n, p, _) in crate::signals::junction_props(&j) {
+                            println!("      {n} à ({:.1}, {:.1}, {:.2})", p.x - j.pos[0], p.y - j.pos[1], p.z);
+                        }
+                        for e in self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).filter(|e| j.props.contains(&e.id)) {
+                            let s = self.proj.terrain.as_ref().and_then(|t| t.surface_at(e.pos.x, e.pos.y));
+                            println!("      posé : {} à ({:.2}, {:.2}, {:.3}), surface {:?}", e.archetype, e.pos.x, e.pos.y, e.pos.z, s);
+                        }
+                        // DW_TEST_TJOIN_LOOK=v : la caméra sur le virage, sinon sur le carrefour
+                        let look = std::env::var("DW_TEST_TJOIN_LOOK").ok();
+                        let at = if look.as_deref() == Some("v") { v3(far.x, far.y, j.pos[2]) } else { v3(j.pos[0], j.pos[1], j.pos[2]) };
+                        self.goto(at, 40.0);
+                        self.cam.target.z = j.pos[2];
+                        self.cam.snap();
+                    }
+                }
                 // DW_TEST_ROADJOIN=1 : une avenue qui croise toutes les routes, une rue qui finit en T sur la première
                 if std::env::var("DW_TEST_ROADJOIN").is_ok() {
                     let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
@@ -197,6 +244,8 @@ impl DwApp {
                 if let Some(vs) = std::env::var("DW_TEST_VEG").ok().and_then(|v| v.parse::<usize>().ok()) {
                     self.terrain.veg_set = vs.min(crate::vegetation::SETS.len() - 1);
                     self.terrain.veg_density = 0.6;
+                    // DW_TEST_VEG_GAP=m : écart choisi entre les objets
+                    self.terrain.veg_spacing = std::env::var("DW_TEST_VEG_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     let mut n = 0;
                     for (dx, dy) in [(-120.0, 150.0), (0.0, 160.0), (120.0, 150.0), (-150.0, -170.0), (150.0, -170.0)] {
                         n += self.veg_paint(c + v3(dx, dy, 0.0), 35.0);
@@ -833,7 +882,7 @@ impl DwApp {
                 }
                 let _ = image::save_buffer(&path, &buf, w as u32, h as u32, image::ExtendedColorType::Rgba8);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if self.frame >= 120 && !self.shot_sent {
+            } else if self.frame >= std::env::var("DW_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120) && !self.shot_sent {
                 self.shot_sent = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
@@ -901,6 +950,31 @@ impl DwApp {
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {
             self.view(ui, dt);
         });
-        ctx.request_repaint();
+        self.schedule_repaint(ctx);
+    }
+
+    /// Prochaine image : tout de suite tant qu'il se passe quelque chose (souris, clavier, caméra qui glisse encore,
+    /// réponse de l'IA attendue, capture de test), puis lentement — 5 images par seconde pendant 20 s (eau et effets
+    /// animés encore fluides à l'œil), puis une par seconde. Avant, chaque image en redemandait une aussitôt : un
+    /// cœur du processeur restait occupé à 100 % même sans rien faire. Les tâches de fond (chargement du jeu, des
+    /// modèles, des vignettes) redemandent elles-mêmes une image tant qu'elles travaillent.
+    fn schedule_repaint(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let input = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving() || i.pointer.any_down() || !i.keys_down.is_empty() || i.smooth_scroll_delta != egui::Vec2::ZERO);
+        let c = &self.cam;
+        let sig = [c.eye.x, c.eye.y, c.eye.z, c.fwd.x, c.fwd.y, c.fwd.z, c.cur_ortho];
+        let moving = sig.iter().zip(self.last_cam_sig.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
+        self.last_cam_sig = sig;
+        if input || moving || self.pending.is_some() || self.shot_path.is_some() || self.game.loading.is_some() {
+            self.last_active = now;
+        }
+        let idle = now - self.last_active;
+        if idle < IDLE_AFTER {
+            ctx.request_repaint();
+        } else if idle < IDLE_SLOW_AFTER {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
