@@ -22,9 +22,10 @@ impl DwApp {
     /// Pour l'export d'une carte du projet : (carte détaillée, carte des versions lointaines éventuelle).
     pub fn lod_split(&self, y: &Ymap) -> (Ymap, Option<Ymap>, usize) {
         let mut hd = y.clone();
-        let Some(w) = self.game.world.as_ref() else { return (hd, None, 0) };
+        let world = self.game.world.as_ref();
         let mut lod = Ymap::new(&format!("{}_lod", y.name));
         let mut cache: std::collections::HashMap<u32, Option<usize>> = std::collections::HashMap::new();
+        let mut extras: Vec<Entity> = Vec::new();
         for e in hd.entities.iter_mut() {
             // sans parent : pas de bit 0x8 (aucun objet du jeu sans parent ne l'a, sonde DW_LODFLAGS)
             if e.parent_index < 0 {
@@ -33,6 +34,34 @@ impl DwApp {
             if e.mlo.is_some() {
                 continue;
             }
+            // bâtiment de l'atelier : sa version lointaine (murs pleins et toit) dans la carte « _lod »
+            let al = e.archetype.to_lowercase();
+            if al.starts_with(crate::atelier::HOUSE_PREFIX) && !al.ends_with("_lod") {
+                let mut l = Entity::new(&format!("{al}_lod"), e.pos);
+                l.rot = e.rot;
+                l.lod_dist = crate::atelier::HOUSE_LOD_FAR;
+                l.child_lod_dist = crate::atelier::HOUSE_LOD;
+                l.lod_level = "LODTYPES_DEPTH_LOD".into();
+                l.num_children = 1;
+                l.parent_index = -1;
+                e.parent_index = lod.entities.len() as i32;
+                e.flags = crate::mlo::lod_in_parent_flags(e.flags, true);
+                e.lod_level = "LODTYPES_DEPTH_HD".into();
+                e.lod_dist = crate::atelier::HOUSE_LOD;
+                // morceaux à textures du jeu : mêmes placement et parent
+                if let Some(h) = self.proj.houses.iter().find(|h| h.name == al) {
+                    for (pn, _) in crate::atelier::house_pieces(h) {
+                        let mut x = e.clone();
+                        x.id = crate::model::new_id();
+                        x.archetype = pn;
+                        extras.push(x);
+                        l.num_children += 1;
+                    }
+                }
+                lod.entities.push(l);
+                continue;
+            }
+            let Some(w) = world else { continue };
             let h = crate::gta::crypto::joaat(&e.archetype.to_lowercase());
             let Some(a) = w.archetypes.get(&h) else { continue };
             // distance du jeu pour ce type quand l'objet a gardé la valeur par défaut
@@ -84,6 +113,7 @@ impl DwApp {
             e.lod_dist = o.lod_dist();
             lod.entities.push(l);
         }
+        hd.entities.extend(extras);
         let n = lod.entities.len();
         if n == 0 {
             return (hd, None, 0);

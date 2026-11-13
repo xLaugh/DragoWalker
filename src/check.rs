@@ -171,6 +171,9 @@ impl DwApp {
                     }
                 }
             }
+            // modèles personnels (Sollumz) : types des .ytyp.xml du dossier d'échange, copiés à l'export
+            // (copy_custom_models) ; un .ydr sans type dans un .ytyp reste signalé
+            known.extend(self.sollumz.archetypes.keys().map(|k| k.to_lowercase()));
             let mut unknown: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
             for y in &ymaps {
                 for e in &y.entities {

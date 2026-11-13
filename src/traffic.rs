@@ -195,14 +195,15 @@ pub fn build_network(t: &Terrain) -> Network {
     let mut per_road: Vec<Vec<usize>> = Vec::new();
     for r in &t.roads {
         let mut ids = Vec::new();
-        if r.samples.len() < 2 || !r.traffic.enabled {
+        if r.samples.len() < 2 || !r.traffic.enabled || r.kind().foot {
             per_road.push(ids);
             continue;
         }
         let len = r.length();
-        let n = ((len / NODE_STEP).ceil() as usize).max(1);
+        let n = ((len / NODE_STEP).ceil() as usize).max(if r.ring { 3 } else { 1 });
         let mut k = 0;
-        for i in 0..=n {
+        // rond-point : le dernier point est le premier
+        for i in 0..=(if r.ring { n - 1 } else { n }) {
             let d = len * i as f32 / n as f32;
             while k + 1 < r.samples.len() - 1 && r.samples[k + 1][3] < d {
                 k += 1;
@@ -222,14 +223,23 @@ pub fn build_network(t: &Terrain) -> Network {
             ids.push(nodes.len() - 1);
         }
         let l = lanes(r.kind as usize);
+        // sens unique (bretelle, rond-point) : aucune voie dans l'autre sens
+        let back = if r.oneway { 0 } else { l };
         for w in ids.windows(2) {
-            links.push((w[0], w[1], l, l));
+            links.push((w[0], w[1], l, back));
+        }
+        if r.ring && ids.len() > 2 {
+            links.push((ids[ids.len() - 1], ids[0], l, back));
         }
         per_road.push(ids);
     }
     // jonctions : le bout d'une route relié au point le plus proche d'une autre route
     let near = |ids: &[usize], p: V3, nodes: &[TNode]| ids.iter().copied().map(|i| (i, (nodes[i].pos - p).len())).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     for (ri, ids) in per_road.iter().enumerate() {
+        // un rond-point n'a pas de bout : ses carrefours le relient
+        if t.roads[ri].ring {
+            continue;
+        }
         for &end in [ids.first(), ids.last()].iter().flatten() {
             let p = nodes[*end].pos;
             for (rj, other) in per_road.iter().enumerate() {
@@ -239,7 +249,16 @@ pub fn build_network(t: &Terrain) -> Network {
                 if let Some((j, d)) = near(other, p, &nodes) {
                     if d < JOIN_DIST && !links.iter().any(|l| (l.0 == *end && l.1 == j) || (l.1 == *end && l.0 == j)) {
                         let l = lanes(t.roads[ri].kind as usize).min(lanes(t.roads[rj].kind as usize));
-                        links.push((*end, j, l, l));
+                        // route à sens unique : on y entre par son début, on en sort par sa fin
+                        if t.roads[ri].oneway {
+                            if Some(end) == ids.first() {
+                                links.push((j, *end, l, 0));
+                            } else {
+                                links.push((*end, j, l, 0));
+                            }
+                        } else {
+                            links.push((*end, j, l, l));
+                        }
                     }
                 }
             }
@@ -253,7 +272,16 @@ pub fn build_network(t: &Terrain) -> Network {
             for b in a + 1..close.len() {
                 let (na, nb) = (close[a].1, close[b].1);
                 if na != nb && !links.iter().any(|l| (l.0 == na && l.1 == nb) || (l.1 == na && l.0 == nb)) {
-                    links.push((na, nb, 1, 1));
+                    // route à sens unique au carrefour : entrée par son début, sortie par sa fin
+                    let (ra, rb) = (close[a].0, close[b].0);
+                    let first = |ri: usize, n: usize| per_road[ri].first() == Some(&n);
+                    links.push(if t.roads[ra].oneway && !t.roads[ra].ring {
+                        if first(ra, na) { (nb, na, 1, 0) } else { (na, nb, 1, 0) }
+                    } else if t.roads[rb].oneway && !t.roads[rb].ring {
+                        if first(rb, nb) { (na, nb, 1, 0) } else { (nb, na, 1, 0) }
+                    } else {
+                        (na, nb, 1, 1)
+                    });
                 }
             }
         }

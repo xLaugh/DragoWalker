@@ -255,7 +255,7 @@ pub fn write_ytyp(t: &Ytyp) -> String {
                 o.push_str("   <portals />\n");
             } else {
                 o.push_str("   <portals>\n");
-                for p in &m.portals {
+                for (pi, p) in m.portals.iter().enumerate() {
                     o.push_str("    <Item>\n");
                     val(&mut o, "     ", "roomFrom", p.room_from);
                     val(&mut o, "     ", "roomTo", p.room_to);
@@ -268,7 +268,12 @@ pub fn write_ytyp(t: &Ytyp) -> String {
                         vec_tag(&mut o, "      ", "Item", *c);
                     }
                     o.push_str("     </corners>\n");
-                    o.push_str("     <attachedObjects />\n");
+                    let att = m.portal_attached(pi);
+                    if att.is_empty() {
+                        o.push_str("     <attachedObjects />\n");
+                    } else {
+                        uint_array(&mut o, "     ", "attachedObjects", &att);
+                    }
                     o.push_str("    </Item>\n");
                 }
                 o.push_str("   </portals>\n");

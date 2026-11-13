@@ -172,6 +172,10 @@ pub struct DwApp {
     pub lists: crate::lists::Lists,
     /// bibliothèque des intérieurs
     pub intlib: crate::intlib::IntLib,
+    /// atelier de bâtiment
+    pub atelier: crate::atelier::AtelierState,
+    /// plan des intérieurs vu de dessus
+    pub plan: crate::plan::PlanState,
     /// éditeur de terrain
     pub terrain: crate::terrain::TerrainState,
     pub terrain_last_upload: f64,
@@ -276,7 +280,7 @@ impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         crate::update::start();
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![] };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -368,6 +372,8 @@ impl DwApp {
             gizmo_object_space: false,
             library: crate::library::Library::new(),
             lists: crate::lists::Lists::default(),
+            plan: Default::default(),
+            atelier: crate::atelier::AtelierState { square: true, wall_door: true, open: std::env::var("DW_ATELIER").is_ok(), ..Default::default() },
             intlib: crate::intlib::IntLib::new(std::env::var("DW_INTLIB").is_ok(), std::env::var("DW_INTLIB_FILTER").unwrap_or_default()),
             terrain: crate::terrain::TerrainState::default(),
             terrain_last_upload: 0.0,

@@ -75,6 +75,10 @@ impl DwApp {
                 self.status = format!("Projet ouvert : {}", path.display());
                 // projet d'avant la correction des rotations d'intérieur (CMloInstanceDef non inversé)
                 let fixed = self.proj.fix_mlo_rotations();
+                let moved = self.fix_misplaced_mlos();
+                if moved > 0 {
+                    self.status += &format!(" · {moved} intérieur(s) créé(s) rangé(s) dans le fichier d'un MLO importé (jamais exporté) : remis dans un fichier du projet, enregistre le projet.");
+                }
                 if fixed > 0 {
                     self.status += &format!(" · Orientation de {fixed} placement(s) d'intérieur corrigée (le tour donné avec les poignées est gardé) : enregistre le projet.");
                     self.sync_game_project();

@@ -64,7 +64,7 @@ impl DwApp {
         };
         if let Some(t) = self.proj.terrain.as_ref() {
             // terrain, chaussées, trottoirs et carrefours (vrais triangles)
-            if let Some(h) = t.surface_at(x, y) {
+            if let Some(h) = t.surface_below(x, y, z_from + 1e-3) {
                 take(h, &mut best);
             }
         }

@@ -9,12 +9,22 @@ use crate::math::{v3, V3};
 use crate::model::{Entity, MloArchetype};
 
 pub const SHELL_PREFIX: &str = "dw_shell_";
+/// Dictionnaire de textures des coques, déclaré par leurs types d'objets (sans lui : texture blanche en jeu).
+pub const SHELL_TXD: &str = "dw_shell_txd";
 /// Clés des trois textures (mur, sol, plafond).
 pub const K_WALL: u64 = 0xD5_5E11_0001;
 pub const K_FLOOR: u64 = 0xD5_5E11_0002;
 pub const K_CEIL: u64 = 0xD5_5E11_0003;
 /// Un portail est sur un mur quand ses quatre coins sont à moins de cette distance du plan du mur (m) — **estimé**.
 const ON_WALL: f32 = 0.2;
+/// Une trémie (portail horizontal entre deux étages) perce le sol ou le plafond d'une pièce quand ses coins sont à
+/// moins de cette distance de son plan (m) — **estimé**.
+const STAIR_PLANE: f32 = 0.6;
+/// Escalier : hauteur de marche au plus, profondeur de marche, et ce qu'il monte de plus que la pièce (épaisseur du
+/// plancher jusqu'au sol de l'étage du dessus) (m) — **estimé**.
+const STAIR_RISE: f32 = 0.18;
+const STAIR_RUN: f32 = 0.28;
+const STAIR_CEIL_GAP: f32 = 0.27;
 /// Distance d'affichage de l'objet « coque » : celle d'un nouvel objet d'intérieur de CodeWalker
 /// (ProjectForm::NewMloEntity 0x06000d68, IL_0398 : ldc.r4 200 → CEntityDef.lodDist).
 const SHELL_LOD: f32 = 200.0;
@@ -32,9 +42,74 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
     let Some(r) = m.rooms.get(ri) else { return Vec::new() };
     let (a, b) = (r.bb_min, r.bb_max);
     let mut out = Vec::new();
-    // sol (vers le haut) et plafond (vers le bas)
-    out.push((0, [v3(a.x, a.y, a.z), v3(b.x, a.y, a.z), v3(b.x, b.y, a.z), v3(a.x, b.y, a.z)], v3(0.0, 0.0, 1.0)));
-    out.push((2, [v3(a.x, a.y, b.z), v3(a.x, b.y, b.z), v3(b.x, b.y, b.z), v3(b.x, a.y, b.z)], v3(0.0, 0.0, -1.0)));
+    // trémies : portails horizontaux de cette pièce au niveau de son sol ou de son plafond (passage entre étages)
+    let flat_holes = |zz: f32| -> Vec<(f32, f32, f32, f32)> {
+        m.portals
+            .iter()
+            .filter(|p| p.room_from as usize == ri || p.room_to as usize == ri)
+            .filter(|p| p.corners.iter().all(|c| (c.z - zz).abs() < STAIR_PLANE))
+            .map(|p| {
+                let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for c in p.corners {
+                    x0 = x0.min(c.x);
+                    x1 = x1.max(c.x);
+                    y0 = y0.min(c.y);
+                    y1 = y1.max(c.y);
+                }
+                (x0.max(a.x), x1.min(b.x), y0.max(a.y), y1.min(b.y))
+            })
+            .filter(|h| h.1 - h.0 > 0.2 && h.3 - h.2 > 0.2)
+            .collect()
+    };
+    let (floor_holes, ceil_holes) = (flat_holes(a.z), flat_holes(b.z));
+    // sol (vers le haut) et plafond (vers le bas), percés des trémies
+    for (part, zz, n, holes) in [(0usize, a.z, v3(0.0, 0.0, 1.0), &floor_holes), (2, b.z, v3(0.0, 0.0, -1.0), &ceil_holes)] {
+        let mut rects = vec![(a.x, b.x, a.y, b.y)];
+        for h in holes.iter() {
+            let mut next = Vec::new();
+            for r in rects {
+                if h.1 <= r.0 || h.0 >= r.1 || h.3 <= r.2 || h.2 >= r.3 {
+                    next.push(r);
+                    continue;
+                }
+                let (hx0, hx1, hy0, hy1) = (h.0.max(r.0), h.1.min(r.1), h.2.max(r.2), h.3.min(r.3));
+                next.push((r.0, hx0, r.2, r.3));
+                next.push((hx1, r.1, r.2, r.3));
+                next.push((hx0, hx1, r.2, hy0));
+                next.push((hx0, hx1, hy1, r.3));
+            }
+            rects = next.into_iter().filter(|r| r.1 - r.0 > 0.01 && r.3 - r.2 > 0.01).collect();
+        }
+        for (x0, x1, y0, y1) in rects {
+            let q = if part == 0 { [v3(x0, y0, zz), v3(x1, y0, zz), v3(x1, y1, zz), v3(x0, y1, zz)] } else { [v3(x0, y0, zz), v3(x0, y1, zz), v3(x1, y1, zz), v3(x1, y0, zz)] };
+            out.push((part, q, n));
+        }
+    }
+    // escalier sous chaque trémie du plafond : le long du grand côté de la trémie, la dernière marche à son bord
+    // le plus loin, marches de STAIR_RISE au plus et STAIR_RUN de profondeur (raccourcies si la pièce est trop
+    // petite)
+    for &(x0, x1, y0, y1) in &ceil_holes {
+        let along_x = x1 - x0 >= y1 - y0;
+        let rise_total = b.z - a.z + STAIR_CEIL_GAP;
+        let n = (rise_total / STAIR_RISE).ceil().max(2.0) as usize;
+        let (lo, hi) = if along_x { (a.x, x1) } else { (a.y, y1) };
+        let run = (STAIR_RUN).min(((hi - lo) - 0.1) / n as f32).max(0.12);
+        let start = hi - run * n as f32;
+        let up = v3(0.0, 0.0, 1.0);
+        let pt = |s: f32, w: f32, zz: f32| if along_x { v3(s, w, zz) } else { v3(w, s, zz) };
+        let (w0, w1) = if along_x { (y0, y1) } else { (x0, x1) };
+        let fwd = if along_x { v3(1.0, 0.0, 0.0) } else { v3(0.0, 1.0, 0.0) };
+        let side = if along_x { v3(0.0, 1.0, 0.0) } else { v3(1.0, 0.0, 0.0) };
+        for i in 0..n {
+            let (s0, s1) = (start + i as f32 * run, start + (i + 1) as f32 * run);
+            let (zl, zh) = (a.z + i as f32 * rise_total / n as f32, a.z + (i + 1) as f32 * rise_total / n as f32);
+            // contremarche (vers le bas de l'escalier), marche, joues
+            out.push((0, [pt(s0, w0, zl), pt(s0, w1, zl), pt(s0, w1, zh), pt(s0, w0, zh)], fwd * -1.0));
+            out.push((0, [pt(s0, w0, zh), pt(s1, w0, zh), pt(s1, w1, zh), pt(s0, w1, zh)], up));
+            out.push((1, [pt(s0, w0, a.z), pt(s1, w0, a.z), pt(s1, w0, zh), pt(s0, w0, zh)], side * -1.0));
+            out.push((1, [pt(s0, w1, a.z), pt(s1, w1, a.z), pt(s1, w1, zh), pt(s0, w1, zh)], side));
+        }
+    }
     // murs : (axe fixe 0 = x / 1 = y, valeur, début et fin le long du mur, normale vers l'intérieur)
     let walls = [(0usize, a.x, a.y, b.y, v3(1.0, 0.0, 0.0)), (0, b.x, a.y, b.y, v3(-1.0, 0.0, 0.0)), (1, a.y, a.x, b.x, v3(0.0, 1.0, 0.0)), (1, b.y, a.x, b.x, v3(0.0, -1.0, 0.0))];
     for (axis, val, s0, s1, n) in walls {
@@ -147,7 +222,14 @@ pub const SHELL_KEYS: [u64; 3] = [K_FLOOR, K_WALL, K_CEIL];
 
 impl DwApp {
     /// Intérieurs à doter d'une coque : créés dans DragoWalker (ni MLO importé, ni intérieur du jeu).
+    /// Intérieurs qui reçoivent une coque visible : ceux créés dans DragoWalker, sauf ceux d'un bâtiment de l'atelier
+    /// (le bâtiment a déjà ses murs, ses planchers et son escalier).
     pub fn shell_mlos(&self) -> Vec<(usize, usize)> {
+        self.created_mlos().into_iter().filter(|&(ti, mi)| !self.proj.ytyps[ti].mlos[mi].name.to_lowercase().starts_with(crate::atelier::HOUSE_PREFIX)).collect()
+    }
+
+    /// Intérieurs créés ou modifiés dans DragoWalker (pas ceux du jeu, ni ceux recopiés d'une ressource MLO).
+    pub fn created_mlos(&self) -> Vec<(usize, usize)> {
         let external = self.mlo_external_ytyps();
         let w = self.game.world.as_deref();
         let mut out = Vec::new();
@@ -255,7 +337,7 @@ impl DwApp {
             for ri in 1..m.rooms.len() {
                 let Some((model, (mn, mx))) = room_model(m, ri) else { continue };
                 let sn = shell_name(&m.name, ri);
-                let Ok(path) = crate::sollumz::write_ydr_xml_ex(stream, &sn, &model, &SHELL_KEYS, &texs, None) else { continue };
+                let Ok(path) = crate::sollumz::write_ydr_xml_ex(stream, &sn, &model, &SHELL_KEYS, &texs, Some(SHELL_TXD)) else { continue };
                 // spots du plafond, rangés dans le modèle comme les lumières des intérieurs du jeu
                 let r = &m.rooms[ri];
                 // pièce déjà éclairée par un objet du jeu qui porte ses propres lumières (plafonnier…) : pas de
@@ -273,7 +355,7 @@ impl DwApp {
                 }
                 let (c, r) = ((mn + mx) * 0.5, (mx - mn).len() * 0.5);
                 archs.push(format!(
-                    "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{SHELL_ARCH_LOD}\" />\n   <flags value=\"0\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{r}\" />\n   <hdTextureDist value=\"15\" />\n   <name>{sn}</name>\n   <textureDictionary />\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{sn}</assetName>\n   <extensions />\n  </Item>",
+                    "  <Item type=\"CBaseArchetypeDef\">\n   <lodDist value=\"{SHELL_ARCH_LOD}\" />\n   <flags value=\"0\" />\n   <specialAttribute value=\"0\" />\n   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />\n   <bsRadius value=\"{r}\" />\n   <hdTextureDist value=\"15\" />\n   <name>{sn}</name>\n   <textureDictionary>{SHELL_TXD}</textureDictionary>\n   <clipDictionary />\n   <drawableDictionary />\n   <physicsDictionary />\n   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>{sn}</assetName>\n   <extensions />\n  </Item>",
                     mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, c.x, c.y, c.z
                 ));
                 n += 1;
@@ -282,8 +364,32 @@ impl DwApp {
         if archs.is_empty() {
             return (Vec::new(), String::new());
         }
+        let _ = crate::sollumz::write_ytd_xml(stream, SHELL_TXD, &texs);
         let ytyp = crate::model::Ytyp { name: "dw_shell_types".into(), mlos: Vec::new(), visible: true, raw_archetypes: archs };
         let _ = std::fs::write(stream.join("dw_shell_types.ytyp.xml"), crate::xmlio::write_ytyp(&ytyp));
         (vec![format!("Coques des intérieurs : {n} pièce(s) avec sol, murs (ouverts aux passages) et plafond ; collision complète avec le numéro de chaque pièce ; {nl} spot(s) au plafond ajouté(s) ; {lit_rooms} pièce(s) déjà éclairée(s) par les lumières de leurs objets du jeu.")], "data_file 'DLC_ITYP_REQUEST' 'stream/dw_shell_types.ytyp'\n".into())
+    }
+}
+
+#[cfg(test)]
+mod stair_tests {
+    use super::*;
+    use crate::model::{MloArchetype, Portal, Room};
+
+    #[test]
+    fn tremie_et_escalier() {
+        let rooms = vec![Room::new("limbo", V3::ZERO, V3::ZERO), Room::new("bas", v3(0.0, 0.0, 0.0), v3(8.0, 6.0, 2.95)), Room::new("haut", v3(0.0, 0.0, 3.2), v3(8.0, 6.0, 6.15))];
+        let z = 2.95;
+        let portals = vec![Portal::new(1, 2, [v3(3.0, 0.0, z), v3(6.0, 0.0, z), v3(6.0, 1.2, z), v3(3.0, 1.2, z)])];
+        let m = MloArchetype { name: "t".into(), lod_dist: 100.0, flags: 0, mlo_flags: 0, entities: vec![], rooms, portals, entity_sets: vec![] };
+        let low = room_quads(&m, 1);
+        // marches : chacune contremarche + marche + 2 joues ; la dernière arrive au sol de la pièce du dessus
+        let treads: Vec<f32> = low.iter().filter(|q| q.0 == 0 && q.2.z > 0.5 && q.1[0].z > 0.01).map(|q| q.1[0].z).collect();
+        assert!(treads.len() >= 15, "{} marches", treads.len());
+        let top = treads.iter().cloned().fold(0.0f32, f32::max);
+        assert!((top - 3.22).abs() < 0.05, "haut de l'escalier à {top}");
+        // le plafond du bas est percé (plusieurs morceaux), le sol du haut aussi
+        assert!(low.iter().filter(|q| q.0 == 2).count() >= 3);
+        assert!(room_quads(&m, 2).iter().filter(|q| q.0 == 0).count() >= 3);
     }
 }

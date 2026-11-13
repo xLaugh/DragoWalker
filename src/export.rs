@@ -175,6 +175,8 @@ impl DwApp {
     pub fn export_project(&mut self, dir: &Path, fivem: bool) -> String {
         // marge d'une seconde : précision des dates de fichiers
         let export_start = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        // intérieurs créés rangés par erreur dans le .ytyp d'une ressource importée : remis dans un .ytyp du projet
+        let moved = self.fix_misplaced_mlos();
         // intérieurs créés : chaque pièce a son objet « coque » (sol, murs, plafond) avant d'écrire les .ytyp
         self.ensure_shell_entities();
         let out = if fivem { dir.join(self.proj.name.replace(' ', "_").to_lowercase()) } else { dir.to_path_buf() };
@@ -184,6 +186,9 @@ impl DwApp {
         }
         let dll = cwbridge::dll(&self.game.cw_dir);
         let mut report = Vec::new();
+        if moved > 0 {
+            report.push(format!("{moved} intérieur(s) créé(s) dans DragoWalker étaient rangés dans le fichier de types d'une ressource MLO importée (recopié tel quel, donc jamais exportés) : remis dans un fichier du projet. Enregistre le projet."));
+        }
         let ymaps = self.ymaps_for_export(dll.as_deref(), &mut report);
         let mut n = 0;
         // cartes du projet : les bâtiments du jeu copiés emportent leur version lointaine (carte « _lod »)
@@ -291,13 +296,21 @@ impl DwApp {
         let (shell_report, shell_manifest) = self.export_shells(&stream);
         report.extend(shell_report);
         mlo_manifest += &shell_manifest;
+        // bâtiments de l'atelier (atelier.rs)
+        let (house_report, house_manifest) = self.export_houses(&stream);
+        report.extend(house_report);
+        mlo_manifest += &house_manifest;
+        // son des intérieurs créés (occlusion et réglages audio des pièces, audio.rs)
+        let (audio_report, audio_manifest) = self.export_audio(&stream);
+        report.extend(audio_report);
+        mlo_manifest += &audio_manifest;
         // binaires fabriqués par DragoWalker lors d'un export précédent et qui ne correspondent plus à rien (tuile,
         // route, collision ou façade disparue) : retirés ; les autres restent, pour être réutilisés s'ils n'ont pas
         // changé (convert_and_tidy)
         let res_prefixes: Vec<String> = self.proj.mlo_res.iter().map(|r| r.name.replace(' ', "_").to_lowercase()).flat_map(|r| [format!("{r}_x_"), format!("{r}_exterieur")]).collect();
         for f in std::fs::read_dir(&stream).into_iter().flatten().flatten() {
             let n = f.file_name().to_string_lossy().to_lowercase();
-            let ours = ["dw_terrain", "dw_road_", "dw_bcol_", "dw_fx_", "dw_cut", "dw_shell", "_manifest.ymf"].iter().any(|p| n.starts_with(p)) || res_prefixes.iter().any(|p| n.starts_with(p.as_str()));
+            let ours = ["dw_terrain", "dw_road_", "dw_bcol_", "dw_fx_", "dw_cut", "dw_shell", "dw_bat_", "dw_house", "dw_audio_game", "_manifest.ymf"].iter().any(|p| n.starts_with(p)) || n.strip_suffix(".ymt").map(|b| b.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) || res_prefixes.iter().any(|p| n.starts_with(p.as_str()));
             // écrit par cet export (ex. façade copiée en entier, sans XML) : gardé
             let fresh = f.metadata().and_then(|m| m.modified()).map(|t| t >= export_start).unwrap_or(true);
             if ours && !fresh && !n.ends_with(".xml") && f.path().is_file() && !stream.join(format!("{}.xml", f.file_name().to_string_lossy())).exists() {
@@ -355,6 +368,17 @@ impl DwApp {
                     Ok(false) => {}
                     Err(e) => report.push(format!("Export des PNJ impossible : {e}")),
                 }
+            }
+            // portes des intérieurs : enregistrées dans le système de portes du jeu, ouvertes
+            match self.export_doors(&out) {
+                Ok(n) if n > 0 => {
+                    man += "
+client_script 'dw_doors.lua'
+";
+                    report.push(format!("Portes : {n} porte(s) d'intérieur enregistrée(s) et ouverte(s) en jeu (dw_doors.lua)."));
+                }
+                Ok(_) => {}
+                Err(e) => report.push(format!("Script des portes impossible : {e}")),
             }
             if !self.export_skip.is_empty() {
                 report.push(format!("Test en jeu sans : {}.", self.export_skip.join(", ")));

@@ -73,12 +73,20 @@ pub fn read_drawable(r: &Resource, d: usize, max_tris: usize) -> Option<Mesh> {
     for lod in 0..4 {
         let Some(h) = r.ptr(r.u64(d + 0x50 + lod * 8)) else { continue };
         let mut mesh = Mesh::default();
+        let bones = bone_transforms(r, d);
         for m in pointer_list(r, h) {
             let Some(garr) = r.ptr(r.u64(m + 0x08)) else { continue };
             let gn = r.u16(m + 0x10) as usize;
+            let v0 = mesh.pos.len();
             for gi in 0..gn.min(512) {
                 if let Some(g) = r.ptr(r.u64(garr + gi * 8)) {
                     read_geometry(r, g, &mut mesh, max_tris);
+                }
+            }
+            if let Some((q, t)) = model_bone(r, m, &bones) {
+                for p in &mut mesh.pos[v0..] {
+                    let q2 = quat_rotate(q, *p);
+                    *p = [q2[0] + t[0], q2[1] + t[1], q2[2] + t[2]];
                 }
             }
         }
@@ -473,8 +481,77 @@ fn read_render_geometry(r: &Resource, g: usize, model: &mut RModel, st: ShaderTe
     }
 }
 
+/// Position de chaque os du squelette d'un modèle, dans le repère du modèle : (rotation x, y, z, w ; translation).
+/// Squelette pointé à 0x18 du modèle (Skeleton : os à 0x20, nombre d'os à 0x5E) ; os de 0x50 octets : rotation
+/// locale (quaternion) à 0x00, translation locale à 0x10, parent (i16) à 0x32 — d'après la structure Skeleton / Bone
+/// de CodeWalker. Chaque os est composé avec son parent.
+pub fn bone_transforms(r: &Resource, d: usize) -> Vec<([f32; 4], [f32; 3])> {
+    let Some(sk) = r.ptr(r.u64(d + 0x18)) else { return Vec::new() };
+    let Some(bones) = r.ptr(r.u64(sk + 0x20)) else { return Vec::new() };
+    let n = r.u16(sk + 0x5E) as usize;
+    if n == 0 || n > 512 || bones + n * 0x50 > r.data.len() {
+        return Vec::new();
+    }
+    let mut abs: Vec<([f32; 4], [f32; 3])> = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = bones + i * 0x50;
+        let q = [r.f32(b), r.f32(b + 4), r.f32(b + 8), r.f32(b + 12)];
+        let t = r.v3(b + 0x10);
+        let parent = r.u16(b + 0x32) as i16;
+        let ql = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        let q = if ql > 1e-6 && ql.is_finite() { [q[0] / ql, q[1] / ql, q[2] / ql, q[3] / ql] } else { [0.0, 0.0, 0.0, 1.0] };
+        let t = if t.iter().all(|v| v.is_finite()) { t } else { [0.0; 3] };
+        if parent >= 0 && (parent as usize) < i {
+            let (pq, pt) = abs[parent as usize];
+            let rt = quat_rotate(pq, t);
+            abs.push((quat_mul(pq, q), [pt[0] + rt[0], pt[1] + rt[1], pt[2] + rt[2]]));
+        } else {
+            abs.push((q, t));
+        }
+    }
+    abs
+}
+
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    // v + 2 w (u × v) + 2 u × (u × v)
+    let u = [q[0], q[1], q[2]];
+    let c = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let uv = c(u, v);
+    let uuv = c(u, uv);
+    [v[0] + 2.0 * (q[3] * uv[0] + uuv[0]), v[1] + 2.0 * (q[3] * uv[1] + uuv[1]), v[2] + 2.0 * (q[3] * uv[2] + uuv[2])]
+}
+
+/// Os auquel une partie de modèle (DrawableModel) est attachée : SkeletonBinding à 0x28, os = 4e octet, peau = 2e
+/// octet (une partie à peau suit ses sommets, elle n'est pas déplacée d'un bloc). None si rien à déplacer.
+fn model_bone(r: &Resource, m: usize, bones: &[([f32; 4], [f32; 3])]) -> Option<([f32; 4], [f32; 3])> {
+    let bind = r.u32(m + 0x28);
+    let (bone, skin) = (((bind >> 24) & 0xFF) as usize, (bind >> 8) & 0xFF);
+    if skin != 0 || bone == 0 || bone >= bones.len() {
+        return None;
+    }
+    let (q, t) = bones[bone];
+    if q == [0.0, 0.0, 0.0, 1.0] && t == [0.0; 3] {
+        return None;
+    }
+    Some((q, t))
+}
+
 /// Modèle complet (formes, normales, coordonnées de texture, matériaux) au niveau de détail le plus haut.
 pub fn read_render_drawable(r: &Resource, d: usize, max_tris: usize) -> Option<RModel> {
+    let bones = bone_transforms(r, d);
+    let debug_bones = std::env::var("DW_DEBUG_BONES").is_ok();
+    if debug_bones {
+        println!("squelette : {} os {:?}", bones.len(), bones.iter().map(|b| b.1).collect::<Vec<_>>());
+    }
     let sg = r.ptr(r.u64(d + 0x10));
     let shader_tex = sg.map(|s| shader_textures(r, s)).unwrap_or_default();
     let embedded_dict = sg.and_then(|s| r.ptr(r.u64(s + 0x08)));
@@ -485,12 +562,25 @@ pub fn read_render_drawable(r: &Resource, d: usize, max_tris: usize) -> Option<R
             let Some(garr) = r.ptr(r.u64(m + 0x08)) else { continue };
             let gn = r.u16(m + 0x10) as usize;
             let map = r.ptr(r.u64(m + 0x20));
+            let v0 = model.verts.len();
             for gi in 0..gn.min(512) {
                 let sidx = map.map(|p| r.u16(p + gi * 2) as usize).unwrap_or(usize::MAX);
                 let st = shader_tex.get(sidx).copied().unwrap_or_default();
                 if let Some(g) = r.ptr(r.u64(garr + gi * 8)) {
                     read_render_geometry(r, g, &mut model, st, max_tris);
                 }
+            }
+            // partie attachée à un os (tête d'un lampadaire, bras d'une barrière…) : placée sur cet os
+            if let Some((q, t)) = model_bone(r, m, &bones) {
+                for v in &mut model.verts[v0..] {
+                    let p = quat_rotate(q, v.pos);
+                    v.pos = [p[0] + t[0], p[1] + t[1], p[2] + t[2]];
+                    v.nrm = quat_rotate(q, v.nrm);
+                }
+            }
+            if debug_bones {
+                let bind = r.u32(m + 0x28);
+                println!("   partie : os {} peau {} -> {:?}", (bind >> 24) & 0xFF, (bind >> 8) & 0xFF, model_bone(r, m, &bones).map(|b| b.1));
             }
         }
         if !model.idx.is_empty() {

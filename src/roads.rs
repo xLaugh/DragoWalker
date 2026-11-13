@@ -39,9 +39,13 @@ pub struct RoadKind {
     pub dirt: bool,
     /// surface de collision (nom de materials.dat) de la chaussée
     pub coll: &'static str,
+    /// passerelle pour piétons : toujours un pont, escaliers aux deux bouts, pas de voitures ni de carrefour
+    pub foot: bool,
+    /// bretelle d'autoroute : une voie à sens unique (sens du tracé), qui se fond dans l'autoroute sans carrefour
+    pub ramp: bool,
 }
 
-pub const KINDS: [RoadKind; 5] = [
+pub const KINDS: [RoadKind; 7] = [
     RoadKind {
         name: "Rue de ville",
         tip: "2 voies, double ligne jaune au centre, places de stationnement, trottoirs avec bordure (11 m + 2 × 3 m)",
@@ -53,6 +57,8 @@ pub const KINDS: [RoadKind; 5] = [
         lines: &[ln(-0.16, 0.12, true, false), ln(0.16, 0.12, true, false), ln(-3.8, 0.12, false, false), ln(3.8, 0.12, false, false)],
         dirt: false,
         coll: "TARMAC",
+        foot: false,
+        ramp: false,
     },
     RoadKind {
         name: "Avenue",
@@ -65,6 +71,8 @@ pub const KINDS: [RoadKind; 5] = [
         lines: &[ln(-0.16, 0.12, true, false), ln(0.16, 0.12, true, false), ln(-3.9, 0.12, false, true), ln(3.9, 0.12, false, true), ln(-7.45, 0.15, false, false), ln(7.45, 0.15, false, false)],
         dirt: false,
         coll: "TARMAC",
+        foot: false,
+        ramp: false,
     },
     RoadKind {
         name: "Autoroute",
@@ -86,6 +94,8 @@ pub const KINDS: [RoadKind; 5] = [
         ],
         dirt: false,
         coll: "TARMAC",
+        foot: false,
+        ramp: false,
     },
     RoadKind {
         name: "Route de campagne",
@@ -98,6 +108,8 @@ pub const KINDS: [RoadKind; 5] = [
         lines: &[ln(0.0, 0.15, true, true), ln(-3.55, 0.12, false, false), ln(3.55, 0.12, false, false)],
         dirt: false,
         coll: "TARMAC",
+        foot: false,
+        ramp: false,
     },
     RoadKind {
         name: "Chemin de terre",
@@ -110,6 +122,36 @@ pub const KINDS: [RoadKind; 5] = [
         lines: &[],
         dirt: true,
         coll: "DIRT_TRACK",
+        foot: false,
+        ramp: false,
+    },
+    RoadKind {
+        name: "Passerelle",
+        tip: "Pont pour piétons au-dessus des routes ou d'un ravin, escaliers aux deux bouts, garde-corps (3 m)",
+        width: 3.0,
+        sidewalk: 0.0,
+        curb: 0.0,
+        shoulder: 0.0,
+        shoulder_mat: 4,
+        lines: &[],
+        dirt: false,
+        coll: "CONCRETE",
+        foot: true,
+        ramp: false,
+    },
+    RoadKind {
+        name: "Bretelle d'autoroute",
+        tip: "Entrée ou sortie d'autoroute : 1 voie à sens unique (dans le sens du tracé), lignes blanches de bord, accotements en béton ; un bout se pose au bord d'une autoroute (5 m + 2 × 1 m)",
+        width: 5.0,
+        sidewalk: 0.0,
+        curb: 0.0,
+        shoulder: 1.0,
+        shoulder_mat: 4,
+        lines: &[ln(-2.3, 0.15, false, false), ln(2.3, 0.15, false, false)],
+        dirt: false,
+        coll: "TARMAC",
+        foot: false,
+        ramp: true,
     },
 ];
 
@@ -117,8 +159,91 @@ pub const KINDS: [RoadKind; 5] = [
 pub const ROAD_TEX_LEN: f32 = 12.0;
 /// Pas entre deux points de la courbe d'une route (m).
 pub const STEP: f32 = 1.5;
-/// Pente maximale d'une route (12 %) — **estimé**.
+/// Pente maximale d'une route par défaut (12 %) — **estimé** ; réglable de GRADE_MIN à GRADE_MAX par route.
 pub const MAX_GRADE: f32 = 0.12;
+pub const GRADE_MIN: f32 = 0.02;
+pub const GRADE_MAX: f32 = 0.25;
+
+fn default_grade() -> f32 {
+    MAX_GRADE
+}
+
+// Ponts — toutes ces mesures sont **estimées** d'après l'aspect des ponts du jeu, pas lues dans ses fichiers.
+/// Hauteur au-dessus du sol à partir de laquelle une route tracée en mode pont devient un pont (m).
+pub const BRIDGE_MIN_CLEAR: f32 = 2.5;
+/// Épaisseur du tablier sous la chaussée (poutre en caisson) : route, passerelle (m).
+pub const DECK_DEPTH: f32 = 1.4;
+pub const FOOT_DEPTH: f32 = 0.6;
+/// Hauteur libre sous un pont qui passe au-dessus d'une route (gabarit des autoroutes, m).
+pub const CLEARANCE: f32 = 5.3;
+/// Hauteur libre sous une passerelle qui ne passe au-dessus d'aucune route (m).
+pub const FOOT_CLEAR: f32 = 2.5;
+/// Écart entre deux piles (m).
+pub const PIER_STEP: f32 = 30.0;
+/// Garde-corps en béton : hauteur (route, passerelle) et épaisseur (m).
+pub const PARAPET_H: f32 = 0.9;
+pub const FOOT_PARAPET_H: f32 = 1.1;
+pub const PARAPET_W: f32 = 0.3;
+/// Marches des escaliers de passerelle : hauteur et profondeur (m).
+pub const STEP_RISE: f32 = 0.17;
+pub const STEP_RUN: f32 = 0.30;
+/// Deux routes dont les hauteurs diffèrent de plus que ça à leur croisement ne se rejoignent pas : l'une passe
+/// au-dessus de l'autre (m).
+pub const JOIN_DZ: f32 = 3.0;
+/// Partie de modèle « structure de pont » (piles, tablier, garde-corps, escaliers) : collision en béton.
+pub const BRIDGE_COLL: u8 = 3;
+/// Glissières : collision en métal ; îlot de rond-point : collision d'herbe.
+pub const RAIL_COLL: u8 = 4;
+pub const GRASS_COLL: u8 = 5;
+
+// Tunnels — mesures **estimées** d'après l'aspect des tunnels du jeu.
+/// Hauteur libre du tube au-dessus de la chaussée (m).
+pub const TUNNEL_H: f32 = 6.0;
+/// Terre au-dessus du toit pour qu'une route tracée en mode tunnel passe en tunnel (m).
+pub const TUNNEL_COVER: f32 = 2.0;
+/// Écart entre deux lumières du tunnel (m).
+pub const TUNNEL_LIGHT_STEP: f32 = 12.0;
+/// Façade de chaque entrée : débord de chaque côté du tube et au-dessus (m).
+pub const PORTAL_SIDE: f32 = 8.0;
+pub const PORTAL_TOP: f32 = 5.0;
+
+/// Raccord entre deux types de route (une rue qui prolonge une avenue) : longueur sur laquelle la largeur passe de
+/// l'une à l'autre (m) — **estimé**.
+pub const TAPER_LEN: f32 = 30.0;
+
+// Équipements — **estimés** d'après les rues du jeu.
+/// Écart entre deux lampadaires d'un même côté (m), et sur l'autoroute (au terre-plein).
+pub const LAMP_STEP: f32 = 30.0;
+pub const LAMP_STEP_HIGHWAY: f32 = 40.0;
+/// Lampadaire à un bras (bord de route) et à deux bras (terre-plein d'autoroute), objets du jeu.
+pub const LAMP_SINGLE: &str = "prop_streetlight_01";
+pub const LAMP_DOUBLE: &str = "prop_streetlight_03d";
+/// Glissière : hauteur du bas et du haut de la lisse (au-dessus de l'accotement), écart des poteaux (m).
+pub const RAIL_LOW: f32 = 0.45;
+pub const RAIL_HIGH: f32 = 0.8;
+pub const RAIL_POST_STEP: f32 = 2.0;
+/// Rayon par défaut d'un rond-point (axe de la chaussée, m).
+pub const RING_RADIUS: f32 = 20.0;
+
+/// Équipements d'une route, posés tout seuls.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Furniture {
+    /// lampadaires du jeu le long de la route
+    pub lights: bool,
+    /// glissières de sécurité (routes sans trottoir)
+    pub rails: bool,
+    /// décalques au sol : fissures, taches, rustines
+    pub decals: bool,
+}
+
+impl Furniture {
+    /// Réglage par défaut selon le type : lampadaires en ville, sur l'autoroute et les bretelles ; glissières sur
+    /// l'autoroute et les bretelles ; décalques sur toutes les routes goudronnées.
+    pub fn for_kind(k: &RoadKind) -> Furniture {
+        let paved = !k.dirt && !k.foot;
+        Furniture { lights: paved && (k.sidewalk > 0.0 || k.ramp || k.width >= 20.0), rails: k.ramp || k.width >= 20.0, decals: paved }
+    }
+}
 
 /// Clés des textures (dans le même dictionnaire que celles du terrain).
 pub fn road_tex_key(kind: usize) -> u64 {
@@ -139,6 +264,45 @@ pub struct Road {
     /// réglages de circulation
     #[serde(default)]
     pub traffic: RoadTraffic,
+    /// pente maximale (0,12 = 12 %)
+    #[serde(default = "default_grade")]
+    pub grade: f32,
+    /// tracée en mode pont (hauteur gardée au-dessus des creux et des routes croisées)
+    #[serde(default)]
+    pub elevated: bool,
+    /// tronçons en pont : distance de début et de fin le long de la route (terrain laissé tel quel dessous)
+    #[serde(default)]
+    pub spans: Vec<[f32; 2]>,
+    /// piles : distance le long de la route et hauteur du sol à leur pied
+    #[serde(default)]
+    pub piers: Vec<[f32; 2]>,
+    /// culées (murs aux deux bouts de chaque tronçon en pont) : distance, hauteur du sol
+    #[serde(default)]
+    pub abutments: Vec<[f32; 2]>,
+    /// passerelle : hauteur du sol au pied de l'escalier du début et de celui de la fin
+    #[serde(default)]
+    pub stairs: Option<[f32; 2]>,
+    /// tracée en mode tunnel (passe sous les reliefs au lieu de les suivre)
+    #[serde(default)]
+    pub buried: bool,
+    /// tronçons en tunnel : distance de début et de fin
+    #[serde(default)]
+    pub tunnels: Vec<[f32; 2]>,
+    /// raccord au début avec une route d'un autre type : (type de l'autre route, longueur du raccord)
+    #[serde(default)]
+    pub taper: Option<(u8, f32)>,
+    /// rond-point : boucle fermée (le dernier point est le premier), sens unique (sens inverse des aiguilles)
+    #[serde(default)]
+    pub ring: bool,
+    /// sens unique dans le sens du tracé (bretelle)
+    #[serde(default)]
+    pub oneway: bool,
+    /// équipements posés tout seuls
+    #[serde(default)]
+    pub furniture: Furniture,
+    /// lampadaires posés par DragoWalker pour cette route (identifiants des objets)
+    #[serde(default)]
+    pub props: Vec<u64>,
 }
 
 /// Carrefour : disque de goudron sans marquage posé sur la jonction de deux routes.
@@ -262,7 +426,13 @@ impl Road {
 
     /// Crée la route à partir des points cliqués : courbe lissée (Catmull-Rom), hauteur du terrain lissée
     /// sur ±15 m puis pente limitée à 12 %.
-    pub fn build(kind: u8, pts: &[V3], height: impl Fn(f32, f32) -> Option<f32>) -> Option<Road> {
+    pub fn build(kind: u8, pts: &[V3], height: impl Fn(f32, f32) -> Option<f32>, grade: f32, elevated: bool) -> Option<Road> {
+        Road::build_ex(kind, pts, height, grade, elevated, false)
+    }
+
+    /// Comme build ; `buried` : mode tunnel, la chaussée va en ligne droite (en hauteur) d'un bout à l'autre sous les
+    /// reliefs, sauf là où le terrain est plus bas.
+    pub fn build_ex(kind: u8, pts: &[V3], height: impl Fn(f32, f32) -> Option<f32>, grade: f32, elevated: bool, buried: bool) -> Option<Road> {
         if pts.len() < 2 {
             return None;
         }
@@ -291,17 +461,538 @@ impl Road {
         for i in 1..xy.len() {
             dist[i] = dist[i - 1] + ((xy[i][0] - xy[i - 1][0]).powi(2) + (xy[i][1] - xy[i - 1][1]).powi(2)).sqrt();
         }
-        // pente limitée dans les deux sens
-        for i in 1..z.len() {
-            let m = (dist[i] - dist[i - 1]) * MAX_GRADE;
-            z[i] = z[i].clamp(z[i - 1] - m, z[i - 1] + m);
+        // mode pont : la chaussée ne descend pas dans les creux, elle va en ligne droite (en hauteur) d'un bout à
+        // l'autre, sauf là où le terrain est plus haut
+        let grade = grade.clamp(GRADE_MIN, GRADE_MAX);
+        if elevated {
+            let (za, zb) = (pts[0].z, pts[pts.len() - 1].z);
+            let len = dist[dist.len() - 1].max(1e-3);
+            for i in 0..z.len() {
+                z[i] = z[i].max(za + (zb - za) * dist[i] / len);
+            }
         }
-        for i in (0..z.len() - 1).rev() {
-            let m = (dist[i + 1] - dist[i]) * MAX_GRADE;
-            z[i] = z[i].clamp(z[i + 1] - m, z[i + 1] + m);
+        if buried && !elevated {
+            let (za, zb) = (pts[0].z, pts[pts.len() - 1].z);
+            let len = dist[dist.len() - 1].max(1e-3);
+            for i in 0..z.len() {
+                z[i] = z[i].min(za + (zb - za) * dist[i] / len);
+            }
         }
+        limit_grade(&mut z, &dist, grade);
         let samples = xy.iter().enumerate().map(|(i, p)| [p[0], p[1], z[i], dist[i]]).collect();
-        Some(Road { kind, pts: p2, samples, gaps: Vec::new(), traffic: RoadTraffic::default() })
+        let kd = &KINDS[(kind as usize).min(KINDS.len() - 1)];
+        let foot = kd.foot;
+        let traffic = RoadTraffic { enabled: !foot, ..RoadTraffic::default() };
+        Some(Road {
+            kind,
+            pts: p2,
+            samples,
+            gaps: Vec::new(),
+            traffic,
+            grade,
+            elevated: elevated || foot,
+            spans: Vec::new(),
+            piers: Vec::new(),
+            abutments: Vec::new(),
+            stairs: None,
+            buried: buried && !elevated && !foot,
+            tunnels: Vec::new(),
+            taper: None,
+            ring: false,
+            oneway: kd.ramp,
+            furniture: Furniture::for_kind(kd),
+            props: Vec::new(),
+        })
+    }
+
+    /// Rond-point : boucle de rayon `radius` (axe de la chaussée) autour de `c`, à la hauteur `z`, parcourue dans
+    /// le sens inverse des aiguilles d'une montre (on roule à droite).
+    pub fn ring(kind: u8, c: V3, radius: f32, z: f32) -> Road {
+        let n = ((std::f32::consts::TAU * radius / STEP).ceil() as usize).max(24);
+        let mut samples = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            samples.push([c.x + radius * a.cos(), c.y + radius * a.sin(), z, radius * a]);
+        }
+        let pts = (0..8).map(|i| {
+            let a = i as f32 / 8.0 * std::f32::consts::TAU;
+            [c.x + radius * a.cos(), c.y + radius * a.sin()]
+        }).collect();
+        let kd = &KINDS[(kind as usize).min(KINDS.len() - 1)];
+        Road {
+            kind,
+            pts,
+            samples,
+            gaps: Vec::new(),
+            traffic: RoadTraffic::default(),
+            grade: MAX_GRADE,
+            elevated: false,
+            spans: Vec::new(),
+            piers: Vec::new(),
+            abutments: Vec::new(),
+            stairs: None,
+            buried: false,
+            tunnels: Vec::new(),
+            taper: None,
+            ring: true,
+            oneway: true,
+            furniture: Furniture::for_kind(kd),
+            props: Vec::new(),
+        }
+    }
+
+    /// La même route refaite depuis ses points cliqués et ses réglages (type, pente, pont, tunnel, rond-point), sur
+    /// le terrain actuel ; ses bouts posés sur une route déjà refaite (`built`) prennent sa hauteur. Le réseau entier
+    /// est refait ainsi quand une route est modifiée ou supprimée (Terrain::rebuild_roads).
+    pub fn rebuilt(&self, height: &dyn Fn(f32, f32) -> Option<f32>, built: &[Road]) -> Option<Road> {
+        let keep = |mut r: Road| {
+            r.traffic = self.traffic.clone();
+            r.furniture = self.furniture;
+            r.taper = self.taper;
+            r.props = self.props.clone();
+            r
+        };
+        if self.ring {
+            let n = self.pts.len().max(1) as f32;
+            let c = v3(self.pts.iter().map(|p| p[0]).sum::<f32>() / n, self.pts.iter().map(|p| p[1]).sum::<f32>() / n, 0.0);
+            let rr = self.pts.first().map(|p| ((p[0] - c.x).powi(2) + (p[1] - c.y).powi(2)).sqrt()).unwrap_or(RING_RADIUS);
+            let z = height(c.x, c.y).or(self.samples.first().map(|s| s[2])).unwrap_or(0.0);
+            return Some(keep(Road::ring(self.kind, c, rr, z)));
+        }
+        let n = self.pts.len();
+        if n < 2 {
+            return None;
+        }
+        let pts: Vec<V3> = self
+            .pts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut z = height(p[0], p[1]).unwrap_or(0.0);
+                if i == 0 || i == n - 1 {
+                    for o in built {
+                        if let Some((d, q, _, _)) = o.nearest_point(p[0], p[1]) {
+                            if d <= o.kind().width * 0.5 + 0.5 && (q.z - z).abs() < 4.0 * JOIN_DZ {
+                                z = q.z;
+                            }
+                        }
+                    }
+                }
+                v3(p[0], p[1], z)
+            })
+            .collect();
+        let foot = self.kind().foot;
+        let mut r = Road::build_ex(self.kind, &pts, height, self.grade, self.elevated && !foot, self.buried)?;
+        if foot {
+            r.make_footbridge(height, built);
+        } else if self.elevated {
+            r.raise_over(built);
+        }
+        Some(keep(r))
+    }
+
+    /// Centre et rayon (axe) d'un rond-point.
+    pub fn ring_center(&self) -> (V3, f32) {
+        let m = (self.samples.len() - 1).max(1);
+        let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
+        for s in &self.samples[..m] {
+            x += s[0];
+            y += s[1];
+            z += s[2];
+        }
+        let c = v3(x / m as f32, y / m as f32, z / m as f32);
+        let r = ((self.samples[0][0] - c.x).powi(2) + (self.samples[0][1] - c.y).powi(2)).sqrt();
+        (c, r)
+    }
+
+    /// Largeurs au point `d` (demi-chaussée, trottoir ou accotement, bordure), raccord compris.
+    pub fn dims_at(&self, d: f32) -> (f32, f32, f32) {
+        let dims = |k: &RoadKind| (k.width * 0.5, k.sidewalk.max(k.shoulder), k.curb);
+        let b = dims(self.kind());
+        if let Some((ok, len)) = self.taper {
+            if d < len && len > 0.0 && !self.kind().foot {
+                let o = dims(&KINDS[(ok as usize).min(KINDS.len() - 1)]);
+                let t = (d / len).clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t);
+                return (o.0 + (b.0 - o.0) * t, o.1 + (b.1 - o.1) * t, o.2 + (b.2 - o.2) * t);
+            }
+        }
+        b
+    }
+
+    /// Demi-largeur totale au point `d` (raccord compris).
+    pub fn half_at(&self, d: f32) -> f32 {
+        let (h, e, _) = self.dims_at(d);
+        h + e
+    }
+
+    /// Plus grande demi-largeur totale de la route (raccord compris).
+    pub fn max_half(&self) -> f32 {
+        self.half_total().max(self.half_at(0.0))
+    }
+
+    /// Vrai si la distance `d` est dans un tunnel.
+    pub fn in_tunnel(&self, d: f32) -> bool {
+        self.tunnels.iter().any(|s| d >= s[0] && d <= s[1])
+    }
+
+    /// Tronçons en tunnel d'une route tracée en mode tunnel : là où il y a plus de TUNNEL_H + TUNNEL_COVER de terrain
+    /// au-dessus de la chaussée ; deux tronçons à moins de 12 m n'en font qu'un, moins de 6 m est ignoré (**estimé**).
+    pub fn mark_tunnels(&mut self, ground: impl Fn(f32, f32) -> Option<f32>) {
+        let mut out: Vec<[f32; 2]> = Vec::new();
+        let mut cur: Option<f32> = None;
+        let n = self.samples.len();
+        for (i, s) in self.samples.iter().enumerate() {
+            let deep = ground(s[0], s[1]).map(|g| g - s[2] > TUNNEL_H + TUNNEL_COVER).unwrap_or(false);
+            match (deep, cur) {
+                (true, None) => cur = Some(s[3]),
+                (false, Some(a)) => {
+                    out.push([a, s[3]]);
+                    cur = None;
+                }
+                _ => {}
+            }
+            if i == n - 1 {
+                if let Some(a) = cur {
+                    out.push([a, s[3]]);
+                }
+            }
+        }
+        let mut merged: Vec<[f32; 2]> = Vec::new();
+        for sp in out {
+            if let Some(l) = merged.last_mut() {
+                if sp[0] - l[1] < 12.0 {
+                    l[1] = sp[1];
+                    continue;
+                }
+            }
+            merged.push(sp);
+        }
+        merged.retain(|s| s[1] - s[0] >= 6.0);
+        self.tunnels = merged;
+    }
+
+    /// Lumières du plafond des tunnels (points, en coordonnées monde) : au milieu du plafond, tous les
+    /// TUNNEL_LIGHT_STEP m.
+    pub fn tunnel_lights(&self) -> Vec<V3> {
+        let mut out = Vec::new();
+        for t in &self.tunnels {
+            let n = ((t[1] - t[0]) / TUNNEL_LIGHT_STEP).floor().max(1.0) as usize;
+            for k in 0..n {
+                let d = t[0] + (t[1] - t[0]) * (k as f32 + 0.5) / n as f32;
+                let (p, _) = self.at(d);
+                out.push(v3(p.x, p.y, p.z + 0.08 + TUNNEL_H - 0.25));
+            }
+        }
+        out
+    }
+
+    /// Emplacements des lampadaires : (pied sur l'axe décalé, direction vers la chaussée, lampadaire à deux bras).
+    pub fn lamp_spots(&self) -> Vec<(V3, V3, bool)> {
+        let k = self.kind();
+        let mut out = Vec::new();
+        if !self.furniture.lights || k.foot || k.dirt || self.samples.len() < 2 {
+            return out;
+        }
+        let len = self.length();
+        let gap = |d: f32, side: f32| self.gaps.iter().any(|g| d >= g[0] - 2.0 && d <= g[1] + 2.0 && (g[2] == 0.0 || g[2] == side));
+        let free = |d: f32| !self.in_tunnel(d) && (self.ring || (d > 6.0 && d < len - 6.0));
+        if k.width >= 20.0 && !self.ring {
+            // autoroute : lampadaires à deux bras sur le terre-plein
+            let mut d = LAMP_STEP_HIGHWAY * 0.5;
+            while d < len {
+                if free(d) && !gap(d, 0.0) {
+                    let (p, t) = self.at(d);
+                    out.push((p, v3(t.y, -t.x, 0.0), true));
+                }
+                d += LAMP_STEP_HIGHWAY;
+            }
+            return out;
+        }
+        let mut d = LAMP_STEP * 0.5;
+        let mut i = 0;
+        while d < len {
+            let (hw, e, _) = self.dims_at(d);
+            // trottoir : près de la bordure, des deux côtés (en quinconce dans une rue, face à face sur une avenue) ;
+            // sans trottoir : au bord de l'accotement, côté droit ; rond-point : côté extérieur
+            let sides: Vec<f32> = if self.ring {
+                vec![1.0]
+            } else if k.sidewalk > 0.0 {
+                if k.width >= 15.0 { vec![-1.0, 1.0] } else { vec![if i % 2 == 0 { -1.0 } else { 1.0 }] }
+            } else {
+                vec![1.0]
+            };
+            for side in sides {
+                if !free(d) || gap(d, side) {
+                    continue;
+                }
+                let (p, t) = self.at(d);
+                let r = v3(t.y, -t.x, 0.0);
+                let off = if k.sidewalk > 0.0 { hw + 0.6 } else { hw + e + 0.5 };
+                out.push((p + r * (off * side), r * -side, false));
+            }
+            i += 1;
+            d += if k.sidewalk > 0.0 && k.width < 15.0 { LAMP_STEP * 0.5 } else { LAMP_STEP };
+        }
+        out
+    }
+
+    /// La même route parcourue dans l'autre sens (distances, ouvertures des trottoirs, ponts et escaliers suivent).
+    pub fn reversed(&self) -> Road {
+        let len = self.length();
+        let mut r = self.clone();
+        r.pts.reverse();
+        r.samples = self.samples.iter().rev().map(|s| [s[0], s[1], s[2], len - s[3]]).collect();
+        r.gaps = self.gaps.iter().map(|g| [len - g[1], len - g[0], -g[2]]).collect();
+        r.spans = self.spans.iter().rev().map(|s| [len - s[1], len - s[0]]).collect();
+        r.piers = self.piers.iter().rev().map(|p| [len - p[0], p[1]]).collect();
+        r.abutments = self.abutments.iter().rev().map(|p| [len - p[0], p[1]]).collect();
+        r.stairs = self.stairs.map(|s| [s[1], s[0]]);
+        r.tunnels = self.tunnels.iter().rev().map(|s| [len - s[1], len - s[0]]).collect();
+        r.taper = None;
+        r
+    }
+
+    /// Début de la route jusqu'à la distance `d` (le point à `d` compris).
+    pub fn head_to(&self, d: f32) -> Road {
+        let mut r = self.clone();
+        let (p, _) = self.at(d);
+        r.samples = self.samples.iter().filter(|s| s[3] < d - 1e-3).copied().collect();
+        r.samples.push([p.x, p.y, p.z, d]);
+        r.gaps = self.gaps.iter().filter(|g| g[0] < d).map(|g| [g[0], g[1].min(d + 1.0), g[2]]).collect();
+        r.spans = self.spans.iter().filter(|g| g[0] < d).map(|g| [g[0], g[1].min(d)]).collect();
+        r.tunnels = self.tunnels.iter().filter(|g| g[0] < d).map(|g| [g[0], g[1].min(d)]).collect();
+        r
+    }
+
+    /// Prolonge cette route (déjà construite) par une nouvelle partie qui part de son bout de fin : une seule route,
+    /// courbe continue. La courbe est refaite à partir des points cliqués des deux ; seul le dernier tronçon de
+    /// l'ancienne route bouge (une courbe de Catmull-Rom ne dépend que des points voisins). Les hauteurs de l'ancienne
+    /// partie sont gardées (raccords aux carrefours compris), la nouvelle s'y raccorde sur HEIGHT_BLEND ; les
+    /// ouvertures de trottoir sont reportées. Renvoie (route, distance où commence la partie refaite).
+    pub fn extended(&self, more: &[V3], height: impl Fn(f32, f32) -> Option<f32>, grade: f32, elevated: bool) -> Option<(Road, f32)> {
+        if self.pts.len() < 2 || more.is_empty() {
+            return None;
+        }
+        let mut all: Vec<V3> = self.pts.iter().map(|p| v3(p[0], p[1], self.nearest(p[0], p[1]).map(|n| n.1).unwrap_or(0.0))).collect();
+        all.extend_from_slice(more);
+        let mut r = Road::build(self.kind, &all, height, grade.max(self.grade), elevated || self.elevated)?;
+        // début de la partie refaite : l'avant-dernier point cliqué de l'ancienne route
+        let keep = self.pts[self.pts.len() - 2];
+        let cut = r.nearest_point(keep[0], keep[1]).map(|n| n.2).unwrap_or(0.0);
+        let z_cut_old = self.nearest(keep[0], keep[1]).map(|n| n.1).unwrap_or(0.0);
+        let k = r.samples.iter().position(|s| s[3] >= cut).unwrap_or(0);
+        let delta = z_cut_old - r.samples[k][2];
+        for s in r.samples.iter_mut() {
+            if s[3] < cut {
+                if let Some((_, z)) = self.nearest(s[0], s[1]) {
+                    s[2] = z;
+                }
+            } else {
+                let w = (1.0 - (s[3] - cut) / HEIGHT_BLEND).max(0.0);
+                s[2] += delta * w * w * (3.0 - 2.0 * w);
+            }
+        }
+        // ouvertures de trottoir de l'ancienne route, reportées le long de la nouvelle courbe
+        let map = |d: f32| {
+            let (p, _) = self.at(d);
+            r.nearest_point(p.x, p.y).map(|n| n.2).unwrap_or(d)
+        };
+        r.gaps = self.gaps.iter().map(|g| [map(g[0].max(0.0)), map(g[1].min(self.length())), g[2]]).collect();
+        r.traffic = self.traffic.clone();
+        Some((r, cut))
+    }
+
+    /// Partie de la route à partir de la distance `d0`, distances recomptées depuis 0 (pour la relier aux autres
+    /// routes sans refaire les carrefours de la partie d'avant).
+    pub fn tail_from(&self, d0: f32) -> Road {
+        let mut r = self.clone();
+        r.samples = self.samples.iter().filter(|s| s[3] >= d0 - 1e-3).map(|s| [s[0], s[1], s[2], s[3] - d0]).collect();
+        r.gaps.clear();
+        r.spans.clear();
+        r.piers.clear();
+        r.abutments.clear();
+        r.tunnels.clear();
+        r.taper = None;
+        r
+    }
+
+    /// Point de l'axe à la distance `d` le long de la route (hauteur de la chaussée comprise) et tangente à plat.
+    pub fn at(&self, d: f32) -> (V3, V3) {
+        let n = self.samples.len();
+        let mut k = 0;
+        while k + 2 < n && self.samples[k + 1][3] < d {
+            k += 1;
+        }
+        let (a, b) = (self.samples[k], self.samples[(k + 1).min(n - 1)]);
+        let f = if (b[3] - a[3]).abs() > 1e-4 { ((d - a[3]) / (b[3] - a[3])).clamp(0.0, 1.0) } else { 0.0 };
+        (v3(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f), v3(b[0] - a[0], b[1] - a[1], 0.0).norm())
+    }
+
+    /// Vrai si la distance `d` le long de la route est sur un tronçon en pont.
+    pub fn in_span(&self, d: f32) -> bool {
+        self.spans.iter().any(|s| d >= s[0] && d <= s[1])
+    }
+
+    /// Longueur totale des tronçons en pont.
+    pub fn bridge_len(&self) -> f32 {
+        self.spans.iter().map(|s| s[1] - s[0]).sum()
+    }
+
+    /// Croisements à plat avec les autres routes : (distance le long de cette route, hauteur de l'autre route,
+    /// demi-largeur totale de l'autre route).
+    fn crossings(&self, others: &[Road]) -> Vec<(f32, f32, f32)> {
+        let mut out = Vec::new();
+        for o in others {
+            for w in self.samples.windows(2) {
+                for v in o.samples.windows(2) {
+                    if let Some((t, u)) = seg_inter([w[0][0], w[0][1]], [w[1][0], w[1][1]], [v[0][0], v[0][1]], [v[1][0], v[1][1]]) {
+                        out.push((w[0][3] + (w[1][3] - w[0][3]) * t, v[0][2] + (v[1][2] - v[0][2]) * u, o.half_total()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Mode pont : la chaussée passe au-dessus des routes qu'elle croise (hauteur libre CLEARANCE sous le tablier),
+    /// avec des rampes à la pente maximale de part et d'autre. Une route déjà bien plus haute (un autre pont) est
+    /// laissée au-dessus.
+    pub fn raise_over(&mut self, others: &[Road]) {
+        let need_above = CLEARANCE + DECK_DEPTH;
+        let n = self.samples.len();
+        // hauteur imposée : un plateau au-dessus de la route croisée (sa largeur + 9 m de chaque côté), puis la rampe
+        let mut tent = vec![f32::MIN; n];
+        for (dc, zo, ohalf) in self.crossings(others) {
+            let (p, _) = self.at(dc);
+            if zo > p.z + JOIN_DZ {
+                continue; // l'autre passe au-dessus
+            }
+            let need = zo + need_above;
+            let plateau = ohalf + 9.0;
+            for (i, s) in self.samples.iter().enumerate() {
+                tent[i] = tent[i].max(need - self.grade * ((s[3] - dc).abs() - plateau).max(0.0));
+            }
+        }
+        if tent.iter().all(|t| *t == f32::MIN) {
+            return;
+        }
+        // sommet arrondi : moyenne glissante sur ±6 points (± 9 m), sans toucher le dessus du plateau
+        let src = tent.clone();
+        for i in 0..n {
+            let (a, b) = (i.saturating_sub(6), (i + 6).min(n - 1));
+            tent[i] = src[a..=b].iter().sum::<f32>() / (b - a + 1) as f32;
+        }
+        for (s, t) in self.samples.iter_mut().zip(&tent) {
+            s[2] = s[2].max(*t);
+        }
+    }
+
+    /// Passerelle : tablier plat, CLEARANCE sous lui au-dessus des routes croisées, FOOT_CLEAR au-dessus du sol
+    /// ailleurs ; escaliers aux deux bouts jusqu'au sol (hauteur du sol aux points cliqués).
+    pub fn make_footbridge(&mut self, ground: impl Fn(f32, f32) -> Option<f32>, others: &[Road]) {
+        let mut top = f32::MIN;
+        for s in &self.samples {
+            if let Some(g) = ground(s[0], s[1]) {
+                top = top.max(g + FOOT_CLEAR + FOOT_DEPTH);
+            }
+        }
+        for (_, zo, _) in self.crossings(others) {
+            top = top.max(zo + CLEARANCE + FOOT_DEPTH);
+        }
+        if top == f32::MIN {
+            top = self.samples[0][2] + FOOT_CLEAR + FOOT_DEPTH;
+        }
+        for s in self.samples.iter_mut() {
+            s[2] = top;
+        }
+        let (a, b) = (self.samples[0], self.samples[self.samples.len() - 1]);
+        let ga = ground(a[0], a[1]).unwrap_or(top - 3.0);
+        let gb = ground(b[0], b[1]).unwrap_or(top - 3.0);
+        self.stairs = Some([ga, gb]);
+        self.spans = vec![[0.0, self.length()]];
+    }
+
+    /// Tronçons en pont d'une route tracée en mode pont : là où la chaussée est à plus de BRIDGE_MIN_CLEAR au-dessus
+    /// du sol ; deux tronçons séparés de moins de 12 m n'en font qu'un, un tronçon de moins de 6 m est ignoré
+    /// (**estimé**).
+    pub fn mark_spans(&mut self, ground: impl Fn(f32, f32) -> Option<f32>) {
+        if self.kind().foot {
+            self.spans = vec![[0.0, self.length()]];
+            return;
+        }
+        let mut spans: Vec<[f32; 2]> = Vec::new();
+        let mut cur: Option<f32> = None;
+        let n = self.samples.len();
+        for (i, s) in self.samples.iter().enumerate() {
+            let high = ground(s[0], s[1]).map(|g| s[2] - g > BRIDGE_MIN_CLEAR).unwrap_or(true);
+            match (high, cur) {
+                (true, None) => cur = Some(s[3]),
+                (false, Some(a)) => {
+                    spans.push([a, s[3]]);
+                    cur = None;
+                }
+                _ => {}
+            }
+            if i == n - 1 {
+                if let Some(a) = cur {
+                    spans.push([a, s[3]]);
+                }
+            }
+        }
+        let mut merged: Vec<[f32; 2]> = Vec::new();
+        for sp in spans {
+            if let Some(l) = merged.last_mut() {
+                if sp[0] - l[1] < 12.0 {
+                    l[1] = sp[1];
+                    continue;
+                }
+            }
+            merged.push(sp);
+        }
+        merged.retain(|s| s[1] - s[0] >= 6.0);
+        self.spans = merged;
+    }
+
+    /// Piles tous les ~PIER_STEP m sur chaque tronçon en pont et culées à ses bouts, posées sur le sol. Une pile qui
+    /// tomberait sur une route plus basse (`blocked`) est décalée le long du pont jusqu'à 12 m, sinon retirée.
+    pub fn place_piers(&mut self, ground: impl Fn(f32, f32) -> Option<f32>, blocked: impl Fn(f32, f32, f32) -> bool) {
+        self.piers.clear();
+        self.abutments.clear();
+        let len = self.length();
+        let foot = self.kind().foot;
+        for sp in self.spans.clone() {
+            let l = sp[1] - sp[0];
+            // culées : au bout d'un tronçon qui retrouve le sol (pas au bout d'une passerelle : ses escaliers)
+            if !foot {
+                for d in [sp[0], sp[1]] {
+                    let (p, _) = self.at(d);
+                    if let Some(g) = ground(p.x, p.y) {
+                        if (d > 0.5 && d < len - 0.5) || p.z - g < BRIDGE_MIN_CLEAR + 2.0 {
+                            self.abutments.push([d, g]);
+                        }
+                    }
+                }
+            }
+            let n = (l / PIER_STEP).round().max(1.0) as usize;
+            // passerelle : une pile à chaque bout (sous le haut des escaliers) en plus de celles du milieu
+            let ks: Vec<f32> = if foot { (0..=n).map(|k| sp[0] + (l * k as f32 / n as f32).clamp(0.6, l - 0.6)).collect() } else { (1..n).map(|k| sp[0] + l * k as f32 / n as f32).collect() };
+            for d0 in ks {
+                let mut placed = false;
+                for off in [0.0f32, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0, 8.0, -8.0, 10.0, -10.0, 12.0, -12.0] {
+                    let d = (d0 + off).clamp(sp[0] + 0.5, sp[1] - 0.5);
+                    let (p, _) = self.at(d);
+                    let Some(g) = ground(p.x, p.y) else { continue };
+                    if p.z - g < 1.0 || blocked(p.x, p.y, p.z) {
+                        continue;
+                    }
+                    self.piers.push([d, g]);
+                    placed = true;
+                    break;
+                }
+                let _ = placed;
+            }
+        }
     }
 
     /// Point le plus proche de la route : (distance à plat, hauteur de la chaussée à cet endroit).
@@ -357,20 +1048,31 @@ impl Road {
         let my_ext = self.ext();
         let mut js = Vec::new();
         let mut cons: Vec<(usize, f32)> = Vec::new();
+        if self.kind().foot {
+            return Vec::new();
+        }
         for o in others.iter_mut() {
+            if o.kind().foot {
+                continue;
+            }
             let ohw = o.kind().width * 0.5;
             let o_ext = o.ext();
             let olen = o.length();
             let dirt = self.kind().dirt && o.kind().dirt;
-            // extrémités de la nouvelle route posées sur l'autre
-            for idx in [0usize, n - 1] {
+            // extrémités de la nouvelle route posées sur l'autre (un rond-point n'en a pas)
+            let ends: &[usize] = if self.ring { &[] } else { &[0, n - 1] };
+            for &idx in ends {
                 let s = self.samples[idx];
                 let Some((d, p, along, tan)) = o.nearest_point(s[0], s[1]) else { continue };
-                if d > ohw + 0.5 {
+                if d > ohw + 0.5 || (s[2] - p.z).abs() > JOIN_DZ {
                     continue;
                 }
                 cons.push((idx, p.z));
-                if along < 1.0 || along > olen - 1.0 {
+                // bretelle posée sur une autoroute : elle s'y fond, sans carrefour ni trottoir ouvert
+                if self.kind().ramp && o.kind().width >= 20.0 {
+                    continue;
+                }
+                if !o.ring && (along < 1.0 || along > olen - 1.0) {
                     // prolongement bout à bout : rien à ouvrir
                     continue;
                 }
@@ -406,8 +1108,9 @@ impl Road {
                 let din = dir.norm();
                 let my_total = self.half_total();
                 let o_total = o.half_total();
-                let my_cross = self.kind().sidewalk > 0.0;
-                let o_cross = o.kind().sidewalk > 0.0;
+                // pas de passage piéton en travers de l'anneau d'un rond-point (seulement sur les routes qui y entrent)
+                let my_cross = self.kind().sidewalk > 0.0 && !self.ring;
+                let o_cross = o.kind().sidewalk > 0.0 && !o.ring;
                 let arms = vec![
                     JArm { dir: [din.x, din.y], hw, total: my_total, len: o_ext, cross: my_cross },
                     JArm { dir: [tan.x, tan.y], hw: ohw, total: o_total, len: my_ext, cross: o_cross },
@@ -420,7 +1123,9 @@ impl Road {
                         corners.push(JCorner { u: [tan.x * sgn, tan.y * sgn], v: [din.x, din.y], hu: ohw, hv: hw, rc, curb });
                     }
                 }
-                js.push(Junction { pos: [p.x, p.y, p.z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control: 0, props: Vec::new() });
+                // rond-point : priorité à l'anneau, ni feux ni stops
+                let control = if o.ring || self.ring { 3 } else { 0 };
+                js.push(Junction { pos: [p.x, p.y, p.z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control, props: Vec::new() });
             }
             // croisements au milieu
             for j in 0..n - 1 {
@@ -434,6 +1139,14 @@ impl Road {
                     }
                     let dk = c[3] + (dd[3] - c[3]) * u;
                     let z = c[2] + (dd[2] - c[2]) * u;
+                    if (a[2] + (b[2] - a[2]) * t - z).abs() > JOIN_DZ {
+                        continue; // l'une passe au-dessus de l'autre (pont)
+                    }
+                    // croisement pile sur un point de la courbe : vu par les deux segments voisins, un seul carrefour
+                    let (px, py) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                    if js.iter().any(|q: &Junction| (q.pos[0] - px).powi(2) + (q.pos[1] - py).powi(2) < 1.0) {
+                        continue;
+                    }
                     cons.push((if t < 0.5 { j } else { j + 1 }, z));
                     let rc = self.kind().sidewalk.min(o.kind().sidewalk);
                     let ds0 = v3(b[0] - a[0], b[1] - a[1], 0.0).norm();
@@ -457,7 +1170,7 @@ impl Road {
                     let ds = v3(b[0] - a[0], b[1] - a[1], 0.0).norm();
                     let dk2 = v3(dd[0] - c[0], dd[1] - c[1], 0.0).norm();
                     let (my_total, o_total) = (self.half_total(), o.half_total());
-                    let (mc, oc) = (self.kind().sidewalk > 0.0, o.kind().sidewalk > 0.0);
+                    let (mc, oc) = (self.kind().sidewalk > 0.0 && !self.ring, o.kind().sidewalk > 0.0 && !o.ring);
                     let arms = vec![
                         JArm { dir: [ds.x, ds.y], hw, total: my_total, len: o_ext, cross: mc },
                         JArm { dir: [-ds.x, -ds.y], hw, total: my_total, len: o_ext, cross: mc },
@@ -471,7 +1184,8 @@ impl Road {
                             corners.push(JCorner { u: [ds.x * su, ds.y * su], v: [dk2.x * sv, dk2.y * sv], hu: hw, hv: ohw, rc, curb });
                         }
                     }
-                    js.push(Junction { pos: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control: 0, props: Vec::new() });
+                    let control = if o.ring || self.ring { 3 } else { 0 };
+                    js.push(Junction { pos: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control, props: Vec::new() });
                 }
             }
         }
@@ -501,11 +1215,17 @@ impl Road {
         if n < 2 {
             return (pos, uv, parts);
         }
-        // repère de chaque point : droite = tangente tournée de -90°
+        // repère de chaque point : droite = tangente tournée de -90° (rond-point : boucle, voisins de part et d'autre
+        // de la jonction)
+        let m = n - 1;
         let frames: Vec<(V3, V3, f32)> = (0..n)
             .map(|i| {
-                let a = self.samples[i.saturating_sub(1)];
-                let b = self.samples[(i + 1).min(n - 1)];
+                let (a, b) = if self.ring && m >= 2 {
+                    let i = i % m;
+                    (self.samples[(i + m - 1) % m], self.samples[(i + 1) % m])
+                } else {
+                    (self.samples[i.saturating_sub(1)], self.samples[(i + 1).min(n - 1)])
+                };
                 let t = v3(b[0] - a[0], b[1] - a[1], 0.0).norm();
                 let s = self.samples[i];
                 (v3(s[0] - origin.x, s[1] - origin.y, s[2]), v3(t.y, -t.x, 0.0), s[3])
@@ -515,12 +1235,41 @@ impl Road {
         let gaps = self.gaps.clone();
         let samples_d: Vec<f32> = self.samples.iter().map(|s| s[3]).collect();
         // side : None = chaussée (jamais ouverte), Some(-1 / 1) = bord gauche / droit
-        let mut strip = |cols: &[(f32, f32, f32)], vlen: f32, key: u64, coll: u8, side: Option<f32>| {
+        let spans = self.spans.clone();
+        let tunnels = self.tunnels.clone();
+        let in_span = |mid: f32| spans.iter().any(|s| mid >= s[0] && mid <= s[1]);
+        let in_tun = |mid: f32| tunnels.iter().any(|s| mid >= s[0] && mid <= s[1]);
+        let lift = 0.08 + if k.ramp { 0.025 } else { 0.0 };
+        // raccord avec un autre type de route : chaque colonne suit la largeur du moment (chaussée et bord étirés,
+        // bordure qui monte ou descend)
+        let dims: Vec<(f32, f32, f32)> = frames.iter().map(|f| self.dims_at(f.2)).collect();
+        let (bhw, bedge) = (hw, k.sidewalk.max(k.shoulder));
+        let tapered = self.taper.is_some() && !k.foot;
+        let map_off = |o: f32, i: usize| -> f32 {
+            if !tapered {
+                return o;
+            }
+            let (h, e, _) = dims[i];
+            let a = o.abs();
+            if a <= bhw + 1e-4 {
+                o * h / bhw.max(1e-3)
+            } else {
+                o.signum() * (h + (a - bhw) * if bedge > 1e-3 { e / bedge } else { 1.0 })
+            }
+        };
+        let map_dz = |dz: f32, i: usize| -> f32 {
+            if !tapered || k.curb <= 0.0 || dz <= lift + 1e-4 || dz > lift + k.curb + 1e-4 {
+                return dz;
+            }
+            lift + (dz - lift) * dims[i].2 / k.curb
+        };
+        // filt : segments dessinés (milieu du segment) ; cap : section fermée là où ils commencent et finissent
+        let mut strip_ex = |cols: &[(f32, f32, f32)], vlen: f32, key: u64, coll: u8, side: Option<f32>, filt: &dyn Fn(f32) -> bool, cap: bool| {
             let base = pos.len() as u32;
-            let lines: Vec<Vec<V3>> = cols.iter().map(|c| offset_line(&frames, c.0)).collect();
+            let lines: Vec<Vec<V3>> = cols.iter().map(|c| offset_line_var(&frames, &(0..n).map(|i| map_off(c.0, i)).collect::<Vec<f32>>())).collect();
             for (i, (_, _, d)) in frames.iter().enumerate() {
                 for (c, (_, dz, u)) in cols.iter().enumerate() {
-                    pos.push(lines[c][i] + v3(0.0, 0.0, *dz));
+                    pos.push(lines[c][i] + v3(0.0, 0.0, map_dz(*dz, i)));
                     uv.push([*u, *d / vlen]);
                 }
             }
@@ -531,7 +1280,29 @@ impl Road {
                 let mid = (samples_d[s as usize] + samples_d[s as usize + 1]) * 0.5;
                 gaps.iter().any(|g| mid >= g[0] && mid <= g[1] && (g[2] == 0.0 || g[2] == sd))
             };
+            let seg_on = |s: u32| filt((samples_d[s as usize] + samples_d[s as usize + 1]) * 0.5);
             for s in 0..(n as u32 - 1) {
+                if !seg_on(s) {
+                    continue;
+                }
+                if cap {
+                    // bouts du tronçon : section fermée
+                    for (edge, at) in [(s == 0 || !seg_on(s - 1), s), (s + 1 == n as u32 - 1 || !seg_on(s + 1), s + 1)] {
+                        if edge {
+                            let b = base + at * w;
+                            for c in 1..w - 1 {
+                                idx.extend_from_slice(&[b, b + c, b + c + 1, b, b + c + 1, b + c]);
+                            }
+                        }
+                    }
+                }
+                if side.is_none() {
+                    for c in 0..w - 1 {
+                        let a = base + s * w + c;
+                        idx.extend_from_slice(&[a, a + 1, a + w + 1, a, a + w + 1, a + w]);
+                    }
+                    continue;
+                }
                 // bout de trottoir (là où il s'ouvre ou reprend) : on ferme la section, pour ne pas voir dessous
                 let here = open(s);
                 if s + 1 < n as u32 - 1 && here != open(s + 1) {
@@ -553,12 +1324,14 @@ impl Road {
             }
             parts.push((key, idx, coll));
         };
-        let lift = 0.08;
+        let mut strip = |cols: &[(f32, f32, f32)], vlen: f32, key: u64, coll: u8, side: Option<f32>| strip_ex(cols, vlen, key, coll, side, &|_| true, false);
         // chaussée : par défaut, comme avant, la texture DragoWalker du type de route (goudron usé et marquages
         // peints, 12 m le long) ; avec « Vraies textures du jeu », goudron du jeu uni (tous les 6 m) et marquages
         // en bandes à part, 6 mm au-dessus
         let game_tex = crate::groundtex::enabled();
-        if game_tex {
+        if k.foot {
+            strip(&[(-hw, lift, -hw / 2.0), (hw, lift, hw / 2.0)], 2.0, SIDEWALK_KEY, 0, None);
+        } else if game_tex || self.ring {
             let surf_key = if k.dirt { DIRT_PLAIN_KEY } else { ASPHALT_KEY };
             strip(&[(-hw, lift, -hw / 6.0), (0.0, lift, 0.0), (hw, lift, hw / 6.0)], 6.0, surf_key, 0, None);
         } else {
@@ -570,16 +1343,48 @@ impl Road {
             // gauche : jupe, bord extérieur, bord de la bordure, pied de la bordure
             strip(&[(-hw - sw, -0.6, (-hw - sw) / 2.0), (-hw - sw, c, (-hw - sw) / 2.0 + 0.3), (-hw, c, -hw / 2.0 + 0.3), (-hw, lift, -hw / 2.0 + 0.39)], 2.0, SIDEWALK_KEY, 1, Some(-1.0));
             strip(&[(hw, lift, hw / 2.0 - 0.09), (hw, c, hw / 2.0), (hw + sw, c, (hw + sw) / 2.0), (hw + sw, -0.6, (hw + sw) / 2.0 + 0.3)], 2.0, SIDEWALK_KEY, 1, Some(1.0));
-        } else {
+        } else if !k.foot {
             let sh = k.shoulder;
             let key = crate::terrain::material_key(k.shoulder_mat as usize);
             strip(&[(-hw - sh, -0.5, (-hw - sh) / 6.0), (-hw - sh, lift - 0.04, (-hw - sh) / 6.0 + 0.1), (-hw, lift, -hw / 6.0 + 0.1)], 6.0, key, 2, Some(-1.0));
             strip(&[(hw, lift, hw / 6.0), (hw + sh, lift - 0.04, (hw + sh) / 6.0), (hw + sh, -0.5, (hw + sh) / 6.0 + 0.1)], 6.0, key, 2, Some(1.0));
         }
-        for l in k.lines.iter().filter(|_| game_tex) {
+        if !spans.is_empty() {
+            let concrete = crate::terrain::material_key(4);
+            // 2 cm plus large que la route : les faces du tablier et des garde-corps ne se superposent pas au bord
+            // du trottoir ou de l'accotement (sinon elles se battent à l'écran)
+            let wt = self.half_total() + 0.02;
+            let depth = if k.foot { FOOT_DEPTH } else { DECK_DEPTH };
+            // tablier : poutre en caisson sous la chaussée, côtés droits et dessous (vers l'extérieur)
+            strip_ex(&[(wt, lift, 0.0), (wt, -depth, (depth + lift) / 6.0), (-wt, -depth, (depth + lift + 2.0 * wt) / 6.0), (-wt, lift, (2.0 * depth + 2.0 * lift + 2.0 * wt) / 6.0)], 6.0, concrete, BRIDGE_COLL, None, &|m| in_span(m), true);
+            // garde-corps en béton sur les deux bords, posés sur le trottoir ou l'accotement
+            let base = if k.sidewalk > 0.0 { lift + k.curb } else if k.foot { lift } else { lift - 0.04 };
+            let ph = if k.foot { FOOT_PARAPET_H } else { PARAPET_H };
+            let top = base + ph;
+            strip_ex(&[(-wt, base - 0.3, 0.0), (-wt, top, (ph + 0.3) / 6.0), (-wt + PARAPET_W, top, (ph + 0.6) / 6.0), (-wt + PARAPET_W, base, (2.0 * ph + 0.6) / 6.0)], 6.0, concrete, BRIDGE_COLL, None, &|m| in_span(m), true);
+            strip_ex(&[(wt - PARAPET_W, base, 0.0), (wt - PARAPET_W, top, ph / 6.0), (wt, top, (ph + 0.3) / 6.0), (wt, base - 0.3, (2.0 * ph + 0.6) / 6.0)], 6.0, concrete, BRIDGE_COLL, None, &|m| in_span(m), true);
+        }
+        // tunnels : tube (murs et plafond tournés vers l'intérieur) et bandes lumineuses au plafond
+        if !tunnels.is_empty() {
+            let concrete = crate::terrain::material_key(4);
+            let wt = self.half_total() + 0.02;
+            let th = lift + TUNNEL_H;
+            strip_ex(&[(wt, -0.6, 0.0), (wt, th, (th + 0.6) / 6.0), (-wt, th, (th + 0.6 + 2.0 * wt) / 6.0), (-wt, -0.6, (2.0 * th + 1.2 + 2.0 * wt) / 6.0)], 6.0, concrete, BRIDGE_COLL, None, &|m| in_tun(m), false);
+            strip_ex(&[(0.3, th - 0.05, 0.0), (-0.3, th - 0.05, 1.0)], 4.0, LIGHTSTRIP_KEY, NO_COLLISION, None, &|m| in_tun(m) && m.rem_euclid(TUNNEL_LIGHT_STEP) < 4.0, false);
+        }
+        // glissières : lisse en métal le long des deux bords (routes sans trottoir), pas sur les ponts ni dans les
+        // tunnels, ouvertes aux carrefours
+        if self.furniture.rails && k.sidewalk <= 0.0 && !k.foot {
+            let x = hw + k.shoulder - 0.25;
+            let (lo, hi) = (lift - 0.04 + RAIL_LOW, lift - 0.04 + RAIL_HIGH);
+            let keep = |m: f32| !in_span(m) && !in_tun(m);
+            strip_ex(&[(-x - 0.06, lo, 0.0), (-x - 0.06, hi, 0.1), (-x, hi, 0.2), (-x, lo, 0.3)], 4.0, METAL_KEY, RAIL_COLL, Some(-1.0), &keep, false);
+            strip_ex(&[(x, lo, 0.0), (x, hi, 0.1), (x + 0.06, hi, 0.2), (x + 0.06, lo, 0.3)], 4.0, METAL_KEY, RAIL_COLL, Some(1.0), &keep, false);
+        }
+        for l in k.lines.iter().filter(|l| (game_tex || self.ring) && !(self.ring && l.yellow)) {
             let base = pos.len() as u32;
             let (a, b) = (l.off - l.w * 0.5, l.off + l.w * 0.5);
-            let (la, lb) = (offset_line(&frames, a), offset_line(&frames, b));
+            let (la, lb) = (offset_line_var(&frames, &vec![a; n]), offset_line_var(&frames, &vec![b; n]));
             for (i, (_, _, d)) in frames.iter().enumerate() {
                 for (q, u) in [(la[i], 0.0f32), (lb[i], 1.0)] {
                     pos.push(q + v3(0.0, 0.0, lift + LINE_LIFT));
@@ -593,8 +1398,8 @@ impl Road {
                 if l.dashed && mid.rem_euclid(ROAD_TEX_LEN) >= 3.0 {
                     continue;
                 }
-                // pas de marquage dans un carrefour (là où les trottoirs s'ouvrent)
-                if gaps.iter().any(|g| mid >= g[0] && mid <= g[1]) {
+                // pas de marquage dans un carrefour (là où les trottoirs s'ouvrent) ni dans un raccord de largeur
+                if gaps.iter().any(|g| mid >= g[0] && mid <= g[1]) || (tapered && mid < self.taper.map(|t| t.1).unwrap_or(0.0)) {
                     continue;
                 }
                 let a0 = base + s * 2;
@@ -602,7 +1407,246 @@ impl Road {
             }
             parts.push((if l.yellow { LINE_YELLOW_KEY } else { LINE_WHITE_KEY }, idx, NO_COLLISION));
         }
+        if !spans.is_empty() {
+            let concrete = crate::terrain::material_key(4);
+            let wt = self.half_total();
+            let depth = if k.foot { FOOT_DEPTH } else { DECK_DEPTH };
+            let mut bidx: Vec<u32> = Vec::new();
+            let o2 = v3(origin.x, origin.y, 0.0);
+            // piles : un voile de béton sous le tablier, du sol (enterré de 1 m) au dessous du tablier
+            for pr in &self.piers {
+                let (p, t) = self.at(pr[0]);
+                let r = v3(t.y, -t.x, 0.0);
+                let half_across = if k.foot { 0.45 } else { (wt * 0.7).max(1.0) };
+                let half_along = if k.foot { 0.45 } else { 0.8 };
+                add_box(&mut pos, &mut uv, &mut bidx, p - o2, t, r, half_along, half_across, pr[1] - 1.0, p.z - depth + 0.05);
+            }
+            // culées : mur sur toute la largeur, du sol (enterré de 1,5 m) jusque sous la chaussée
+            for ab in &self.abutments {
+                let (p, t) = self.at(ab[0]);
+                let r = v3(t.y, -t.x, 0.0);
+                add_box(&mut pos, &mut uv, &mut bidx, p - o2, t, r, 0.75, wt + 0.2, ab[1] - 1.5, p.z + lift - 0.02);
+            }
+            // escaliers des passerelles, vers l'extérieur aux deux bouts
+            if let (Some(st), true) = (self.stairs, k.foot) {
+                let len = self.length();
+                for (d, out_sign, g) in [(0.0f32, -1.0f32, st[0]), (len, 1.0, st[1])] {
+                    let (p, t) = self.at(d);
+                    let out = t * out_sign;
+                    let r = v3(out.y, -out.x, 0.0);
+                    let top = p.z + lift;
+                    let rise = top - g;
+                    if rise < 0.3 {
+                        continue;
+                    }
+                    let steps = (rise / STEP_RISE).ceil() as usize;
+                    let h = rise / steps as f32;
+                    let p0 = p - o2;
+                    for i in 0..steps {
+                        let (x0, x1) = (i as f32 * STEP_RUN, (i + 1) as f32 * STEP_RUN);
+                        let (z_hi, z_lo) = (top - i as f32 * h, top - (i + 1) as f32 * h);
+                        let at = |x: f32, s: f32, z: f32| v3(p0.x + out.x * x + r.x * s, p0.y + out.y * x + r.y * s, z);
+                        // contremarche (face vers l'extérieur) puis marche
+                        push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, -hw, z_hi), at(x0, hw, z_hi), at(x0, hw, z_lo), at(x0, -hw, z_lo)], out);
+                        push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, -hw, z_lo), at(x0, hw, z_lo), at(x1, hw, z_lo), at(x1, -hw, z_lo)], v3(0.0, 0.0, 1.0));
+                        // limons : côtés pleins, de la marche jusque sous le sol, et garde-corps
+                        for s in [-1.0f32, 1.0] {
+                            let e = s * (hw + PARAPET_W);
+                            let ei = s * hw;
+                            let rail = z_hi + FOOT_PARAPET_H;
+                            for (ss, want) in [(e, r * s), (ei, r * -s)] {
+                                push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, ss, g - 0.5), at(x1, ss, g - 0.5), at(x1, ss, rail), at(x0, ss, rail)], want);
+                            }
+                            push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, ei, rail), at(x1, ei, rail), at(x1, e, rail), at(x0, e, rail)], v3(0.0, 0.0, 1.0));
+                        }
+                    }
+                    // bout du limon
+                    let lx = steps as f32 * STEP_RUN;
+                    let at = |x: f32, s: f32, z: f32| v3(p0.x + out.x * x + r.x * s, p0.y + out.y * x + r.y * s, z);
+                    for s in [-1.0f32, 1.0] {
+                        let (e, ei) = (s * (hw + PARAPET_W), s * hw);
+                        push_quad(&mut pos, &mut uv, &mut bidx, [at(lx, e, g - 0.5), at(lx, ei, g - 0.5), at(lx, ei, g + h + FOOT_PARAPET_H), at(lx, e, g + h + FOOT_PARAPET_H)], out);
+                    }
+                }
+            }
+            if !bidx.is_empty() {
+                parts.push((concrete, bidx, BRIDGE_COLL));
+            }
+        }
+        let o2 = v3(origin.x, origin.y, 0.0);
+        let gap_at = |d: f32, side: f32| self.gaps.iter().any(|g| d >= g[0] && d <= g[1] && (g[2] == 0.0 || g[2] == side));
+        // poteaux des glissières
+        if self.furniture.rails && k.sidewalk <= 0.0 && !k.foot {
+            let mut pidx = Vec::new();
+            let x = hw + k.shoulder - 0.25 + 0.14;
+            let len = self.length();
+            let mut d = 1.0;
+            while d < len - 0.5 {
+                if !self.in_span(d) && !self.in_tunnel(d) {
+                    let (p, t) = self.at(d);
+                    let r = v3(t.y, -t.x, 0.0);
+                    for side in [-1.0f32, 1.0] {
+                        if !gap_at(d, side) {
+                            add_box(&mut pos, &mut uv, &mut pidx, p - o2 + r * (x * side), t, r, 0.06, 0.06, p.z - 0.6, p.z + lift - 0.04 + RAIL_HIGH - 0.05);
+                        }
+                    }
+                }
+                d += RAIL_POST_STEP;
+            }
+            if !pidx.is_empty() {
+                parts.push((METAL_KEY, pidx, RAIL_COLL));
+            }
+        }
+        // façades des entrées de tunnel : un mur percé du tube, de part et d'autre et au-dessus, et une dalle de toit
+        // sur les premiers mètres (cache le terrain ouvert à l'entrée)
+        if !self.tunnels.is_empty() {
+            let concrete = crate::terrain::material_key(4);
+            let mut tidx = Vec::new();
+            let wt = self.half_total() + 0.02;
+            for t in &self.tunnels {
+                for (d, sign) in [(t[0], -1.0f32), (t[1], 1.0)] {
+                    let (p, tg) = self.at(d);
+                    let out = tg * sign;
+                    let r = v3(out.y, -out.x, 0.0);
+                    let c = p - o2;
+                    let (bot, oh, top) = (p.z - 1.0, p.z + lift + TUNNEL_H, p.z + lift + TUNNEL_H + PORTAL_TOP);
+                    let w = wt + PORTAL_SIDE;
+                    let at = |a: f32, l: f32, z: f32| v3(c.x + out.x * a + r.x * l, c.y + out.y * a + r.y * l, z);
+                    for (l0, l1, z0, z1) in [(-w, -wt, bot, top), (wt, w, bot, top), (-wt, wt, oh, top)] {
+                        push_quad(&mut pos, &mut uv, &mut tidx, [at(0.0, l0, z0), at(0.0, l1, z0), at(0.0, l1, z1), at(0.0, l0, z1)], out);
+                        push_quad(&mut pos, &mut uv, &mut tidx, [at(-1.0, l0, z0), at(-1.0, l1, z0), at(-1.0, l1, z1), at(-1.0, l0, z1)], out * -1.0);
+                    }
+                    // dessus de la façade et dalle vers l'intérieur
+                    push_quad(&mut pos, &mut uv, &mut tidx, [at(0.0, -w, top), at(0.0, w, top), at(-1.0, w, top), at(-1.0, -w, top)], v3(0.0, 0.0, 1.0));
+                    push_quad(&mut pos, &mut uv, &mut tidx, [at(-1.0, -wt - 1.0, oh + 0.6), at(-1.0, wt + 1.0, oh + 0.6), at(-9.0, wt + 1.0, oh + 0.6), at(-9.0, -wt - 1.0, oh + 0.6)], v3(0.0, 0.0, 1.0));
+                }
+            }
+            parts.push((concrete, tidx, BRIDGE_COLL));
+        }
+        // îlot central d'un rond-point : herbe à la hauteur du trottoir (ou 15 cm), bordure en béton tout autour
+        if self.ring {
+            let (c, rr) = self.ring_center();
+            let ri = (rr - self.half_total()).max(1.0);
+            let zi = c.z + lift + if k.curb > 0.0 { k.curb } else { 0.15 };
+            let cc = c - o2;
+            let seg = 64u32;
+            let (mut gidx, mut kidx) = (Vec::new(), Vec::new());
+            let base = pos.len() as u32;
+            pos.push(v3(cc.x, cc.y, zi));
+            uv.push([c.x / 6.0, c.y / 6.0]);
+            for i in 0..seg {
+                let a = i as f32 / seg as f32 * std::f32::consts::TAU;
+                let q = v3(cc.x + ri * a.cos(), cc.y + ri * a.sin(), zi);
+                pos.push(q);
+                uv.push([(q.x + origin.x) / 6.0, (q.y + origin.y) / 6.0]);
+            }
+            for i in 0..seg {
+                gidx.extend_from_slice(&[base, base + 1 + i, base + 1 + (i + 1) % seg]);
+            }
+            if k.curb <= 0.0 {
+                for i in 0..seg {
+                    let (a0, a1) = (i as f32 / seg as f32 * std::f32::consts::TAU, (i + 1) as f32 / seg as f32 * std::f32::consts::TAU);
+                    let p0 = v3(cc.x + ri * a0.cos(), cc.y + ri * a0.sin(), 0.0);
+                    let p1 = v3(cc.x + ri * a1.cos(), cc.y + ri * a1.sin(), 0.0);
+                    let outw = v3((a0 + a1).cos() * 0.5 + (a0 + a1).cos() * 0.5, (a0 + a1).sin(), 0.0);
+                    let mid = v3(((a0 + a1) * 0.5).cos(), ((a0 + a1) * 0.5).sin(), 0.0);
+                    let _ = outw;
+                    push_quad(&mut pos, &mut uv, &mut kidx, [v3(p0.x, p0.y, c.z + lift - 0.05), v3(p1.x, p1.y, c.z + lift - 0.05), v3(p1.x, p1.y, zi), v3(p0.x, p0.y, zi)], mid);
+                }
+                parts.push((crate::terrain::material_key(4), kidx, 1));
+            }
+            parts.push((crate::terrain::material_key(2), gidx, GRASS_COLL));
+        }
+        // décalques au sol : fissures, taches d'huile, rustines, posés au hasard (toujours les mêmes pour une route)
+        if self.furniture.decals && !k.dirt && !k.foot {
+            let len = self.length();
+            let mut seed = (self.samples[0][0].to_bits() ^ self.samples[0][1].to_bits().rotate_left(13)) | 1;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed % 10_000) as f32 / 10_000.0
+            };
+            let taper_end = self.taper.map(|t| t.1).unwrap_or(0.0);
+            let mut lists: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut d = 5.0 + rnd() * 8.0;
+            while d < len - 3.0 {
+                let kind = (rnd() * 3.0) as usize % 3;
+                let lat = (rnd() * 2.0 - 1.0) * (hw - 1.0).max(0.3);
+                let (a_len, b_len, ang) = match kind {
+                    0 => (1.2 + rnd() * 1.0, 0.35 + rnd() * 0.3, (rnd() - 0.5) * 1.0),
+                    1 => (0.6 + rnd() * 0.8, 0.5 + rnd() * 0.6, rnd() * 6.28),
+                    _ => (0.8 + rnd() * 1.0, 0.6 + rnd() * 0.7, (rnd() - 0.5) * 0.15),
+                };
+                if d > taper_end && !gap_at(d, 0.0) && !gap_at(d, -1.0) && !gap_at(d, 1.0) && !self.in_tunnel(d) {
+                    let (p, t) = self.at(d);
+                    let r = v3(t.y, -t.x, 0.0);
+                    let u = t * ang.cos() + r * ang.sin();
+                    let v = v3(u.y, -u.x, 0.0);
+                    let c = p - o2 + r * lat;
+                    let corner = |su: f32, sv: f32| {
+                        let q = c + u * (a_len * su) + v * (b_len * sv);
+                        let along = d + (u * (a_len * su) + v * (b_len * sv)).dot(t);
+                        v3(q.x, q.y, self.at(along.clamp(0.0, len)).0.z + lift + 0.004)
+                    };
+                    let b = pos.len() as u32;
+                    pos.extend_from_slice(&[corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)]);
+                    uv.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+                    // tournées vers le haut : (u, v) direct ou non selon le sens de v
+                    if u.cross(v).z > 0.0 {
+                        lists[kind].extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+                    } else {
+                        lists[kind].extend_from_slice(&[b, b + 2, b + 1, b, b + 3, b + 2]);
+                    }
+                }
+                d += 7.0 + rnd() * 14.0;
+            }
+            for (i, l) in lists.into_iter().enumerate() {
+                if !l.is_empty() {
+                    parts.push((DECAL_KEYS[i], l, NO_COLLISION));
+                }
+            }
+        }
         (pos, uv, parts)
+    }
+}
+
+/// Quadrilatère (4 coins dans l'ordre du tour) tourné vers `want` : l'ordre est inversé s'il regarde de l'autre
+/// côté. Coordonnées de texture en mètres / 4.
+fn push_quad(pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, q: [V3; 4], want: V3) {
+    let n = (q[1] - q[0]).cross(q[2] - q[0]);
+    let q = if n.dot(want) < 0.0 { [q[3], q[2], q[1], q[0]] } else { q };
+    let (lu, lv) = ((q[1] - q[0]).len() / 4.0, (q[3] - q[0]).len() / 4.0);
+    let b = pos.len() as u32;
+    pos.extend_from_slice(&q);
+    uv.extend_from_slice(&[[0.0, 0.0], [lu, 0.0], [lu, lv], [0.0, lv]]);
+    idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+}
+
+/// Boîte posée au point `c` (x, y), orientée par `along` et `right`, de z0 à z1 : quatre côtés et le dessus.
+#[allow(clippy::too_many_arguments)]
+fn add_box(pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, c: V3, along: V3, right: V3, ha: f32, hr: f32, z0: f32, z1: f32) {
+    let at = |a: f32, r: f32, z: f32| v3(c.x + along.x * a + right.x * r, c.y + along.y * a + right.y * r, z);
+    for (a, r, want) in [(1.0f32, 0.0f32, along), (-1.0, 0.0, along * -1.0), (0.0, 1.0, right), (0.0, -1.0, right * -1.0)] {
+        let q = if a != 0.0 {
+            [at(a * ha, -hr, z0), at(a * ha, hr, z0), at(a * ha, hr, z1), at(a * ha, -hr, z1)]
+        } else {
+            [at(-ha, r * hr, z0), at(ha, r * hr, z0), at(ha, r * hr, z1), at(-ha, r * hr, z1)]
+        };
+        push_quad(pos, uv, idx, q, want);
+    }
+    push_quad(pos, uv, idx, [at(-ha, -hr, z1), at(ha, -hr, z1), at(ha, hr, z1), at(-ha, hr, z1)], v3(0.0, 0.0, 1.0));
+}
+
+/// Pente limitée dans les deux sens : deux points voisins ne diffèrent pas de plus de `grade` × leur écart.
+fn limit_grade(z: &mut [f32], dist: &[f32], grade: f32) {
+    for i in 1..z.len() {
+        let m = (dist[i] - dist[i - 1]) * grade;
+        z[i] = z[i].clamp(z[i - 1] - m, z[i - 1] + m);
+    }
+    for i in (0..z.len().saturating_sub(1)).rev() {
+        let m = (dist[i + 1] - dist[i]) * grade;
+        z[i] = z[i].clamp(z[i + 1] - m, z[i + 1] + m);
     }
 }
 
@@ -628,9 +1672,10 @@ pub fn crosswalk_start(j: &Junction, a: &JArm) -> f32 {
 /// Dans un virage plus serré que le décalage, le bord intérieur repartirait en arrière et le trottoir se
 /// replierait sur lui-même : tant qu'un point recule par rapport au dernier gardé (dans le sens de la route),
 /// il est ramené sur ce point (bord en éventail, sans repli).
-fn offset_line(frames: &[(V3, V3, f32)], off: f32) -> Vec<V3> {
+fn offset_line_var(frames: &[(V3, V3, f32)], offs: &[f32]) -> Vec<V3> {
     let mut out: Vec<V3> = Vec::with_capacity(frames.len());
-    for (p, r, _) in frames {
+    for (i, (p, r, _)) in frames.iter().enumerate() {
+        let off = offs[i];
         let q = *p + *r * off;
         if off != 0.0 {
             if let Some(last) = out.last().copied() {
@@ -785,6 +1830,95 @@ pub const DIRT_PLAIN_KEY: u64 = 0xD7E2_0000_0000_0112;
 /// Marquages au sol (bandes à part sur la chaussée) : blanc et jaune.
 pub const LINE_WHITE_KEY: u64 = 0xD7E2_0000_0000_0114;
 pub const LINE_YELLOW_KEY: u64 = 0xD7E2_0000_0000_0115;
+/// Glissières (acier galvanisé), bandes lumineuses des tunnels, décalques (fissure, tache, rustine).
+pub const METAL_KEY: u64 = 0xD7E2_0000_0000_0116;
+pub const LIGHTSTRIP_KEY: u64 = 0xD7E2_0000_0000_0117;
+pub const DECAL_KEYS: [u64; 3] = [0xD7E2_0000_0000_0118, 0xD7E2_0000_0000_0119, 0xD7E2_0000_0000_011A];
+
+/// Texture découpée (transparence par seuil : « cutout ») : les décalques.
+pub fn is_cutout(key: u64) -> bool {
+    DECAL_KEYS.contains(&key)
+}
+
+/// Acier galvanisé, 64 × 64.
+fn make_metal() -> TexData {
+    let n = 64u32;
+    let mut d = Vec::with_capacity((n * n * 4) as usize);
+    for y in 0..n {
+        for x in 0..n {
+            let f = 0.92 + (hash(x, y, 41) - 0.5) * 0.12 + if (y / 8) % 2 == 0 { 0.04 } else { -0.04 };
+            d.extend_from_slice(&[(168.0 * f) as u8, (172.0 * f) as u8, (176.0 * f) as u8, 255]);
+        }
+    }
+    with_mips(n, n, d)
+}
+
+/// Lumière de tunnel : blanc chaud très clair, 32 × 32.
+fn make_lightstrip() -> TexData {
+    let n = 32u32;
+    let mut d = Vec::with_capacity((n * n * 4) as usize);
+    for _ in 0..n * n {
+        d.extend_from_slice(&[255, 244, 214, 255]);
+    }
+    with_mips(n, n, d)
+}
+
+/// Décalques (fond transparent) : 0 fissure ramifiée, 1 tache d'huile, 2 rustine de goudron plus sombre.
+fn make_decal(kind: usize) -> TexData {
+    let n = 128u32;
+    let mut d = vec![0u8; (n * n * 4) as usize];
+    let mut put = |x: i32, y: i32, c: [u8; 3]| {
+        if x >= 0 && y >= 0 && (x as u32) < n && (y as u32) < n {
+            let i = ((y as u32 * n + x as u32) * 4) as usize;
+            d[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    };
+    match kind {
+        0 => {
+            // fissure : marche au hasard d'un bord à l'autre, avec deux branches
+            let crack = [30u8, 31, 33];
+            let mut walk = |mut x: f32, mut y: f32, dx: f32, steps: u32, seed: u32| {
+                for s in 0..steps {
+                    y += (hash(s, seed, 77) - 0.5) * 2.4;
+                    x += dx;
+                    put(x as i32, y as i32, crack);
+                    put(x as i32, y as i32 + 1, crack);
+                }
+                (x, y)
+            };
+            walk(2.0, 64.0, 1.0, 124, 1);
+            walk(40.0, 64.0, 0.8, 40, 2);
+            walk(84.0, 62.0, 0.9, 36, 3);
+        }
+        1 => {
+            // tache : disque bruité, plus sombre au centre
+            for y in 0..n {
+                for x in 0..n {
+                    let (fx, fy) = (x as f32 / n as f32 - 0.5, y as f32 / n as f32 - 0.5);
+                    let r = (fx * fx + fy * fy).sqrt() * 2.0 + (hash(x / 6, y / 6, 5) - 0.5) * 0.35;
+                    if r < 0.85 {
+                        let s = 0.55 + r * 0.35 + (hash(x, y, 9) - 0.5) * 0.1;
+                        put(x as i32, y as i32, [(52.0 * s) as u8, (50.0 * s) as u8, (52.0 * s) as u8]);
+                    }
+                }
+            }
+        }
+        _ => {
+            // rustine : rectangle de goudron neuf, bords un peu irréguliers
+            for y in 0..n {
+                for x in 0..n {
+                    let e = (hash(x / 4, y / 4, 13) - 0.5) * 6.0;
+                    let inside = (x as f32) > 6.0 + e && (x as f32) < 122.0 + e && (y as f32) > 10.0 + e && (y as f32) < 118.0 + e;
+                    if inside {
+                        let s = 0.78 + (hash(x, y, 21) - 0.5) * 0.18;
+                        put(x as i32, y as i32, [(58.0 * s) as u8, (59.0 * s) as u8, (62.0 * s) as u8]);
+                    }
+                }
+            }
+        }
+    }
+    with_mips(n, n, d)
+}
 /// Hauteur des marquages au-dessus de la chaussée (m) — **estimé**.
 pub const LINE_LIFT: f32 = 0.006;
 /// Partie sans collision (marquages : la chaussée dessous a déjà la sienne).
@@ -937,8 +2071,9 @@ fn make_sidewalk_texture() -> TexData {
 pub fn preview_image(kind: usize) -> eframe::egui::ColorImage {
     let k = &KINDS[kind.min(KINDS.len() - 1)];
     let texs = road_textures();
-    let road = &texs.iter().find(|t| t.0 == road_tex_key(kind)).unwrap().1;
     let side = &texs.iter().find(|t| t.0 == SIDEWALK_KEY).unwrap().1;
+    // passerelle : dalles de béton comme un trottoir
+    let road = if k.foot { side } else { &texs.iter().find(|t| t.0 == road_tex_key(kind)).unwrap().1 };
     let shoulder = crate::terrain::material_preview_texture(k.shoulder_mat as usize);
     let grass = crate::terrain::material_preview_texture(2);
     let hw = k.width * 0.5;
@@ -986,6 +2121,11 @@ pub fn road_textures() -> Vec<(u64, TexData)> {
             v.push((CROSSWALK_KEY, make_crosswalk()));
             v.push((LINE_WHITE_KEY, make_line(false)));
             v.push((LINE_YELLOW_KEY, make_line(true)));
+            v.push((METAL_KEY, make_metal()));
+            v.push((LIGHTSTRIP_KEY, make_lightstrip()));
+            for (i, k) in DECAL_KEYS.iter().enumerate() {
+                v.push((*k, make_decal(i)));
+            }
             v
         })
         .clone()
@@ -1156,5 +2296,150 @@ mod collision_tests {
                 assert!(v < 32768);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    fn flat(_x: f32, _y: f32) -> Option<f32> {
+        Some(0.0)
+    }
+
+    #[test]
+    fn pont_au_dessus_d_une_route() {
+        let mut low = vec![Road::build(1, &[v3(-150.0, 0.0, 0.0), v3(150.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap()];
+        let mut r = Road::build(0, &[v3(0.0, -150.0, 0.0), v3(0.0, 150.0, 0.0)], flat, MAX_GRADE, true).unwrap();
+        r.raise_over(&low);
+        // passe au-dessus : pas de carrefour
+        assert!(r.attach(&mut low).is_empty());
+        r.mark_spans(flat);
+        let (p, _) = r.at(150.0);
+        assert!(p.z >= CLEARANCE + DECK_DEPTH - 0.01, "hauteur au croisement {}", p.z);
+        assert_eq!(r.spans.len(), 1);
+        assert!(r.in_span(150.0) && !r.in_span(5.0));
+        // pente respectée, bouts au sol
+        for w in r.samples.windows(2) {
+            assert!((w[1][2] - w[0][2]).abs() <= (w[1][3] - w[0][3]) * MAX_GRADE + 1e-3);
+        }
+        assert!(r.samples[0][2].abs() < 0.01);
+        // aucune pile sur l'avenue
+        let lw = low[0].clone();
+        r.place_piers(flat, |x, y, _| lw.nearest(x, y).map(|(d, _)| d < lw.half_total() + 1.0).unwrap_or(false));
+        assert!(!r.piers.is_empty() && r.abutments.len() == 2);
+        for pr in &r.piers {
+            let (q, _) = r.at(pr[0]);
+            assert!(q.y.abs() > lw.half_total(), "pile sur l'avenue à {}", q.y);
+        }
+        let (_, _, parts) = r.mesh(V3::ZERO);
+        assert!(parts.iter().any(|p| p.2 == BRIDGE_COLL && !p.1.is_empty()));
+    }
+
+    #[test]
+    fn passerelle_au_dessus_d_une_route() {
+        let low = vec![Road::build(0, &[v3(-60.0, 0.0, 0.0), v3(60.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap()];
+        let mut f = Road::build(5, &[v3(0.0, -15.0, 0.0), v3(0.0, 15.0, 0.0)], flat, MAX_GRADE, false).unwrap();
+        assert!(f.elevated && !f.traffic.enabled);
+        f.make_footbridge(flat, &low);
+        assert!(f.samples.iter().all(|s| (s[2] - (CLEARANCE + FOOT_DEPTH)).abs() < 0.01));
+        assert_eq!(f.stairs, Some([0.0, 0.0]));
+        assert_eq!(f.spans, vec![[0.0, f.length()]]);
+        // escaliers : le modèle descend jusqu'au sol, au-delà des bouts
+        let (pos, _, _) = f.mesh(V3::ZERO);
+        assert!(pos.iter().any(|p| p.y < -20.0 && p.z < 0.5));
+    }
+
+    #[test]
+    fn prolonger_une_route_sans_coude() {
+        let old = Road::build(0, &[v3(-120.0, -30.0, 0.0), v3(0.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap();
+        // dans les deux sens : prolongée par sa fin, ou par son début (route retournée)
+        for o in [old.clone(), old.reversed().reversed()] {
+            let (r, cut) = o.extended(&[v3(55.0, 95.0, 0.0)], flat, MAX_GRADE, false).unwrap();
+            assert_eq!(r.pts.len(), 3);
+            assert!(cut < 1.0, "avec 2 points, toute l'ancienne partie est refaite");
+            let mut worst = 0.0f32;
+            for w in r.samples.windows(3) {
+                let a = v3(w[1][0] - w[0][0], w[1][1] - w[0][1], 0.0).norm();
+                let b = v3(w[2][0] - w[1][0], w[2][1] - w[1][1], 0.0).norm();
+                worst = worst.max(a.dot(b).clamp(-1.0, 1.0).acos().to_degrees());
+            }
+            assert!(worst < 6.0, "coude de {worst:.1}° entre deux points de la courbe");
+        }
+        let rr = old.reversed().reversed();
+        assert!(old.samples.iter().zip(&rr.samples).all(|(a, b)| (a[3] - b[3]).abs() < 1e-3 && a[0] == b[0]));
+    }
+
+    #[test]
+    fn pente_reglable() {
+        let hill = |x: f32, _y: f32| Some(if x.abs() < 20.0 { 30.0 } else { 0.0 });
+        for g in [0.06f32, 0.2] {
+            let r = Road::build(3, &[v3(-200.0, 0.0, 0.0), v3(200.0, 0.0, 0.0)], hill, g, false).unwrap();
+            for w in r.samples.windows(2) {
+                assert!((w[1][2] - w[0][2]).abs() <= (w[1][3] - w[0][3]) * g + 1e-3);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod roads2_tests {
+    use super::*;
+
+    fn flat(_x: f32, _y: f32) -> Option<f32> {
+        Some(0.0)
+    }
+
+    #[test]
+    fn tunnel_sous_une_colline() {
+        let hill = |x: f32, _y: f32| Some(if x.abs() < 60.0 { 30.0 } else { 0.0 });
+        let mut r = Road::build_ex(0, &[v3(-150.0, 0.0, 0.0), v3(150.0, 0.0, 0.0)], hill, MAX_GRADE, false, true).unwrap();
+        // la chaussée reste au niveau des bouts
+        assert!(r.samples.iter().all(|s| s[2].abs() < 0.01));
+        r.mark_tunnels(hill);
+        assert_eq!(r.tunnels.len(), 1);
+        let t = r.tunnels[0];
+        assert!(t[0] > 80.0 && t[1] < 220.0 && t[1] - t[0] > 100.0, "{t:?}");
+        assert!(!r.tunnel_lights().is_empty());
+        let (_, _, parts) = r.mesh(V3::ZERO);
+        assert!(parts.iter().any(|p| p.0 == LIGHTSTRIP_KEY && !p.1.is_empty()));
+    }
+
+    #[test]
+    fn rond_point_ferme_et_a_sens_unique() {
+        let r = Road::ring(0, v3(0.0, 0.0, 0.0), 20.0, 5.0);
+        assert!(r.ring && r.oneway);
+        let (a, b) = (r.samples[0], r.samples[r.samples.len() - 1]);
+        assert!((a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3);
+        let (c, rr) = r.ring_center();
+        assert!(c.len() < 0.01 + 5.0 && (rr - 20.0).abs() < 0.01);
+        // sens inverse des aiguilles d'une montre
+        assert!(r.samples[1][1] > r.samples[0][1]);
+        // une route qui arrive dessus : carrefour sans feux
+        let mut ring = vec![r];
+        let mut a = Road::build(0, &[v3(120.0, 0.0, 5.0), v3(20.0, 0.0, 5.0)], |_, _| Some(5.0), MAX_GRADE, false).unwrap();
+        let js = a.attach(&mut ring);
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].control, 3);
+    }
+
+    #[test]
+    fn raccord_de_largeur() {
+        let mut r = Road::build(0, &[v3(0.0, 0.0, 0.0), v3(100.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap();
+        r.taper = Some((1, TAPER_LEN));
+        let (avenue, rue) = (KINDS[1].width * 0.5 + KINDS[1].sidewalk, KINDS[0].width * 0.5 + KINDS[0].sidewalk);
+        assert!((r.half_at(0.0) - avenue).abs() < 1e-3);
+        assert!((r.half_at(TAPER_LEN + 1.0) - rue).abs() < 1e-3);
+        let mid = r.half_at(TAPER_LEN * 0.5);
+        assert!(mid < avenue && mid > rue);
+    }
+
+    #[test]
+    fn bretelle_sur_autoroute_sans_carrefour() {
+        let mut hw = vec![Road::build(2, &[v3(-200.0, 0.0, 0.0), v3(200.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap()];
+        let mut ramp = Road::build(6, &[v3(-100.0, -60.0, 0.0), v3(0.0, -10.2, 0.0)], flat, MAX_GRADE, false).unwrap();
+        assert!(ramp.oneway);
+        assert!(ramp.attach(&mut hw).is_empty());
+        assert!(hw[0].gaps.is_empty());
     }
 }

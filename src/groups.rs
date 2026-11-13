@@ -284,7 +284,7 @@ impl DwApp {
                 }
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut ng.move_originals, false, "Copier").on_hover_text("L'original reste en place");
-                    ui.radio_value(&mut ng.move_originals, true, "Déplacer").on_hover_text("L'original est retiré de la carte du jeu à l'export (comme Suppr), dès la première pose");
+                    ui.radio_value(&mut ng.move_originals, true, "Déplacer").on_hover_text("L'original est retiré de la carte dès la première pose du groupe (comme Suppr ; Ctrl+Z pour revenir)");
                 });
                 ui.label(RichText::new("Les versions de loin, la collision et les lumières des objets du jeu suivent à l'export ; un intérieur garde son placement.").weak().small());
                 if ui.button(RichText::new("Créer et poser").strong()).clicked() {

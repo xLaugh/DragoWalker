@@ -299,7 +299,7 @@ pub fn local_parse(input: &str) -> AiReply {
         actions.push(Action::Place { archetype: p.name.to_string(), count, pattern: pattern.to_string(), size });
         msg = format!("Je pose {count} × {} ({}) en {pattern}.", p.label, p.name);
     } else {
-        msg = "Je n'ai pas compris. Exemples : « pose 10 arbres en ligne », « supprime tout dans un rayon de 40 m », « supprime les arbres dans un rayon de 80 m », « crée un intérieur de 4 pièces », « meuble en bureau », « tourne de 45° », « sélectionne les bancs ». Avec une clé API (onglet Options), Claude comprend des demandes plus libres.".into();
+        msg = "Je n'ai pas compris. Exemples : « pose 10 arbres en ligne », « supprime tout dans un rayon de 40 m », « supprime les arbres dans un rayon de 80 m », « crée un intérieur de 4 pièces », « meuble en bureau », « tourne de 45° », « sélectionne les bancs ». Avec une clé API (fenêtre Assistant IA, repli « Réglages de l'IA »), Claude comprend des demandes plus libres.".into();
     }
     AiReply { message: msg, actions }
 }
@@ -401,7 +401,7 @@ fn call_claude(api_key: &str, history: &[ChatLine], scene: &str) -> Result<AiRep
         Err(ureq::Error::Status(code, r)) => {
             let t = r.into_string().unwrap_or_default();
             return Err(match code {
-                401 => "Clé API refusée (401). Vérifie la clé dans l'onglet Options.".into(),
+                401 => "Clé API refusée (401). Vérifie la clé dans « Réglages de l'IA » (fenêtre Assistant IA).".into(),
                 429 => "Trop de demandes (429), réessaie dans un instant.".into(),
                 c if c >= 500 => format!("Le service Claude est indisponible ({c}), réessaie."),
                 c => format!("Erreur {c} : {t}"),
@@ -454,7 +454,7 @@ fn call_claude(api_key: &str, history: &[ChatLine], scene: &str) -> Result<AiRep
 
 // ---------------------------------------------------------------- autres moteurs d'IA
 
-/// Moteur d'IA choisi dans l'onglet IA.
+/// Moteur d'IA choisi dans la fenêtre Assistant IA.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
     /// Claude Code installé sur l'ordinateur (abonnement de la personne)

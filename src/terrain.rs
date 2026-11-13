@@ -68,6 +68,13 @@ pub struct Terrain {
     /// l'herbe lui-même)
     #[serde(default)]
     pub grass: std::sync::Arc<Vec<u8>>,
+    /// cases peintes sous les routes : (case, matériau d'avant) — pour effacer la peinture quand une route bouge ou
+    /// est supprimée
+    #[serde(default)]
+    pub road_paint: Vec<[u32; 2]>,
+    /// cases retirées (ni dessinées ni solides) : entrées des tunnels
+    #[serde(default)]
+    pub holes: Vec<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +93,8 @@ pub enum Brush {
     Water,
     /// effets de particules du jeu
     Particles,
+    /// copier une zone / coller (terrain_clip.rs)
+    Clip,
 }
 
 /// Modèles de départ d'un terrain : nom, description, style de peinture (0 verdoyant, 1 désert).
@@ -122,6 +131,21 @@ pub struct TerrainState {
     /// type de route et points déjà cliqués de la route en cours
     pub road_kind: u8,
     pub road_pts: Vec<V3>,
+    /// prochaine route tracée en mode pont, et sa pente maximale (0,12 = 12 %)
+    pub road_bridge: bool,
+    pub road_grade: f32,
+    /// prochaine route tracée en mode tunnel ; mode rond-point (un clic pose un rond-point) et son rayon
+    pub road_tunnel: bool,
+    pub road_ring: bool,
+    pub ring_radius: f32,
+    /// route en cours de modification (poignées sur ses points) et point tiré (numéro, position)
+    pub road_edit: Option<usize>,
+    pub edit_drag: Option<(usize, V3)>,
+    /// copier-coller : 0 rien, 1 copier (coin de départ), 2 coller ; morceau copié et quarts de tour
+    pub clip_mode: u8,
+    pub clip_a: Option<V3>,
+    pub clip: Option<crate::terrain_clip::Clip>,
+    pub clip_rot: u8,
     /// végétation : ensemble choisi, densité (0..1), dernier point semé
     pub veg_set: usize,
     pub veg_density: f32,
@@ -161,6 +185,17 @@ impl Default for TerrainState {
             seed: 1,
             road_kind: 0,
             road_pts: Vec::new(),
+            road_bridge: false,
+            road_grade: crate::roads::MAX_GRADE,
+            road_tunnel: false,
+            road_edit: None,
+            edit_drag: None,
+            clip_mode: 0,
+            clip_a: None,
+            clip: None,
+            clip_rot: 0,
+            road_ring: false,
+            ring_radius: crate::roads::RING_RADIUS,
             veg_set: 0,
             veg_density: 0.5,
             veg_spacing: 0.0,
@@ -205,7 +240,7 @@ impl Terrain {
         let cell = if size > 600.0 { 4.0 } else { 2.0 };
         let n = ((size / cell).round() as usize + 1).clamp(16, 400);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default() }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new() }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
@@ -267,6 +302,33 @@ impl Terrain {
 
     /// Peint selon le relief : plage au bord de l'eau, roche sur les pentes raides et en altitude, terre sur
     /// les pentes moyennes, herbe (ou sable dans le style désert) ailleurs.
+    /// Style du terrain d'après son sol actuel, pour « Peindre tout selon le relief » : 1 (désert) si le sable
+    /// couvre plus de cases que l'herbe, sinon 0 (vert). Les cases sous 1,6 m (plages, fond de la mer, toujours en
+    /// sable) ne comptent pas, ni le béton, le goudron et les routes.
+    pub fn dominant_style(&self) -> u8 {
+        let (nx, ny) = (self.nx, self.ny);
+        let (mut sand, mut grass) = (0usize, 0usize);
+        for j in 0..ny.saturating_sub(1) {
+            for i in 0..nx.saturating_sub(1) {
+                let h = |a: usize, b: usize| self.h[b * nx + a];
+                let z = (h(i, j) + h(i + 1, j) + h(i, j + 1) + h(i + 1, j + 1)) * 0.25;
+                if z < 1.6 {
+                    continue;
+                }
+                match self.mat[j * (nx - 1) + i] {
+                    0 => sand += 1,
+                    2 => grass += 1,
+                    _ => {}
+                }
+            }
+        }
+        if sand > grass {
+            1
+        } else {
+            0
+        }
+    }
+
     pub fn auto_paint(&mut self, style: u8) {
         let (nx, ny) = (self.nx, self.ny);
         for j in 0..ny - 1 {
@@ -296,15 +358,22 @@ impl Terrain {
     }
 
     /// Aplanit le terrain sous une route (chaussée et trottoirs à sa hauteur, raccord en pente douce sur 8 m
-    /// de chaque côté) et peint le dessous en goudron (ou en terre pour un chemin).
+    /// de chaque côté) et peint le dessous en goudron (ou en terre pour un chemin). Rien sous les ponts et dans les
+    /// tunnels ; l'îlot d'un rond-point est mis à la hauteur de la chaussée.
     pub fn apply_road(&mut self, r: &crate::roads::Road) {
-        let half = r.half_total();
+        let half = r.max_half();
         let blend = 8.0;
         let reach = half + blend;
         let (nx, ny) = (self.nx, self.ny);
-        let mut best = vec![(f32::MAX, 0.0f32); nx * ny];
+        // (distance, hauteur de la chaussée, demi-largeur de la route à cet endroit)
+        let mut best = vec![(f32::MAX, 0.0f32, half); nx * ny];
+        // case dont le point le plus proche de la route est sous un pont ou dans un tunnel : terrain laissé tel quel
+        let mut under = vec![false; nx * ny];
         for w in r.samples.windows(2) {
             let (a, b) = (w[0], w[1]);
+            let mid = (a[3] + b[3]) * 0.5;
+            let skip = r.in_span(mid) || r.in_tunnel(mid);
+            let hseg = r.half_at(mid);
             let i0 = (((a[0].min(b[0]) - reach - self.origin.x) / self.cell).floor().max(0.0)) as usize;
             let j0 = (((a[1].min(b[1]) - reach - self.origin.y) / self.cell).floor().max(0.0)) as usize;
             let i1 = ((((a[0].max(b[0]) + reach - self.origin.x) / self.cell).ceil().max(0.0)) as usize).min(nx - 1);
@@ -318,46 +387,205 @@ impl Terrain {
                     let d = ((p.x - a[0] - dx * t).powi(2) + (p.y - a[1] - dy * t).powi(2)).sqrt();
                     let k = j * nx + i;
                     if d < best[k].0 {
-                        best[k] = (d, a[2] + (b[2] - a[2]) * t);
+                        best[k] = (d, a[2] + (b[2] - a[2]) * t, hseg);
+                        under[k] = skip;
                     }
                 }
             }
         }
-        for (k, (d, z)) in best.iter().enumerate() {
-            if *d > reach {
+        for (k, (d, z, hh)) in best.iter().enumerate() {
+            if *d > hh + blend || under[k] {
                 continue;
             }
             let target = z - 0.05;
-            let w = if *d <= half + 0.5 { 1.0 } else { let t = 1.0 - (*d - half - 0.5) / (blend - 0.5); t * t * (3.0 - 2.0 * t) };
+            let w = if *d <= hh + 0.5 { 1.0 } else { let t = 1.0 - (*d - hh - 0.5) / (blend - 0.5); t * t * (3.0 - 2.0 * t) };
             let v = self.h[k];
             std::sync::Arc::make_mut(&mut self.h)[k] = v + (target - v) * w;
         }
-        // couleur du sol sous la route (vue de loin, version simplifiée) : seulement les cases entièrement
-        // couvertes par la route, trottoirs ou accotements compris — une case de 2 m à moitié dessous dépassait
-        // du bord en marches d'escalier
-        let m = if r.kind().dirt { 1 } else { ROAD };
-        let cover = half - 0.05;
-        for j in 0..ny - 1 {
-            for i in 0..nx - 1 {
-                let k = j * nx + i;
-                if best[k].0 > reach {
-                    continue;
-                }
-                let x0 = self.origin.x + i as f32 * self.cell;
-                let y0 = self.origin.y + j as f32 * self.cell;
-                let inside = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
-                    .iter()
-                    .all(|(a, b)| r.nearest(x0 + a * self.cell, y0 + b * self.cell).map(|(d, _)| d <= cover).unwrap_or(false));
-                if inside {
-                    std::sync::Arc::make_mut(&mut self.mat)[j * (nx - 1) + i] = m;
+        // îlot du rond-point : à plat, à la hauteur de la chaussée
+        if r.ring {
+            let (c, rr) = r.ring_center();
+            let ri = rr - r.half_total() + 0.5;
+            let hm = std::sync::Arc::make_mut(&mut self.h);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let p = v3(self.origin.x + i as f32 * self.cell, self.origin.y + j as f32 * self.cell, 0.0);
+                    if (p.x - c.x).powi(2) + (p.y - c.y).powi(2) <= ri * ri {
+                        hm[j * nx + i] = c.z - 0.05;
+                    }
                 }
             }
+        }
+        self.paint_road(r);
+    }
+
+    /// Couleur du sol sous la route (vue de loin, version simplifiée) : seulement les cases entièrement couvertes par
+    /// la route, trottoirs ou accotements compris (une case de 2 m à moitié dessous dépassait du bord en marches
+    /// d'escalier) ; ni sous un pont, ni dans un tunnel. Le matériau d'avant est gardé (road_paint).
+    pub fn paint_road(&mut self, r: &crate::roads::Road) {
+        let (nx, ny) = (self.nx, self.ny);
+        if nx < 2 || ny < 2 {
+            return;
+        }
+        let m = if r.kind().dirt { 1 } else { ROAD };
+        let reach = r.max_half() + self.cell;
+        let mut cand = vec![false; (nx - 1) * (ny - 1)];
+        for w in r.samples.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let i0 = (((a[0].min(b[0]) - reach - self.origin.x) / self.cell).floor().max(0.0)) as usize;
+            let j0 = (((a[1].min(b[1]) - reach - self.origin.y) / self.cell).floor().max(0.0)) as usize;
+            let i1 = ((((a[0].max(b[0]) + reach - self.origin.x) / self.cell).ceil().max(0.0)) as usize).min(nx - 2);
+            let j1 = ((((a[1].max(b[1]) + reach - self.origin.y) / self.cell).ceil().max(0.0)) as usize).min(ny - 2);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    cand[j * (nx - 1) + i] = true;
+                }
+            }
+        }
+        let recorded: std::collections::HashSet<u32> = self.road_paint.iter().map(|c| c[0]).collect();
+        for (ci, on) in cand.iter().enumerate() {
+            if !on {
+                continue;
+            }
+            let (i, j) = (ci % (nx - 1), ci / (nx - 1));
+            let x0 = self.origin.x + i as f32 * self.cell;
+            let y0 = self.origin.y + j as f32 * self.cell;
+            let inside = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].iter().all(|(a, b)| {
+                r.nearest_point(x0 + a * self.cell, y0 + b * self.cell).map(|(d, _, along, _)| d <= r.half_at(along) - 0.05 && !r.in_span(along) && !r.in_tunnel(along)).unwrap_or(false)
+            });
+            if inside {
+                let old = self.mat[ci];
+                if old != m {
+                    if !recorded.contains(&(ci as u32)) {
+                        self.road_paint.push([ci as u32, old as u32]);
+                    }
+                    std::sync::Arc::make_mut(&mut self.mat)[ci] = m;
+                }
+            }
+        }
+    }
+
+    /// Efface la peinture des routes (matériau d'avant remis là où il reste celui d'une route) puis repeint sous les
+    /// routes actuelles : après une suppression, ou quand une route a bougé.
+    pub fn repaint_roads(&mut self) {
+        let paint = std::mem::take(&mut self.road_paint);
+        if !paint.is_empty() {
+            let mm = std::sync::Arc::make_mut(&mut self.mat);
+            for c in paint {
+                if let Some(v) = mm.get_mut(c[0] as usize) {
+                    if *v == ROAD || *v == 1 {
+                        *v = c[1] as u8;
+                    }
+                }
+            }
+        }
+        let roads = self.roads.clone();
+        for r in &roads {
+            self.paint_road(r);
+        }
+    }
+
+    /// Trous du terrain aux entrées des tunnels : les cases traversées par l'ouverture du tube (largeur de la route
+    /// + 1,5 m, sur deux cases devant l'entrée et une derrière) dont le sol dépasse la chaussée.
+    pub fn refresh_holes(&mut self) {
+        let mut out: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let (nx, ny) = (self.nx, self.ny);
+        for r in &self.roads {
+            for t in &r.tunnels {
+                for (d, sign) in [(t[0], -1.0f32), (t[1], 1.0)] {
+                    let (p, _) = r.at(d);
+                    let reach = r.half_total() + 1.5 + self.cell * 3.0;
+                    let i0 = (((p.x - reach - self.origin.x) / self.cell).floor().max(0.0)) as usize;
+                    let j0 = (((p.y - reach - self.origin.y) / self.cell).floor().max(0.0)) as usize;
+                    let i1 = ((((p.x + reach - self.origin.x) / self.cell).ceil().max(0.0)) as usize).min(nx - 2);
+                    let j1 = ((((p.y + reach - self.origin.y) / self.cell).ceil().max(0.0)) as usize).min(ny - 2);
+                    for j in j0..=j1 {
+                        for i in i0..=i1 {
+                            let c = v3(self.origin.x + (i as f32 + 0.5) * self.cell, self.origin.y + (j as f32 + 0.5) * self.cell, 0.0);
+                            let Some((dl, z, along, _)) = r.nearest_point(c.x, c.y).map(|n| (n.0, n.1.z, n.2, n.3)) else { continue };
+                            // devant l'entrée : côté route au sol ; derrière : côté tunnel
+                            let rel = (along - d) * -sign;
+                            if dl > r.half_total() + 1.5 || rel < -self.cell * 1.01 || rel > self.cell * 2.01 {
+                                continue;
+                            }
+                            let top = [(0, 0), (1, 0), (0, 1), (1, 1)].iter().map(|(a, b)| self.h[(j + b) * nx + i + a]).fold(f32::MIN, f32::max);
+                            if top > z + 0.3 {
+                                out.insert((j * (nx - 1) + i) as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.holes = out.into_iter().collect();
+    }
+
+    /// Refait tout le réseau de routes, dans l'ordre où elles ont été tracées, depuis leurs points cliqués et leurs
+    /// réglages : carrefours, trottoirs ouverts, ponts, tunnels, peinture du sol. Les routes d'indice `flatten`
+    /// (modifiées) aplanissent de nouveau le terrain. Le réglage des feux de chaque carrefour est gardé. Rend les
+    /// objets à retirer (feux et panneaux des anciens carrefours, lampadaires des routes disparues).
+    pub fn rebuild_roads(&mut self, flatten: &[usize]) -> std::collections::HashSet<u64> {
+        let old = std::mem::take(&mut self.roads);
+        let old_j = std::mem::take(&mut self.junctions);
+        let mut gone: std::collections::HashSet<u64> = old_j.iter().flat_map(|j| j.props.iter().copied()).collect();
+        for (i, r) in old.iter().enumerate() {
+            let h = |x: f32, y: f32| self.height_at(x, y);
+            let Some(mut nr) = r.rebuilt(&h, &self.roads) else {
+                gone.extend(r.props.iter().copied());
+                continue;
+            };
+            let js = nr.attach(&mut self.roads);
+            if nr.buried {
+                nr.mark_tunnels(|x, y| self.height_at(x, y));
+            }
+            if nr.elevated {
+                nr.mark_spans(|x, y| self.height_at(x, y));
+            }
+            if flatten.contains(&i) {
+                self.apply_road(&nr);
+            }
+            self.roads.push(nr);
+            for mut j in js {
+                if let Some(o) = old_j.iter().find(|o| (o.pos[0] - j.pos[0]).powi(2) + (o.pos[1] - j.pos[1]).powi(2) < 9.0) {
+                    j.control = o.control;
+                }
+                self.junctions.push(j);
+            }
+        }
+        self.refresh_bridges();
+        self.repaint_roads();
+        self.refresh_holes();
+        gone
+    }
+
+    /// Replace les piles et culées de tous les ponts : sur le sol actuel, jamais sur une route plus basse.
+    pub fn refresh_bridges(&mut self) {
+        let mut out: Vec<(usize, crate::roads::Road)> = Vec::new();
+        for (i, r) in self.roads.iter().enumerate() {
+            if r.spans.is_empty() {
+                continue;
+            }
+            let mut r = r.clone();
+            let roads = &self.roads;
+            r.place_piers(
+                |x, y| self.height_at(x, y),
+                |x, y, z| roads.iter().enumerate().any(|(j, o)| j != i && o.nearest(x, y).map(|(d, oz)| d < o.half_total() + 1.0 && oz < z - crate::roads::JOIN_DZ).unwrap_or(false)),
+            );
+            out.push((i, r));
+        }
+        for (i, r) in out {
+            self.roads[i] = r;
         }
     }
 
     /// Plus haute surface dessinée sous (x, y) : terrain, chaussées, trottoirs, accotements et carrefours
     /// (triangles des routes, sans les marquages). None hors du terrain et des routes.
     pub fn surface_at(&self, x: f32, y: f32) -> Option<f32> {
+        self.surface_below(x, y, f32::INFINITY)
+    }
+
+    /// Comme surface_at, sans ce qui est au-dessus de `zmax` (sous un pont : le sol, pas le tablier).
+    pub fn surface_below(&self, x: f32, y: f32, zmax: f32) -> Option<f32> {
         let mut best = self.height_at(x, y);
         let o = v3(x, y, 0.0);
         let mut scan = |pos: &[V3], parts: &[(u64, Vec<u32>, u8)]| {
@@ -378,12 +606,17 @@ impl Terrain {
                         continue;
                     }
                     let z = a.z + (b.z - a.z) * u + (c.z - a.z) * v;
+                    if z > zmax {
+                        continue;
+                    }
                     best = Some(best.map_or(z, |m: f32| m.max(z)));
                 }
             }
         };
         for r in &self.roads {
-            if r.nearest(x, y).map(|(d, _)| d <= r.half_total() + 1.0).unwrap_or(false) {
+            // escaliers de passerelle : jusqu'à ~ 30 m au-delà des bouts
+            let reach = r.max_half() + 1.0 + if r.stairs.is_some() { 30.0 } else { 0.0 } + if r.ring { r.ring_center().1 } else { 0.0 };
+            if r.nearest(x, y).map(|(d, _)| d <= reach).unwrap_or(false) {
                 let (pos, _, parts) = r.mesh(o);
                 scan(&pos, &parts);
             }
@@ -413,7 +646,16 @@ impl Terrain {
                 grass.push(self.grass_at(i, j));
             }
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into() }
+        let hs: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
+        let mut holes = Vec::new();
+        for j in j0..j1 {
+            for i in i0..i1 {
+                if hs.contains(&((j * (self.nx - 1) + i) as u32)) {
+                    holes.push(((j - j0) * (nx - 1) + (i - i0)) as u32);
+                }
+            }
+        }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into(), road_paint: Vec::new(), holes }
     }
 
     /// Version simplifiée pour la vue de loin : un sommet sur `f` dans chaque direction (cases `f` fois plus
@@ -437,7 +679,7 @@ impl Terrain {
                 mat.push(self.mat[gj(j).min(self.ny - 2) * (self.nx - 1) + gi(i).min(self.nx - 2)]);
             }
         }
-        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default() }
+        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new() }
     }
 
     /// Herbe du jeu d'une case (0 = aucune).
@@ -506,8 +748,14 @@ impl Terrain {
         }
         for r in &self.roads {
             for s in &r.samples {
-                hi = hi.max(s[2] + 0.3);
-                lo = lo.min(s[2] - 0.7);
+                hi = hi.max(s[2] + if r.spans.is_empty() { 0.3 } else { 1.4 });
+                lo = lo.min(s[2] - if r.spans.is_empty() { 0.7 } else { crate::roads::DECK_DEPTH + 0.2 });
+            }
+            for p in r.piers.iter().chain(&r.abutments) {
+                lo = lo.min(p[1] - 1.6);
+            }
+            if let Some(st) = r.stairs {
+                lo = lo.min(st[0].min(st[1]) - 0.6);
             }
         }
         (v3(self.origin.x, self.origin.y, lo), v3(self.origin.x + (self.nx - 1) as f32 * self.cell, self.origin.y + (self.ny - 1) as f32 * self.cell, hi))
@@ -565,7 +813,7 @@ impl Terrain {
                 });
             }
             Brush::Paint => self.paint_disc(c, r, paint),
-            Brush::Road | Brush::Vegetation | Brush::Water | Brush::Particles => {}
+            Brush::Road | Brush::Vegetation | Brush::Water | Brush::Particles | Brush::Clip => {}
         }
     }
 
@@ -656,8 +904,12 @@ impl Terrain {
             }
         }
         let mut per: Vec<Vec<u32>> = vec![Vec::new(); MATERIALS.len()];
+        let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
         for j in 0..ny - 1 {
             for i in 0..nx - 1 {
+                if holes.contains(&((j * (nx - 1) + i) as u32)) {
+                    continue; // entrée de tunnel
+                }
                 let m = (self.mat[j * (nx - 1) + i] as usize).min(MATERIALS.len() - 1);
                 let a = (j * nx + i) as u32;
                 let (b, c, d) = (a + 1, a + nx as u32, a + nx as u32 + 1);
@@ -718,7 +970,7 @@ pub fn append_mesh(verts: &mut Vec<RVert>, idx: &mut Vec<u32>, geoms: &mut Vec<R
     for (key, list, _) in parts {
         let tex = texs.iter().position(|t| t.0 == *key).unwrap_or(0) as u32;
         for chunk in list.chunks(60000) {
-            geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex, cutout: false, blend: 0, glass: false, ..Default::default() });
+            geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex, cutout: crate::roads::is_cutout(*key) || crate::atelier::is_cutout(*key), blend: 0, glass: false, ..Default::default() });
             keys.push(*key);
             idx.extend(chunk.iter().map(|i| i + base));
         }
@@ -879,10 +1131,25 @@ impl DwApp {
         if self.proj.terrain.is_none() {
             return;
         }
+        if self.terrain.brush == Brush::Clip {
+            self.clip_tool(resp, g);
+            return;
+        }
+        // route en cours de modification : poignées sur ses points
+        if self.terrain.brush == Brush::Road && self.terrain.road_edit.is_some() {
+            self.road_edit_tool(resp, p, g);
+            return;
+        }
         // routes : un clic par point, double-clic ou Entrée pour finir
         if self.terrain.brush == Brush::Road {
-            if resp.double_clicked_by(PointerButton::Primary) {
+            if resp.double_clicked_by(PointerButton::Primary) && !self.terrain.road_ring {
                 self.finish_road();
+                return;
+            }
+            if resp.clicked_by(PointerButton::Primary) && self.terrain.road_ring {
+                if let Some(p) = g {
+                    self.place_ring(p);
+                }
                 return;
             }
             if resp.clicked_by(PointerButton::Primary) {
@@ -971,8 +1238,11 @@ impl DwApp {
     /// route. Renvoie le point et vrai pour une extrémité.
     pub fn road_snap(&self, p: V3) -> Option<(V3, bool)> {
         let t = self.proj.terrain.as_ref()?;
+        if crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)].foot {
+            return None;
+        }
         let mut best: Option<(f32, V3, bool)> = None;
-        for r in &t.roads {
+        for r in t.roads.iter().filter(|r| !r.kind().foot) {
             for s in [r.samples.first()?, r.samples.last()?] {
                 let d = ((s[0] - p.x).powi(2) + (s[1] - p.y).powi(2)).sqrt();
                 if d < crate::roads::SNAP_END.max(r.kind().width * 0.5) && best.map(|b| d < b.0).unwrap_or(true) {
@@ -980,8 +1250,21 @@ impl DwApp {
                 }
             }
         }
+        // bretelle : posée sur la voie de droite (ou de gauche) d'une autoroute, côté du clic
+        if best.is_none() && crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)].ramp {
+            for r in t.roads.iter().filter(|r| r.kind().width >= 20.0) {
+                if let Some((d, q, _, tan)) = r.nearest_point(p.x, p.y) {
+                    let hw = r.kind().width * 0.5;
+                    if d <= hw + 4.0 {
+                        let right = v3(tan.y, -tan.x, 0.0);
+                        let side = if (p - q).dot(right) >= 0.0 { 1.0 } else { -1.0 };
+                        return Some((q + right * ((hw - 1.8) * side), false));
+                    }
+                }
+            }
+        }
         if best.is_none() {
-            for r in &t.roads {
+            for r in t.roads.iter().filter(|r| !r.kind().foot) {
                 if let Some((d, q, _, _)) = r.nearest_point(p.x, p.y) {
                     if d <= r.kind().width * 0.5 && best.map(|b| d < b.0).unwrap_or(true) {
                         best = Some((d, q, false));
@@ -1001,29 +1284,304 @@ impl DwApp {
             return;
         }
         let kind = self.terrain.road_kind;
+        let foot = crate::roads::KINDS[(kind as usize).min(crate::roads::KINDS.len() - 1)].foot;
+        let elevated = self.terrain.road_bridge && !foot;
+        let buried = self.terrain.road_tunnel && !foot && !elevated;
+        let is_ramp = crate::roads::KINDS[(kind as usize).min(crate::roads::KINDS.len() - 1)].ramp;
+        let grade = self.terrain.road_grade;
         let Some(t) = self.proj.terrain.as_ref() else { return };
-        let Some(mut r) = crate::roads::Road::build(kind, &pts, |x, y| t.height_at(x, y)) else { return };
+        // relier au bout d'une route du même type : la nouvelle la prolonge, et les deux n'en font plus qu'une (courbe
+        // continue, trottoirs sans coupure) au lieu de deux routes collées en angle
+        let mut pts = pts;
+        let mut merge: Option<(usize, f32)> = None;
+        let mut merged: Option<crate::roads::Road> = None;
+        // route d'un autre type prolongée : l'ancienne, retouchée au raccord (courbe continue)
+        let mut taper: Option<(usize, crate::roads::Road)> = None;
+        if !foot && !is_ramp {
+            let near = |a: [f32; 4], p: V3| (a[0] - p.x).powi(2) + (a[1] - p.y).powi(2) < 1.0;
+            'find: for (i, o) in t.roads.iter().enumerate() {
+                if o.kind().foot || o.kind().ramp || o.ring || o.samples.len() < 2 || o.stairs.is_some() {
+                    continue;
+                }
+                let (first, last) = (o.samples[0], o.samples[o.samples.len() - 1]);
+                for (new_first, p) in [(true, pts[0]), (false, pts[pts.len() - 1])] {
+                    for (old_last, q) in [(true, last), (false, first)] {
+                        if near(q, p) {
+                            if !new_first {
+                                pts.reverse();
+                            }
+                            let old = if old_last { o.clone() } else { o.reversed() };
+                            if o.kind == kind {
+                                if let Some((r, cut)) = old.extended(&pts[1..], |x, y| t.height_at(x, y), grade, elevated) {
+                                    merge = Some((i, cut));
+                                    merged = Some(r);
+                                }
+                            } else if let Some((ext, _)) = old.extended(&pts[1..2], |x, y| t.height_at(x, y), old.grade, old.elevated) {
+                                // raccord entre deux types : l'ancienne route est refaite jusqu'au point de raccord en
+                                // visant le point suivant de la nouvelle, la nouvelle part de l'avant-dernier point de
+                                // l'ancienne ; les deux ont alors la même direction au raccord. La largeur passe de
+                                // l'une à l'autre sur TAPER_LEN m.
+                                let join = pts[0];
+                                let jd = ext.nearest_point(join.x, join.y).map(|n| n.2).unwrap_or(old.length());
+                                let mut head = ext.head_to(jd);
+                                head.pts = old.pts.clone();
+                                let prev = old.pts[old.pts.len() - 2];
+                                let mut all = vec![v3(prev[0], prev[1], old.nearest(prev[0], prev[1]).map(|n| n.1).unwrap_or(join.z))];
+                                all.extend_from_slice(&pts);
+                                if let Some(full) = crate::roads::Road::build_ex(kind, &all, |x, y| t.height_at(x, y), grade, elevated, buried) {
+                                    let jd2 = full.nearest_point(join.x, join.y).map(|n| n.2).unwrap_or(0.0);
+                                    let mut nr = full.tail_from(jd2);
+                                    nr.pts = pts.iter().map(|p| [p.x, p.y]).collect();
+                                    if let (Some(he), Some(n0)) = (head.samples.last().copied(), nr.samples.first().copied()) {
+                                        let delta = he[2] - n0[2];
+                                        for s in nr.samples.iter_mut() {
+                                            let w = (1.0 - s[3] / crate::roads::HEIGHT_BLEND).max(0.0);
+                                            s[2] += delta * w * w * (3.0 - 2.0 * w);
+                                        }
+                                    }
+                                    nr.taper = Some((o.kind, crate::roads::TAPER_LEN.min(nr.length() * 0.5)));
+                                    taper = Some((i, head));
+                                    merged = Some(nr);
+                                }
+                            }
+                            break 'find;
+                        }
+                    }
+                }
+            }
+        }
+        let built = match merged {
+            Some(r) => Some(r),
+            None => crate::roads::Road::build_ex(kind, &pts, |x, y| t.height_at(x, y), grade, elevated, buried),
+        };
+        let tapered = taper.is_some();
+        let Some(mut r) = built else { return };
+        if foot {
+            r.make_footbridge(|x, y| t.surface_at(x, y), &t.roads);
+        } else if elevated {
+            // pas au-dessus de la route qu'elle prolonge (elle la remplace)
+            let others: Vec<crate::roads::Road> = t.roads.iter().enumerate().filter(|(j, _)| merge.map(|m| m.0) != Some(*j)).map(|(_, o)| o.clone()).collect();
+            r.raise_over(&others);
+        }
         self.push_undo();
         let len = r.length();
         let mut nj = 0;
+        let mut bridge = (0.0f32, 0usize, false);
+        let mut tun = (0.0f32, 0usize);
         if let Some(t) = self.proj.terrain.as_mut() {
-            // reliée aux routes existantes : hauteur raccordée, trottoirs ouverts, carrefours
-            let js = r.attach(&mut t.roads);
+            // reliée aux routes existantes : hauteur raccordée, trottoirs ouverts, carrefours (pas une passerelle,
+            // ni là où une route passe au-dessus de l'autre)
+            let js = if let Some((i, cut)) = merge {
+                // la route prolongée remplace l'ancienne ; seule la partie refaite est reliée aux autres routes
+                t.roads.remove(i);
+                let mut tail = r.tail_from(cut);
+                let mut js = tail.attach(&mut t.roads);
+                for (s, ts) in r.samples.iter_mut().filter(|s| s[3] >= cut - 1e-3).zip(&tail.samples) {
+                    s[2] = ts[2];
+                }
+                r.gaps.extend(tail.gaps.iter().map(|g| [g[0] + cut, g[1] + cut, g[2]]));
+                // carrefours de l'ancienne route repris par la partie refaite : déjà là
+                js.retain(|j| !t.junctions.iter().any(|o| (o.pos[0] - j.pos[0]).powi(2) + (o.pos[1] - j.pos[1]).powi(2) < 4.0));
+                js
+            } else {
+                if let Some((i, head)) = taper.take() {
+                    t.roads[i] = head;
+                }
+                r.attach(&mut t.roads)
+            };
             nj = js.len();
+            if r.buried {
+                r.mark_tunnels(|x, y| t.height_at(x, y));
+                tun = (r.tunnels.iter().map(|s| s[1] - s[0]).sum(), r.tunnel_lights().len());
+            }
+            if r.elevated {
+                r.mark_spans(|x, y| t.height_at(x, y));
+                // bout resté en l'air (rampe trop courte pour redescendre)
+                let air = |s: &[f32; 4]| t.height_at(s[0], s[1]).map(|g| s[2] - g > crate::roads::BRIDGE_MIN_CLEAR).unwrap_or(false);
+                bridge.2 = !foot && (air(&r.samples[0]) || air(&r.samples[r.samples.len() - 1]));
+            }
             t.apply_road(&r);
             t.roads.push(r);
             t.junctions.extend(js);
+            t.refresh_bridges();
+            if let Some(r) = t.roads.last() {
+                bridge.0 = r.bridge_len();
+                bridge.1 = r.piers.len();
+            }
+            // une route a pu bouger (prolongée, raccord) : peinture du sol refaite ; entrées des tunnels
+            if merge.is_some() || tapered {
+                t.repaint_roads();
+            }
+            t.refresh_holes();
         }
+        self.refresh_furniture();
         // feux et stops des carrefours (reposés pour tous : une nouvelle branche change la signalisation)
         if nj > 0 {
             self.refresh_signals();
         }
         self.terrain.dirty = true;
-        self.status = if nj > 0 {
-            format!("{} de {:.0} m construite et reliée : {nj} carrefour(s).", crate::roads::KINDS[kind as usize].name, len)
+        let name = crate::roads::KINDS[kind as usize].name;
+        let joined = if merge.is_some() { " (prolonge la route existante : une seule route)" } else { "" };
+        let pct = (grade.clamp(crate::roads::GRADE_MIN, crate::roads::GRADE_MAX) * 100.0).round();
+        self.status = if foot {
+            format!("{name} de {len:.0} m construite : tablier à hauteur fixe, {} pile(s), escaliers aux deux bouts.", bridge.1)
+        } else if bridge.0 > 0.0 {
+            let mut s = format!("{name} de {len:.0} m construite : {:.0} m en pont, {} pile(s), pente limitée à {pct} %", bridge.0, bridge.1);
+            if nj > 0 {
+                s += &format!(", {nj} carrefour(s)");
+            }
+            if bridge.2 {
+                s += " · un bout reste en l'air : allonge la route pour que la rampe redescende jusqu'au sol";
+            }
+            s + "."
+        } else if elevated {
+            format!("{name} de {len:.0} m construite : jamais à plus de {:.1} m du sol, donc pas de pont (pente limitée à {pct} %).", crate::roads::BRIDGE_MIN_CLEAR)
+        } else if nj > 0 {
+            format!("{name} de {len:.0} m construite et reliée{joined} : {nj} carrefour(s).")
         } else {
-            format!("{} de {:.0} m construite (terrain aplani dessous, pente limitée à 12 %).", crate::roads::KINDS[kind as usize].name, len)
+            format!("{name} de {len:.0} m construite{joined} (terrain aplani dessous, pente limitée à {pct} %).")
         };
+        if tapered {
+            self.status += &format!(" Raccord progressif avec la route existante sur {:.0} m.", crate::roads::TAPER_LEN);
+        }
+        if tun.0 > 0.0 {
+            self.status += &format!(" {:.0} m en tunnel, {} lumière(s) au plafond.", tun.0, tun.1);
+        } else if buried {
+            self.status += &format!(" Pas de tunnel : jamais plus de {:.0} m de relief au-dessus de la route.", crate::roads::TUNNEL_H + crate::roads::TUNNEL_COVER);
+        }
+        if is_ramp {
+            self.status += " Sens unique dans le sens du tracé.";
+        }
+    }
+
+    /// Refait tout le réseau de routes (après une modification ou une suppression) : carrefours, feux, lampadaires,
+    /// peinture du sol. `flatten` : routes modifiées, dont le terrain est de nouveau aplani.
+    pub fn rebuild_road_network(&mut self, flatten: &[usize]) {
+        let Some(t) = self.proj.terrain.as_mut() else { return };
+        let gone = t.rebuild_roads(flatten);
+        if !gone.is_empty() {
+            self.proj.delete_ids(&gone);
+        }
+        self.refresh_signals();
+        self.refresh_furniture();
+        self.clean_selection();
+        self.terrain.dirty = true;
+    }
+
+    /// Poignées de la route modifiée : glisser = déplacer un point (rond-point : tout l'anneau), double-clic sur la
+    /// route = ajouter un point, clic droit sur un point = le retirer (au moins 2 points).
+    fn road_edit_tool(&mut self, resp: &egui::Response, mouse: Pos2, g: Option<V3>) {
+        let Some(ei) = self.terrain.road_edit else { return };
+        let Some(r) = self.proj.terrain.as_ref().and_then(|t| t.roads.get(ei)).cloned() else {
+            self.terrain.road_edit = None;
+            return;
+        };
+        let h = |s: &Self, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+        let near = |s: &Self| -> Option<usize> {
+            r.pts
+                .iter()
+                .enumerate()
+                .filter_map(|(k, p)| s.cam.project(v3(p[0], p[1], h(s, p[0], p[1]) + 0.3)).map(|q| (k, (q.0 - mouse).length())))
+                .filter(|x| x.1 < 14.0)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|x| x.0)
+        };
+        if resp.drag_started_by(PointerButton::Primary) {
+            if let (Some(k), Some(g)) = (near(self), g) {
+                self.terrain.edit_drag = Some((k, g));
+            }
+        } else if resp.dragged_by(PointerButton::Primary) {
+            if let (Some((k, _)), Some(g)) = (self.terrain.edit_drag, g) {
+                self.terrain.edit_drag = Some((k, g));
+            }
+        }
+        if resp.drag_stopped_by(PointerButton::Primary) {
+            if let Some((k, q)) = self.terrain.edit_drag.take() {
+                self.push_undo();
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    let rr = &mut t.roads[ei];
+                    if rr.ring {
+                        let (dx, dy) = (q.x - rr.pts[k][0], q.y - rr.pts[k][1]);
+                        for p in rr.pts.iter_mut() {
+                            p[0] += dx;
+                            p[1] += dy;
+                        }
+                    } else {
+                        rr.pts[k] = [q.x, q.y];
+                    }
+                }
+                self.rebuild_road_network(&[ei]);
+                self.status = "Point déplacé : la route et ses voisines ont été refaites.".into();
+            }
+            return;
+        }
+        if resp.secondary_clicked() && !r.ring && r.pts.len() > 2 {
+            if let Some(k) = near(self) {
+                self.push_undo();
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    t.roads[ei].pts.remove(k);
+                }
+                self.rebuild_road_network(&[ei]);
+                self.status = "Point retiré.".into();
+            }
+            return;
+        }
+        if resp.double_clicked_by(PointerButton::Primary) && !r.ring {
+            let Some(g) = g else { return };
+            // inséré dans le segment de points cliqués le plus proche
+            let mut best: Option<(f32, usize)> = None;
+            for k in 0..r.pts.len() - 1 {
+                let (a, b) = (r.pts[k], r.pts[k + 1]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let t = (((g.x - a[0]) * dx + (g.y - a[1]) * dy) / (dx * dx + dy * dy).max(1e-6)).clamp(0.0, 1.0);
+                let d = ((g.x - a[0] - dx * t).powi(2) + (g.y - a[1] - dy * t).powi(2)).sqrt();
+                if best.map(|b| d < b.0).unwrap_or(true) {
+                    best = Some((d, k + 1));
+                }
+            }
+            if let Some((d, at)) = best {
+                if d < r.half_total() + 4.0 {
+                    self.push_undo();
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.roads[ei].pts.insert(at, [g.x, g.y]);
+                    }
+                    self.rebuild_road_network(&[ei]);
+                    self.status = "Point ajouté : glisse-le pour courber la route.".into();
+                }
+            }
+        }
+    }
+
+    /// Pose un rond-point (type de route et rayon choisis) centré en `c` : anneau à sens unique, îlot central en
+    /// herbe ; les routes qui le croisent déjà font un carrefour sans feux. Les routes tracées ensuite jusqu'à
+    /// l'anneau s'y branchent.
+    pub fn place_ring(&mut self, c: V3) {
+        let kind = self.terrain.road_kind;
+        let k = &crate::roads::KINDS[(kind as usize).min(crate::roads::KINDS.len() - 1)];
+        if k.foot || k.ramp {
+            self.status = "Un rond-point se fait avec une rue, une avenue, une autoroute, une route de campagne ou un chemin.".into();
+            return;
+        }
+        let Some(t) = self.proj.terrain.as_ref() else { return };
+        let radius = self.terrain.ring_radius.max(k.width * 0.5 + k.sidewalk.max(k.shoulder) + 4.0);
+        let z = t.height_at(c.x, c.y).unwrap_or(c.z);
+        let mut r = crate::roads::Road::ring(kind, c, radius, z);
+        self.push_undo();
+        let mut nj = 0;
+        if let Some(t) = self.proj.terrain.as_mut() {
+            let js = r.attach(&mut t.roads);
+            nj = js.len();
+            t.apply_road(&r);
+            t.roads.push(r);
+            t.junctions.extend(js);
+            t.refresh_bridges();
+        }
+        if nj > 0 {
+            self.refresh_signals();
+        }
+        self.refresh_furniture();
+        self.terrain.dirty = true;
+        self.status = format!("Rond-point ({}) de {radius:.0} m de rayon posé{} : sens unique, sens inverse des aiguilles d'une montre. Trace des routes jusqu'à l'anneau pour les y brancher.", k.name, if nj > 0 { format!(", {nj} carrefour(s) avec les routes qu'il croise") } else { String::new() });
     }
 
     fn push_undo_terrain(&mut self) {
@@ -1065,6 +1623,38 @@ impl DwApp {
     pub fn draw_terrain_brush(&self, painter: &egui::Painter, hover: Option<Pos2>) {
         let (Some(p), Some(t)) = (hover, self.proj.terrain.as_ref()) else { return };
         let Some(c) = self.terrain_ground(p) else { return };
+        if self.terrain.brush == Brush::Clip {
+            self.draw_clip(painter, c);
+            return;
+        }
+        if self.terrain.brush == Brush::Road && self.terrain.road_edit.is_some() {
+            let Some(r) = self.terrain.road_edit.and_then(|i| t.roads.get(i)) else { return };
+            let drag = self.terrain.edit_drag;
+            let pts: Vec<[f32; 2]> = r.pts.iter().enumerate().map(|(k, p)| match drag {
+                Some((dk, q)) if dk == k && !r.ring => [q.x, q.y],
+                _ => *p,
+            }).collect();
+            let hz = |x: f32, y: f32| t.height_at(x, y).unwrap_or(c.z) + 0.3;
+            if !r.ring {
+                let curve = crate::roads::spline(&pts, 2.0);
+                let line: Vec<Pos2> = curve.iter().filter_map(|p| self.cam.project(v3(p[0], p[1], hz(p[0], p[1]))).map(|q| q.0)).collect();
+                painter.add(egui::Shape::line(line, egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 210, 60))));
+            }
+            for (k, p) in pts.iter().enumerate() {
+                if let Some((q, _)) = self.cam.project(v3(p[0], p[1], hz(p[0], p[1]))) {
+                    let on = drag.map(|d| d.0 == k).unwrap_or(false);
+                    painter.circle_filled(q, if on { 8.0 } else { 6.5 }, Color32::from_rgb(255, 150, 50));
+                    painter.circle_stroke(q, if on { 8.0 } else { 6.5 }, egui::Stroke::new(1.5_f32, Color32::WHITE));
+                }
+            }
+            if let (true, Some((k, q))) = (r.ring, drag) {
+                if let Some((s, _)) = self.cam.project(v3(q.x, q.y, hz(q.x, q.y))) {
+                    let _ = k;
+                    painter.circle_stroke(s, 10.0, egui::Stroke::new(2.0_f32, Color32::from_rgb(90, 220, 255)));
+                }
+            }
+            return;
+        }
         if self.terrain.brush == Brush::Road {
             // aperçu : courbe passant par les points cliqués et la souris, à la largeur de la route
             let snap = self.road_snap(c);
@@ -1074,6 +1664,21 @@ impl DwApp {
                     painter.circle_stroke(sp, 9.0, egui::Stroke::new(2.5_f32, if end { Color32::from_rgb(90, 220, 255) } else { Color32::from_rgb(120, 255, 140) }));
                     painter.text(sp + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, if end { "relier au bout" } else { "carrefour" }, egui::FontId::proportional(12.0), Color32::WHITE);
                 }
+            }
+            if self.terrain.road_ring {
+                let k = &crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)];
+                let rr = self.terrain.ring_radius.max(k.width * 0.5 + k.sidewalk.max(k.shoulder) + 4.0);
+                for (off, col) in [(-k.width * 0.5, Color32::WHITE), (0.0, Color32::from_rgb(255, 210, 60)), (k.width * 0.5, Color32::WHITE)] {
+                    let line: Vec<Pos2> = (0..=72)
+                        .filter_map(|i| {
+                            let a = i as f32 / 72.0 * std::f32::consts::TAU;
+                            let (x, y) = (c.x + (rr + off) * a.cos(), c.y + (rr + off) * a.sin());
+                            self.cam.project(v3(x, y, t.height_at(x, y).unwrap_or(c.z) + 0.3)).map(|q| q.0)
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8_f32, col)));
+                }
+                return;
             }
             let mut pts: Vec<[f32; 2]> = self.terrain.road_pts.iter().map(|p| [p.x, p.y]).collect();
             pts.push([c.x, c.y]);
@@ -1256,8 +1861,9 @@ impl DwApp {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Peindre selon le relief").on_hover_text("Plages au bord de l'eau, roche sur les pentes, herbe ou sable ailleurs").clicked() {
                     self.push_undo();
-                    let style = PRESETS[self.terrain.preset as usize].2;
                     if let Some(t) = self.proj.terrain.as_mut() {
+                        // style d'après le sol réel du terrain (voir dominant_style)
+                        let style = t.dominant_style();
                         t.auto_paint(style);
                     }
                     self.terrain.dirty = true;
@@ -1265,10 +1871,23 @@ impl DwApp {
                 if ui.button("Tout aplanir").clicked() {
                     self.push_undo();
                     let h0 = self.terrain.new_height;
+                    // les routes partent avec tout ce qui va avec : carrefours, lampadaires, feux et panneaux, peinture
+                    // « Route » du sol (matériau d'avant remis) et trous des entrées de tunnel
+                    let mut gone: std::collections::HashSet<u64> = std::collections::HashSet::new();
                     if let Some(t) = self.proj.terrain.as_mut() {
                         std::sync::Arc::make_mut(&mut t.h).iter_mut().for_each(|v| *v = h0);
+                        gone.extend(t.roads.iter().flat_map(|r| r.props.iter().copied()));
+                        gone.extend(t.junctions.iter().flat_map(|j| j.props.iter().copied()));
                         t.roads.clear();
+                        t.junctions.clear();
+                        t.repaint_roads();
+                        t.refresh_holes();
                     }
+                    if !gone.is_empty() {
+                        self.proj.delete_ids(&gone);
+                    }
+                    self.terrain.road_edit = None;
+                    self.clean_selection();
                     self.terrain.dirty = true;
                 }
                 if ui.button("Supprimer le terrain").clicked() {
@@ -1318,6 +1937,7 @@ impl DwApp {
             }
         });
         ui.label(RichText::new("Glisser dans la vue pour sculpter · Ctrl+Z annule un coup de pinceau").small().weak());
+        self.clip_ui(ui);
     }
 
     fn terrain_ui_paint(&mut self, ui: &mut egui::Ui) {
@@ -1332,10 +1952,15 @@ impl DwApp {
         });
         self.brush_sliders(ui, false);
         self.game_textures_toggle(ui);
-        if ui.button("Peindre tout selon le relief").clicked() {
+        if ui
+            .button("Peindre tout selon le relief")
+            .on_hover_text("Sable, terre, herbe et roche d'après la hauteur et la pente. Le style suit le sol actuel du terrain : désert (sable, terre, roche) si le sable domine, sinon vert (herbe, terre, roche). Béton, goudron et routes sont gardés.")
+            .clicked()
+        {
             self.push_undo();
-            let style = PRESETS[self.terrain.preset as usize].2;
             if let Some(t) = self.proj.terrain.as_mut() {
+                // style d'après le sol réel du terrain (avant : le modèle choisi dans « Créer », sans rapport)
+                let style = t.dominant_style();
                 t.auto_paint(style);
             }
             self.terrain.dirty = true;
@@ -1380,7 +2005,60 @@ impl DwApp {
                 self.set_terrain_brush(Brush::Road);
             }
         }
-        ui.label(RichText::new("Relier : un point posé près du bout d'une route s'y accroche (cercle bleu) ; sur une route, il fait un carrefour (cercle vert). Une route qui en croise une autre fait aussi un carrefour.").small());
+        let foot = crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)].foot;
+        ui.add_space(4.0);
+        if foot {
+            ui.label(RichText::new("Passerelle : toujours un pont, à hauteur fixe (5,3 m libres au-dessus des routes croisées, 2,5 m au-dessus du sol), avec un escalier à chaque bout, posé au-delà des points cliqués. Pas de voitures ni de carrefour.").small());
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Tracé :");
+                let mode = if self.terrain.road_bridge { 1 } else if self.terrain.road_tunnel { 2 } else { 0 };
+                if ui.selectable_label(mode == 0, "Au sol").on_hover_text("La route suit le terrain et l'aplanit dessous.").clicked() {
+                    self.terrain.road_bridge = false;
+                    self.terrain.road_tunnel = false;
+                }
+                if ui.selectable_label(mode == 2, "Tunnel").on_hover_text("La route va en ligne droite (en hauteur) d'un bout à l'autre, sous les reliefs. Là où il y a plus de 8 m de terrain au-dessus d'elle, elle passe dans un tunnel : tube en béton de 6 m de haut, bandes lumineuses et vraies lumières au plafond tous les 12 m, façade à chaque entrée. Le terrain est ouvert à l'entrée, jamais au-dessus.").clicked() {
+                    self.terrain.road_bridge = false;
+                    self.terrain.road_tunnel = true;
+                }
+                let _ = mode;
+            });
+            ui.add_enabled_ui(true, |ui| {
+                let resp = ui.checkbox(&mut self.terrain.road_bridge, "Pont / viaduc");
+                if resp.changed() && self.terrain.road_bridge {
+                    self.terrain.road_tunnel = false;
+                }
+                resp.on_hover_text(
+                    "La route ne descend plus dans les creux : elle va en ligne droite d'un bout à l'autre et passe au-dessus des routes qu'elle croise (5,3 m libres dessous), avec des rampes à la pente choisie. Là où elle est à plus de 2,5 m du sol, elle devient un pont : tablier en béton, garde-corps, piles tous les 30 m et murs aux deux bouts ; le terrain dessous n'est pas aplani.",
+                );
+            });
+            let mut pct = self.terrain.road_grade * 100.0;
+            if ui
+                .add(egui::Slider::new(&mut pct, crate::roads::GRADE_MIN * 100.0..=crate::roads::GRADE_MAX * 100.0).step_by(1.0).suffix(" %").text("pente maximale"))
+                .on_hover_text("Pente la plus forte permise sur la prochaine route. 12 % par défaut ; jusqu'à 25 % pour une route de montagne. Plus elle est faible, plus les rampes d'un pont sont longues (6,7 m à monter : 56 m à 12 %).")
+                .changed()
+            {
+                self.terrain.road_grade = pct / 100.0;
+            }
+        }
+        if !foot {
+            ui.horizontal(|ui| {
+                let k = &crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)];
+                ui.add_enabled_ui(!k.ramp, |ui| {
+                    if ui.toggle_value(&mut self.terrain.road_ring, "Rond-point").on_hover_text("Un clic pose un rond-point du type choisi, centré sous la souris : anneau à sens unique (sens inverse des aiguilles d'une montre), îlot central en herbe, sans feux. Trace ensuite des routes jusqu'à l'anneau pour les brancher.").changed() {
+                        self.terrain.road_pts.clear();
+                        self.set_terrain_brush(Brush::Road);
+                    }
+                });
+                if self.terrain.road_ring {
+                    ui.add(egui::Slider::new(&mut self.terrain.ring_radius, 12.0..=45.0).step_by(1.0).suffix(" m").text("rayon"));
+                }
+            });
+        }
+        if crate::roads::KINDS[(self.terrain.road_kind as usize).min(crate::roads::KINDS.len() - 1)].ramp {
+            ui.label(RichText::new("Bretelle : sens unique dans le sens du tracé. Pour une entrée, commence sur la route locale et finis sur l'autoroute ; pour une sortie, l'inverse. Un point posé sur une autoroute se met sur sa voie de droite (ou de gauche, selon le côté du clic) et la bretelle s'y fond, sans carrefour.").small());
+        }
+        ui.label(RichText::new("Relier : un point posé près du bout d'une route s'y accroche (cercle bleu) ; sur une route, il fait un carrefour (cercle vert). Une route qui en croise une autre fait aussi un carrefour, sauf si l'une passe au-dessus de l'autre (pont).").small());
         ui.add_space(4.0);
         ui.label(RichText::new("Clic : poser un point · double-clic ou Entrée : construire · Retour arrière : enlever le dernier point · Échap : annuler").small());
         let n = self.terrain.road_pts.len();
@@ -1399,7 +2077,30 @@ impl DwApp {
             let mut del: Option<usize> = None;
             let mut goto: Option<V3> = None;
             let mut traffic_edit: Option<(usize, crate::roads::RoadTraffic)> = None;
+            let mut furn_edit: Option<(usize, crate::roads::Furniture)> = None;
+            let mut edit_toggle: Option<usize> = None;
+            let mut road_change: Option<(usize, u8, f32, u8)> = None;
             for (i, r) in t.roads.iter().enumerate() {
+                // nom de la route d'abord, puis ses replis « Circulation » et « Équipements »
+                ui.horizontal(|ui| {
+                    let b = r.bridge_len();
+                    if b > 0.0 && !r.kind().foot {
+                        ui.label(format!("{} · {:.0} m, dont {:.0} m en pont", r.kind().name, r.length(), b));
+                    } else {
+                        ui.label(format!("{} · {:.0} m", r.kind().name, r.length()));
+                    }
+                    if ui.small_button("Aller voir").clicked() {
+                        let m = r.samples[r.samples.len() / 2];
+                        goto = Some(v3(m[0], m[1], m[2]));
+                    }
+                    let editing = self.terrain.road_edit == Some(i);
+                    if ui.selectable_label(editing, "Modifier").on_hover_text("Poignées sur les points de la route : glisser un point pour le déplacer, double-clic sur la route pour ajouter un point, clic droit sur un point pour le retirer. Type, pente et tracé se changent ici. Toutes les routes sont refaites autour.").clicked() {
+                        edit_toggle = Some(i);
+                    }
+                    if ui.small_button("Supprimer").on_hover_text("Retire la route, ses lampadaires et la peinture du sol dessous (le terrain reste aplani) ; les trottoirs des autres routes se referment").clicked() {
+                        del = Some(i);
+                    }
+                });
                 egui::CollapsingHeader::new(RichText::new("Circulation").small()).id_salt(("road_traffic", i)).show(ui, |ui| {
                     let mut tr = r.traffic.clone();
                     let mut ch = ui.checkbox(&mut tr.enabled, "Voitures sur cette route").changed();
@@ -1414,42 +2115,100 @@ impl DwApp {
                         traffic_edit = Some((i, tr));
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} · {:.0} m", r.kind().name, r.length()));
-                    if ui.small_button("Aller voir").clicked() {
-                        let m = r.samples[r.samples.len() / 2];
-                        goto = Some(v3(m[0], m[1], m[2]));
-                    }
-                    if ui.small_button("Supprimer").on_hover_text("Retire la route (le terrain reste aplani)").clicked() {
-                        del = Some(i);
+                egui::CollapsingHeader::new(RichText::new("Équipements").small()).id_salt(("road_furn", i)).show(ui, |ui| {
+                    let mut f = r.furniture;
+                    let k = r.kind();
+                    let mut ch = ui.add_enabled(!k.foot && !k.dirt, egui::Checkbox::new(&mut f.lights, "Lampadaires")).on_hover_text("Vrais lampadaires du jeu (prop_streetlight_01, à deux bras prop_streetlight_03d sur le terre-plein d'une autoroute), environ tous les 30 m, jamais dans un carrefour ni dans un tunnel. Ce sont des objets normaux : tu peux les déplacer ou les supprimer.").changed();
+                    ch |= ui.add_enabled(k.sidewalk <= 0.0 && !k.foot, egui::Checkbox::new(&mut f.rails, "Glissières")).on_hover_text("Glissières de sécurité en acier le long des deux bords (routes sans trottoir), ouvertes aux carrefours, pas sur les ponts (garde-corps) ni dans les tunnels.").changed();
+                    ch |= ui.add_enabled(!k.foot && !k.dirt, egui::Checkbox::new(&mut f.decals, "Fissures, taches, rustines")).on_hover_text("Décalques posés au hasard sur la chaussée (toujours les mêmes pour cette route), pour qu'elle ait l'air moins neuve. Pas dans les carrefours.").changed();
+                    if ch {
+                        furn_edit = Some((i, f));
                     }
                 });
+                if self.terrain.road_edit == Some(i) {
+                    egui::Frame::new().fill(Color32::from_rgb(40, 34, 26)).corner_radius(4.0).inner_margin(4.0).show(ui, |ui| {
+                        let mut kind = r.kind;
+                        let mut grade = r.grade * 100.0;
+                        let mut mode = if r.elevated && !r.kind().foot { 1 } else if r.buried { 2 } else { 0 };
+                        let mut ch = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Type :");
+                            egui::ComboBox::from_id_salt(("road_kind_edit", i)).selected_text(crate::roads::KINDS[kind as usize].name).show_ui(ui, |ui| {
+                                for (k, kd) in crate::roads::KINDS.iter().enumerate() {
+                                    // un rond-point garde un type de route ordinaire
+                                    if r.ring && (kd.foot || kd.ramp) {
+                                        continue;
+                                    }
+                                    ch |= ui.selectable_value(&mut kind, k as u8, kd.name).changed();
+                                }
+                            });
+                        });
+                        if !r.ring && !r.kind().foot {
+                            ui.horizontal(|ui| {
+                                ui.label("Tracé :");
+                                for (m, n) in [(0, "Au sol"), (1, "Pont"), (2, "Tunnel")] {
+                                    ch |= ui.selectable_value(&mut mode, m, n).changed();
+                                }
+                            });
+                            ch |= ui.add(egui::Slider::new(&mut grade, crate::roads::GRADE_MIN * 100.0..=crate::roads::GRADE_MAX * 100.0).step_by(1.0).suffix(" %").text("pente maximale")).drag_stopped();
+                        }
+                        ui.label(RichText::new(format!("{} points · glisser une poignée orange dans la vue pour déplacer un point ; double-clic sur la route : ajouter un point ; clic droit sur un point : le retirer{}.", r.pts.len(), if r.ring { " (rond-point : le déplacer en entier)" } else { "" })).small());
+                        if ch {
+                            road_change = Some((i, kind, grade / 100.0, mode));
+                        }
+                    });
+                }
             }
             if let Some((i, tr)) = traffic_edit {
                 if let Some(t) = self.proj.terrain.as_mut() {
                     t.roads[i].traffic = tr;
                 }
             }
+            if let Some(i) = edit_toggle {
+                self.terrain.road_edit = if self.terrain.road_edit == Some(i) { None } else { Some(i) };
+                self.terrain.edit_drag = None;
+                self.terrain.road_pts.clear();
+                self.terrain.road_ring = false;
+                if self.terrain.road_edit.is_some() {
+                    self.set_terrain_brush(Brush::Road);
+                    self.terrain.road_edit = Some(i);
+                }
+            }
+            if let Some((i, kind, grade, mode)) = road_change {
+                self.push_undo();
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    let r = &mut t.roads[i];
+                    let kd = &crate::roads::KINDS[kind as usize];
+                    if r.kind != kind {
+                        r.kind = kind;
+                        r.furniture = crate::roads::Furniture::for_kind(kd);
+                        r.oneway = kd.ramp || r.ring;
+                        r.traffic.enabled = !kd.foot;
+                        r.taper = None;
+                    }
+                    r.grade = grade;
+                    r.elevated = kd.foot || mode == 1;
+                    r.buried = mode == 2 && !kd.foot;
+                }
+                self.rebuild_road_network(&[i]);
+                self.status = "Route modifiée : le réseau a été refait autour.".into();
+            }
+            if let Some((i, f)) = furn_edit {
+                self.push_undo();
+                if let Some(t) = self.proj.terrain.as_mut() {
+                    t.roads[i].furniture = f;
+                }
+                self.refresh_furniture();
+                self.terrain.dirty = true;
+            }
             if let Some(i) = del {
                 self.push_undo();
-                let mut gone: std::collections::HashSet<u64> = std::collections::HashSet::new();
-                if let Some(t) = self.proj.terrain.as_mut() {
-                    let r = t.roads.remove(i);
-                    t.junctions.retain(|j| {
-                        let keep = r.nearest(j.pos[0], j.pos[1]).map(|(d, _)| d > 1.0).unwrap_or(true);
-                        if !keep {
-                            gone.extend(j.props.iter().copied());
-                        }
-                        keep
-                    });
-                }
-                // les feux et panneaux de ses carrefours partent avec elle
-                if !gone.is_empty() {
-                    self.proj.delete_ids(&gone);
-                    self.clean_selection();
-                    self.sync_game_project();
-                }
-                self.terrain.dirty = true;
+                // ses lampadaires partent avec elle ; le réseau est refait sans elle (trottoirs des autres routes
+                // refermés, carrefours, feux et peinture du sol à jour)
+                let gone: std::collections::HashSet<u64> = self.proj.terrain.as_mut().map(|t| t.roads.remove(i).props.into_iter().collect()).unwrap_or_default();
+                self.terrain.road_edit = None;
+                self.proj.delete_ids(&gone);
+                self.rebuild_road_network(&[]);
             }
             if let Some(p) = goto {
                 self.cam.target = p;
@@ -1599,7 +2358,7 @@ fn collision_types(w: Option<&crate::gta::world::GameWorld>) -> [u32; 7] {
 }
 
 /// Index d'un type de surface de collision par son nom (materials.dat), sinon `fallback`.
-fn coll_type(names: &[String], name: &str, fallback: u32) -> u32 {
+pub fn coll_type(names: &[String], name: &str, fallback: u32) -> u32 {
     names.iter().position(|x| x == name).map(|k| k as u32).unwrap_or(fallback)
 }
 
@@ -1762,8 +2521,12 @@ impl Terrain {
                     }
                 }
                 let verts = rel;
+                let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
                 for j in j0..j1 {
                     for i in i0..i1 {
+                        if holes.contains(&((j * (self.nx - 1) + i) as u32)) {
+                            continue;
+                        }
                         let g = (self.grass_at(i, j) as usize).min(pids.len().saturating_sub(1));
                         let m = (self.mat[j * (self.nx - 1) + i] as usize).min(6) + g * 7;
                         used[m % 7] = true;
@@ -1928,7 +2691,7 @@ impl DwApp {
                     let (pos, uv, parts) = r.mesh(anchor);
                     // collision : chaussée, trottoirs, accotements (types de surface lus dans materials.dat)
                     let shoulder = COLL_NAMES[(k.shoulder_mat as usize).min(COLL_NAMES.len() - 1)];
-                    let ctypes = [coll_type(&names, k.coll, if k.dirt { 35 } else { 4 }), coll_type(&names, "PAVING_SLAB", coll_type(&names, "CONCRETE", 1)), coll_type(&names, shoulder, 1)];
+                    let ctypes = [coll_type(&names, k.coll, if k.dirt { 35 } else { 4 }), coll_type(&names, "PAVING_SLAB", coll_type(&names, "CONCRETE", 1)), coll_type(&names, shoulder, 1), coll_type(&names, "CONCRETE", 1), coll_type(&names, "METAL_SOLID_SMALL", coll_type(&names, "CONCRETE", 1)), coll_type(&names, "GRASS", 1)];
                     (anchor, pos, uv, parts, ctypes)
                 }
                 None => {
@@ -1944,7 +2707,7 @@ impl DwApp {
                         }
                     }
                     let tar = coll_type(&names, "TARMAC", 4);
-                    (anchor, pos, uv, parts, [tar, tar, tar])
+                    (anchor, pos, uv, parts, [tar, tar, tar, tar, tar, tar])
                 }
             };
             let texs: Vec<(u64, TexData)> = (0..MATERIALS.len()).map(|m| (material_key(m), material_texture(m))).chain(crate::roads::road_textures()).collect();
@@ -1952,6 +2715,13 @@ impl DwApp {
             append_mesh(&mut verts, &mut idx, &mut geoms, &mut keys, &texs, &pos, &uv, &parts);
             let model = RModel { verts, idx, geoms, embedded_dict: None };
             let pieces = write_split(stream, name, &model, &keys, &texs, txd)?;
+            // tunnels : vraies lumières au plafond, dans le modèle de la route (partie à textures DragoWalker)
+            if let Some(r) = rr {
+                let lights: Vec<crate::lights::Light> = r.tunnel_lights().into_iter().map(|p| crate::lights::Light { pos: p - anchor, falloff: crate::roads::TUNNEL_LIGHT_STEP + 4.0 }).collect();
+                if !lights.is_empty() && pieces.iter().any(|(n, _)| n == name) {
+                    crate::lights::add_lights_to_ydr_xml(&stream.join(format!("{name}.ydr.xml")), &lights)?;
+                }
+            }
             let world: Vec<V3> = pos.iter().map(|p| *p + anchor).collect();
             let mut tris = Vec::new();
             for (_, list, m) in &parts {
@@ -1984,7 +2754,7 @@ impl DwApp {
         }
         let mut fx_n = 0u32;
         let before = tiles;
-        let (fx_archs, fx_ents, fx_ext) = self.export_scenery(stream, &mut tiles)?;
+        let (fx_archs, fx_ents, fx_ext, water_skipped) = self.export_scenery(stream, &mut tiles)?;
         fx_n += tiles - before;
         tiles = before;
         archs.extend(fx_archs);
@@ -2026,7 +2796,11 @@ impl DwApp {
                 (t.nx - 1) as f32 * t.cell,
                 (t.ny - 1) as f32 * t.cell,
                 t.waters.len()
-            ),
+            ) + if water_skipped {
+                " EAU NON EXPORTÉE : le jeu n'est pas chargé, son water.xml (océan, lacs) est introuvable ; un water.xml avec seulement tes zones ferait disparaître l'océan en jeu. Charge le jeu puis exporte à nouveau."
+            } else {
+                ""
+            },
             "dw_terrain_types".to_string(),
         ])
     }
@@ -2056,6 +2830,14 @@ mod tests {
         let (parent, kept) = pair_lod_pieces(&hd, &[]);
         assert_eq!(parent, vec![None, None]);
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn style_d_apres_le_sol() {
+        // sable au-dessus de la mer → désert ; herbe → vert ; sable sous 1,6 m (plage, fond) ne compte pas
+        assert_eq!(Terrain::new(V3::ZERO, 64.0, 10.0, 0).dominant_style(), 1);
+        assert_eq!(Terrain::new(V3::ZERO, 64.0, 10.0, 2).dominant_style(), 0);
+        assert_eq!(Terrain::new(V3::ZERO, 64.0, 0.0, 0).dominant_style(), 0);
     }
 
     #[test]

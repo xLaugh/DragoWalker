@@ -48,14 +48,20 @@ impl DwApp {
                 format!("{n} × {archetype} posé(s).")
             }
             Action::DeleteRadius { radius, filter } => {
-                let ids: HashSet<u64> = self.items_in_radius(c, *radius, filter, true).into_iter().collect();
-                if ids.is_empty() {
+                let mut ids: HashSet<u64> = self.items_in_radius(c, *radius, filter, true).into_iter().filter(|id| !self.game.hidden_ids.contains(id)).collect();
+                // objets du jeu visibles aussi (comme la Gomme) ; sans nom de modèle, les gros (bâtiments, ponts…
+                // plus de 20 m) sont épargnés
+                let game = self.game_visible_matching(c, radius.max(0.1), filter, filter.trim().is_empty());
+                if ids.is_empty() && game.is_empty() {
                     return "Rien à supprimer dans cette zone.".into();
                 }
                 self.push_undo();
+                if !game.is_empty() {
+                    ids.extend(self.game_ents_to_project(&game));
+                }
                 let n = self.proj.delete_ids(&ids);
                 self.clean_selection();
-                format!("{n} objet(s) supprimé(s) dans un rayon de {radius} m.")
+                format!("{n} objet(s) supprimé(s) dans un rayon de {radius} m{}.", if game.is_empty() { "" } else { " (objets du jeu compris)" })
             }
             Action::DeleteSelection => {
                 let n = self.selected.len();
@@ -63,7 +69,21 @@ impl DwApp {
                 format!("{n} objet(s) supprimé(s).")
             }
             Action::Select { filter, radius } => {
-                let n = self.select_filtered(filter, *radius);
+                let mut n = self.select_filtered(filter, *radius);
+                // objets du jeu visibles portant ce nom : copiés dans le projet (leur carte .ymap, comme un clic
+                // dessus) puis sélectionnés. Seulement avec un nom de modèle, et pas plus de GAME_SELECT_MAX
+                // d'un coup (chaque carte touchée est copiée dans le projet)
+                const GAME_SELECT_MAX: usize = 300;
+                let game = if filter.trim().is_empty() { Vec::new() } else { self.game_visible_matching(c, *radius, filter, false) };
+                if game.len() > GAME_SELECT_MAX {
+                    return format!("{n} objet(s) du projet sélectionné(s) ; {} objets du jeu correspondent, trop pour les prendre d'un coup (au plus {GAME_SELECT_MAX}) : précise le nom ou réduis le rayon.", game.len());
+                }
+                if !game.is_empty() {
+                    self.push_undo();
+                    let ids = self.game_ents_to_project(&game);
+                    n += ids.len();
+                    self.add_selection(ids);
+                }
                 format!("{n} objet(s) sélectionné(s).")
             }
             Action::ClearSelection => {

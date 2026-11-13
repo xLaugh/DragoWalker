@@ -3,7 +3,7 @@
 use crate::ai::Action;
 use crate::app::{save_api_key, DwApp, Tab, Tool};
 use crate::catalog;
-use crate::math::{v3, Quat, V3};
+use crate::math::{v3, V3};
 use crate::mech;
 use crate::model::{self, ItemRef, Project, Ymap, Ytyp};
 use crate::sample;
@@ -238,7 +238,7 @@ impl DwApp {
                 ui.label(crate::i18n::t("G / R / T : poignées · Flèches : bouger la sélection · [ ] : tourner de 15°"));
                 ui.label(crate::i18n::t("Ctrl+C / Ctrl+V / Ctrl+X : copier, coller (devant la caméra, comme CodeWalker), couper"));
                 ui.label(crate::i18n::t("Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+Z / Ctrl+Y · Ctrl+U : panneaux"));
-                ui.label(crate::i18n::t("Terrain : F2–F9 pinceaux · + / - rayon · Entrée : construire la route"));
+                ui.label(crate::i18n::t("Terrain : F2–F11 pinceaux · + / - rayon · Entrée : construire la route"));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(crate::i18n::t("DragoWalker")).strong().color(Color32::from_rgb(255, 150, 50)));
@@ -391,7 +391,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![] };
+        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -483,6 +483,9 @@ impl DwApp {
             if ui.selectable_label(self.buildings.open, RichText::new(crate::i18n::t("Bâtiments")).size(15.0)).on_hover_text(crate::i18n::t("Bâtiments du jeu : les copier pour les poser ailleurs, sur une carte custom (N)")).clicked() {
                 self.buildings.open = !self.buildings.open;
             }
+            if ui.selectable_label(self.atelier.open, RichText::new(crate::i18n::t("Atelier")).size(15.0)).on_hover_text(crate::i18n::t("Atelier de bâtiment : tracer l'emprise au sol, choisir les étages, le toit et la façade ; modèle, collision, version lointaine et fenêtres éclairées la nuit faits par DragoWalker")).clicked() {
+                self.atelier.open = !self.atelier.open;
+            }
             if ui.selectable_label(self.groups_open, RichText::new(crate::i18n::t("Groupes")).size(15.0)).on_hover_text(crate::i18n::t("Tes groupes d'objets : les poser à la souris (molette = tourner, Maj + molette = quart de tour)")).clicked() {
                 self.groups_open = !self.groups_open;
             }
@@ -506,7 +509,7 @@ impl DwApp {
             // poignées dans la vue, comme le widget de CodeWalker
             for (mode, label, tip) in [
                 (crate::gizmo::GizmoMode::Move, crate::i18n::t("Déplacer"), crate::i18n::t("Flèches pour déplacer la sélection le long d'un axe (G)")),
-                (crate::gizmo::GizmoMode::Rotate, crate::i18n::t("Tourner"), crate::i18n::t("Anneaux pour tourner la sélection, par pas de 5° avec la grille (R ou E)")),
+                (crate::gizmo::GizmoMode::Rotate, crate::i18n::t("Tourner"), crate::i18n::t("Anneaux pour tourner la sélection, par pas de 5° avec « Aimanter » (R ou E)")),
                 (crate::gizmo::GizmoMode::Scale, crate::i18n::t("Agrandir"), crate::i18n::t("Carrés pour changer la taille ; carré du centre = partout (T)")),
             ] {
                 if ui.selectable_label(self.gizmo_mode == mode, label).on_hover_text(tip).clicked() {
@@ -520,7 +523,7 @@ impl DwApp {
             if ui.button(vlabel).on_hover_text(crate::i18n::t("Changer de vue (M)")).clicked() {
                 self.cam.map_view = !self.cam.map_view;
             }
-            ui.checkbox(&mut self.snap, crate::i18n::t("Grille")).on_hover_text(crate::i18n::t("Aligner les positions sur une grille"));
+            ui.checkbox(&mut self.snap, crate::i18n::t("Aimanter")).on_hover_text(crate::i18n::t("Aligner les positions sur un pas fixe (sans rapport avec Affichage → Grille, qui ne fait que dessiner)"));
             if self.snap {
                 ui.add(egui::DragValue::new(&mut self.snap_size).range(0.1..=50.0).speed(0.1).suffix(crate::i18n::t(" m")));
             }
@@ -807,7 +810,8 @@ impl DwApp {
         });
         if let Some(first) = self.selected.first().and_then(|id| self.proj.find_id(*id)).and_then(|r| self.proj.ent(r)).map(|e| e.archetype.clone()) {
             if ui.button(format!("Sélectionner tous les « {first} »")).on_hover_text("Prendre tous les objets du même modèle d'un coup").clicked() {
-                let n = self.select_filtered(&first, 0.0);
+                // nom exact : « prop_bench_01 » ne prend pas « prop_bench_01a »
+                let n = self.select_matching(&first, 0.0, true);
                 self.status = format!("{n} « {first} » sélectionné(s).");
             }
         }
@@ -846,7 +850,8 @@ impl DwApp {
             ui.label("Cap (°)");
             let mut h = e.rot.heading_deg();
             if ui.add(egui::DragValue::new(&mut h).speed(1.0).range(0.0..=360.0)).changed() {
-                e.rot = Quat::from_z(h.to_radians());
+                // seul le cap change : l'inclinaison X/Y de l'objet est gardée
+                e.rot = e.rot.with_heading_deg(h);
             }
             ui.end_row();
             ui.label("Échelle XY / Z");
@@ -1029,7 +1034,7 @@ impl DwApp {
             ui.label("Seulement");
             ui.add(egui::TextEdit::singleline(&mut self.erase_filter).hint_text("vide = tout").desired_width(150.0));
         });
-        ui.checkbox(&mut self.erase_buildings, "Gommer aussi les bâtiments");
+        ui.checkbox(&mut self.erase_buildings, "Gommer aussi les gros objets (bâtiments…)").on_hover_text("Décochée, la gomme épargne les bâtiments créés dans DragoWalker et les objets du jeu de plus de 20 m (bâtiments, ponts, gros rochers…). Les objets cachés (H) ne sont jamais gommés.");
     }
 
     /// Intérieurs du jeu proches de la vue : choisir leurs variantes (groupes d'objets).
@@ -1079,6 +1084,8 @@ impl DwApp {
         }
         ui.label(RichText::new("Coche les groupes d'objets à montrer (décor, meubles, travaux...). Le fichier de la carte est copié dans le projet et exporté avec ton choix.").weak().small());
         let mut change: Option<(usize, usize, u32, bool)> = None;
+        // libellé lisible de la variante changée (objets qu'elle contient), pour la barre d'état
+        let mut change_label: Option<String> = None;
         for (ei, yi, li, name, d, sets, game_defaults) in &near {
             let (names, ymap_name) = {
                 let w = self.game.world.as_ref().unwrap();
@@ -1112,6 +1119,7 @@ impl DwApp {
                     let mut on = active.contains(h) || active.contains(&(si as u32));
                     if ui.checkbox(&mut on, format!("Variante {} · {}", si + 1, names[si])).changed() {
                         change = Some((*yi, *li, *h, on));
+                        change_label = Some(format!("{} · {}", si + 1, names[si]));
                     }
                 }
             });
@@ -1140,7 +1148,8 @@ impl DwApp {
                         }
                     }
                 }
-                self.status = format!("Variante « {set_name} » {}.", if on { "affichée" } else { "cachée" });
+                let shown = change_label.clone().unwrap_or_else(|| set_name.clone());
+                self.status = format!("Variante {shown} {}.", if on { "affichée" } else { "cachée" });
             }
         }
         ui.separator();
@@ -1168,7 +1177,7 @@ impl DwApp {
         {
             self.status = self.convert_to_interior();
         }
-        ui.label(RichText::new("La coque du bâtiment reste fermée dans le jeu : l'ouvrir et créer les sols où l'on marche passera par Blender et Sollumz (pas encore fait).").weak().small());
+        ui.label(RichText::new("« Transformer en intérieur » ouvre l'entrée dans la façade et donne à chaque pièce sa coque (sol, murs, plafond) et sa collision. Pour d'autres portes ou fenêtres : onglet « Percer des ouvertures ».").weak().small());
         let mut cut_to: Option<f32> = None;
         let mut rooms_for: Option<usize> = None;
         if let Some(a) = self.game.analysis.as_mut() {
@@ -1390,6 +1399,7 @@ impl DwApp {
                 changed = true;
             }
         }
+        self.plan_ui(ui);
         ui.separator();
         ui.label(RichText::new("Meubler automatiquement").strong());
         let mut furnish = None;
@@ -1568,7 +1578,7 @@ impl DwApp {
 
     fn options_tab(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Assistant IA").strong());
-        ui.label(RichText::new(format!("Moteur : {} — à changer dans l'onglet IA.", self.ai_provider.label())).small());
+        ui.label(RichText::new(format!("Moteur : {} — à changer dans la fenêtre Assistant IA (repli « Réglages de l'IA »).", self.ai_provider.label())).small());
         ui.separator();
         ui.label(RichText::new("Caméra").strong());
         ui.horizontal(|ui| {

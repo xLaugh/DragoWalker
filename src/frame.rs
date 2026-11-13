@@ -24,6 +24,7 @@ impl DwApp {
         self.cuts_tick();
         self.mlo_link_tick();
         self.shells_tick();
+        self.houses_tick();
         self.server_tick(ctx);
         // capture automatique : attendre la fin du chargement du jeu (au plus ~90 s)
         if self.shot_path.is_some() && self.game.loading.is_some() && self.frame > 2 && self.frame < 6000 {
@@ -141,6 +142,306 @@ impl DwApp {
                         }
                         self.goto(v3(j.pos[0], j.pos[1], j.pos[2]), 55.0);
                         self.cam.target.z = j.pos[2];
+                        self.cam.snap();
+                    }
+                }
+                // DW_TEST_ROADS2=n : 1 tunnel sous une colline, 2 rond-point et 4 routes, 3 avenue prolongée par une rue
+                // (raccord), 4 autoroute et bretelle, 5 route de campagne supprimée (peinture du sol effacée) ;
+                // DW_TEST_ROADS2_LOOK="x,y,dist,yaw,pitch" (décalage depuis le centre)
+                if let Some(mode) = std::env::var("DW_TEST_ROADS2").ok().and_then(|v| v.parse::<u8>().ok()) {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    let road = |s: &mut DwApp, kind: u8, pts: &[V3]| {
+                        s.terrain.road_kind = kind;
+                        s.terrain.road_pts = pts.iter().map(|p| v3(p.x, p.y, h(s, p.x, p.y))).collect();
+                        // comme un clic : accroché aux routes existantes
+                        for i in [0, s.terrain.road_pts.len() - 1] {
+                            let p = s.terrain.road_pts[i];
+                            if let Some((q, _)) = s.road_snap(p) {
+                                s.terrain.road_pts[i] = q;
+                            }
+                        }
+                        s.finish_road();
+                        println!("{}", s.status);
+                    };
+                    match mode {
+                        1 => {
+                            if let Some(t) = self.proj.terrain.as_mut() {
+                                for _ in 0..40 {
+                                    t.brush(crate::terrain::Brush::Raise, c, 70.0, 6.0, 1.0, 0, 0.0);
+                                }
+                            }
+                            self.terrain.road_tunnel = true;
+                            road(self, 0, &[c + v3(-170.0, 0.0, 0.0), c + v3(170.0, 0.0, 0.0)]);
+                            self.terrain.road_tunnel = false;
+                        }
+                        2 => {
+                            self.terrain.road_kind = 0;
+                            self.terrain.ring_radius = 22.0;
+                            self.place_ring(c);
+                            println!("{}", self.status);
+                            for a in [0.0f32, 90.0, 200.0, 290.0] {
+                                let d = v3(a.to_radians().cos(), a.to_radians().sin(), 0.0);
+                                road(self, 0, &[c + d * 130.0, c + d * 22.0]);
+                            }
+                        }
+                        3 => {
+                            road(self, 1, &[c + v3(-150.0, -40.0, 0.0), c + v3(0.0, 0.0, 0.0)]);
+                            road(self, 0, &[c, c + v3(70.0, 50.0, 0.0), c + v3(150.0, 60.0, 0.0)]);
+                        }
+                        4 => {
+                            road(self, 2, &[c + v3(-200.0, 0.0, 0.0), c + v3(200.0, 0.0, 0.0)]);
+                            road(self, 0, &[c + v3(-200.0, -90.0, 0.0), c + v3(200.0, -90.0, 0.0)]);
+                            // entrée : de la rue vers l'autoroute
+                            road(self, 6, &[c + v3(-120.0, -90.0, 0.0), c + v3(-60.0, -40.0, 0.0), c + v3(10.0, -9.0, 0.0)]);
+                        }
+                        _ => {
+                            road(self, 3, &[c + v3(-150.0, -60.0, 0.0), c + v3(0.0, 20.0, 0.0), c + v3(150.0, -10.0, 0.0)]);
+                            let painted = |s: &DwApp| s.proj.terrain.as_ref().map(|t| t.mat.iter().filter(|m| **m == 6).count()).unwrap_or(0);
+                            println!("cases peintes « route » : {}", painted(self));
+                            if let Some(t) = self.proj.terrain.as_mut() {
+                                t.roads.clear();
+                                t.repaint_roads();
+                            }
+                            println!("après suppression : {}", painted(self));
+                            road(self, 3, &[c + v3(-150.0, 60.0, 0.0), c + v3(150.0, 60.0, 0.0)]);
+                        }
+                    }
+                    if let Some(t) = self.proj.terrain.as_ref() {
+                        println!("routes {}, carrefours {}, lampadaires {}, trous {}", t.roads.len(), t.junctions.len(), self.lamps_count(), t.holes.len());
+                        for r in &t.roads {
+                            println!("   {} : {:.0} m, tunnels {:?}, raccord {:?}, sens unique {}, anneau {}", r.kind().name, r.length(), r.tunnels, r.taper, r.oneway, r.ring);
+                        }
+                    }
+                    if let Some(net) = self.proj.terrain.as_ref().map(crate::traffic::build_network) {
+                        let one = net.links.iter().filter(|l| l.3 == 0).count();
+                        println!("circulation : {} points, {} liens dont {one} à sens unique", net.nodes.len(), net.links.len());
+                    }
+                    let look: Vec<f32> = std::env::var("DW_TEST_ROADS2_LOOK").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+                    let at = c + v3(look.first().copied().unwrap_or(0.0), look.get(1).copied().unwrap_or(0.0), 0.0);
+                    let at = v3(at.x, at.y, h(self, at.x, at.y));
+                    self.goto(at, look.get(2).copied().unwrap_or(90.0));
+                    if look.len() >= 5 {
+                        // 6e valeur : hauteur au-dessus de la route la plus proche (dans un tunnel)
+                        let road_z = self.proj.terrain.as_ref().and_then(|t| t.roads.iter().filter_map(|r| r.nearest(at.x, at.y)).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).map(|n| n.1));
+                        self.cam.target.z = match (look.get(5), road_z) {
+                            (Some(o), Some(z)) => z + o,
+                            _ => at.z + 3.0,
+                        };
+                        self.cam.yaw = look[3];
+                        self.cam.pitch = look[4];
+                        self.cam.snap();
+                    }
+                }
+                // DW_TEST_ROADEDIT=1 : deux rues qui se croisent, un point déplacé (plus de croisement), type changé, suppression
+                if std::env::var("DW_TEST_ROADEDIT").is_ok() {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    for (a, b) in [(v3(-120.0, 0.0, 0.0), v3(120.0, 0.0, 0.0)), (v3(0.0, -100.0, 0.0), v3(0.0, 100.0, 0.0))] {
+                        let (a, b) = (c + a, c + b);
+                        self.terrain.road_kind = 0;
+                        self.terrain.road_pts = vec![v3(a.x, a.y, h(self, a.x, a.y)), v3(b.x, b.y, h(self, b.x, b.y))];
+                        self.finish_road();
+                    }
+                    let state = |s: &DwApp, what: &str| {
+                        if let Some(t) = s.proj.terrain.as_ref() {
+                            let (l, st) = s.signals_count();
+                            println!("{what} : {} routes, {} carrefours, ouvertures de la 1re : {}, feux {l} stops {st}, lampadaires {}", t.roads.len(), t.junctions.len(), t.roads[0].gaps.len(), s.lamps_count());
+                        }
+                    };
+                    state(self, "au départ");
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.roads[1].pts[1] = [c.x + 60.0, c.y - 30.0];
+                        t.roads[1].pts[0] = [c.x + 60.0, c.y - 100.0];
+                    }
+                    self.rebuild_road_network(&[1]);
+                    state(self, "point déplacé");
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.roads[1].pts[1] = [c.x, c.y + 100.0];
+                        t.roads[1].pts[0] = [c.x, c.y - 100.0];
+                        t.roads[1].kind = 1;
+                    }
+                    self.rebuild_road_network(&[1]);
+                    state(self, "remis et devenu avenue");
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.roads.remove(1);
+                    }
+                    self.rebuild_road_network(&[]);
+                    state(self, "supprimé");
+                    self.goto(c, 120.0);
+                }
+                // DW_TEST_CLIP=1 : une colline et une route copiées, collées 120 m plus loin, tournées d'un quart
+                if std::env::var("DW_TEST_CLIP").is_ok() {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        for _ in 0..10 {
+                            t.brush(crate::terrain::Brush::Raise, c + v3(-30.0, -60.0, 0.0), 20.0, 6.0, 1.0, 0, 0.0);
+                        }
+                    }
+                    self.terrain.road_kind = 3;
+                    let (a, b) = (c + v3(-60.0, -70.0, 0.0), c + v3(40.0, -50.0, 0.0));
+                    self.terrain.road_pts = vec![v3(a.x, a.y, h(self, a.x, a.y)), v3(b.x, b.y, h(self, b.x, b.y))];
+                    self.finish_road();
+                    println!("{}", self.clip_copy(c + v3(-70.0, -100.0, 0.0), c + v3(50.0, -20.0, 0.0)));
+                    self.terrain.clip_rot = 1;
+                    println!("{}", self.clip_paste(c + v3(0.0, 90.0, 0.0)));
+                    if let Some(t) = self.proj.terrain.as_ref() {
+                        println!("routes {} ; hauteur colline d'origine {:.1}, copie {:.1}", t.roads.len(), h(self, c.x - 30.0, c.y - 60.0), t.height_at(c.x + 0.0 - 0.0 + 20.0, c.y + 90.0 - 0.0 + 0.0).unwrap_or(0.0));
+                    }
+                    self.goto(c + v3(0.0, 30.0, 0.0), 160.0);
+                }
+                // DW_TEST_HOUSE=1 : trois bâtiments de l'atelier (toit plat, deux pans, quatre pans), le premier transformé
+                // en intérieur ; DW_TEST_HOUSE_LOOK="x,y,dist,yaw,pitch"
+                if std::env::var("DW_TEST_HOUSE").is_ok() {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    let z = h(self, c.x, c.y);
+                    let r = |x: f32, y: f32, w: f32, d: f32| vec![v3(x - w, y - d, z), v3(x + w, y - d, z), v3(x + w, y + d, z), v3(x - w, y + d, z)];
+                    println!("{}", self.create_house(&r(c.x - 25.0, c.y, 8.0, 6.0)));
+                    println!("{}", self.create_house(&r(c.x, c.y, 6.0, 5.0)));
+                    println!("{}", self.create_house(&[v3(c.x + 15.0, c.y - 6.0, z), v3(c.x + 30.0, c.y - 6.0, z), v3(c.x + 30.0, c.y + 8.0, z), v3(c.x + 23.0, c.y + 8.0, z), v3(c.x + 23.0, c.y, z), v3(c.x + 15.0, c.y, z)]));
+                    if self.proj.houses.len() >= 3 {
+                        self.proj.houses[0].floors = 4;
+                        self.proj.houses[0].shop = true;
+                        self.proj.houses[1].roof = 1;
+                        self.proj.houses[1].facade = 0;
+                        self.proj.houses[2].roof = 2;
+                        self.proj.houses[2].facade = 3;
+                        self.proj.houses[2].floors = 1;
+                        println!("{}", self.house_to_interior(0));
+                        // DW_TEST_DOORS=1 : 2e porte (autre modèle) au dos du 2e bâtiment, le 3e transformé en intérieur
+                        if std::env::var("DW_TEST_DOORS").is_ok() {
+                            self.proj.houses[1].more_doors.push(crate::atelier::DoorSpec { edge: 2, t: 0.3, ..Default::default() });
+                            println!("{}", self.house_set_door(1, 1, Some("prop_ron_door_01".into())));
+                            println!("{}", self.house_to_interior(2));
+                            let h = &self.proj.houses[2];
+                            println!("porte de l'intérieur : {:?}", h.door_fit(0));
+                        }
+                        // DW_TEST_INSIDE=1 : 2e bâtiment, sol en terre cuite du jeu, cloison avec passage, plafonnier
+                        if std::env::var("DW_TEST_INSIDE").is_ok() {
+                            self.proj.houses[1].floor_kind = 9;
+                            self.proj.houses[1].walls.push(crate::atelier::Partition { floor: 0, a: [1.0, -4.7], b: [1.0, 4.7], door: true });
+                            println!("{}", self.house_add_light(1, 0, [-3.0, 1.0]));
+                            self.opts.show_rooms = false;
+                        }
+                        // DW_TEST_WINDOWS=1 : 2e bâtiment petits carreaux, une fenêtre retirée, une baie vitrée ; 3e volets
+                        if std::env::var("DW_TEST_WINDOWS").is_ok() {
+                            self.proj.houses[1].win_style = 1;
+                            let c0 = self.proj.houses[1].holes(0, 1).first().map(|h| (h.s0 + h.s1) * 0.5).unwrap_or(2.0);
+                            self.proj.houses[1].win_off.push(crate::atelier::WinRef { edge: 0, floor: 1, s: c0 });
+                            self.proj.houses[1].win_add.push(crate::atelier::WinSpec { edge: 0, floor: 0, s: 2.5, w: 2.8, h: 2.4, sill: 0.05, style: 2 });
+                            self.proj.houses[2].win_style = 3;
+                        }
+                        // DW_TEST_HOUSE_GAME=1 : textures et salissures du jeu
+                        if std::env::var("DW_TEST_HOUSE_GAME").is_ok() {
+                            self.proj.houses[1].game_facade = 1;
+                            self.proj.houses[1].game_roof = 9;
+                            self.proj.houses[1].grime = 0.7;
+                            self.proj.houses[2].game_facade = 5;
+                            self.proj.houses[2].grime = 0.9;
+                            self.proj.houses[2].grime_kind = 12;
+                        }
+                    }
+                    // DW_TEST_PLAN=1 : le rez-de-chaussée coupé en deux, portes posées, intérieur vu de dedans
+                    if std::env::var("DW_TEST_PLAN").is_ok() {
+                        self.plan.floor = 0;
+                        self.plan.floor_h = 3.2;
+                        println!("{}", self.plan_split(v3(2.0, 0.0, 0.0)));
+                        println!("{}", self.plan_doors());
+                        if let Some((ti, mi)) = self.cur_mlo {
+                            let m = &self.proj.ytyps[ti].mlos[mi];
+                            println!("intérieur : {} pièces, {} portails, {} objets dont {} portes", m.rooms.len(), m.portals.len(), m.entities.len(), m.entities.iter().filter(|e| e.archetype.contains("door")).count());
+                        }
+                        self.opts.show_rooms = false;
+                    }
+                    // DW_TEST_HOUSE_FREE=1 : emprise de forme libre, 2 étages, toit plat, à 45 m au nord
+                    if std::env::var("DW_TEST_HOUSE_FREE").is_ok() {
+                        let pts: Vec<V3> = [[-12.0f32, -4.0], [6.0, -6.0], [13.0, 1.0], [10.0, 7.0], [-2.0, 5.0], [-11.0, 6.0]].iter().map(|p| v3(c.x + p[0], c.y + 45.0 + p[1], z)).collect();
+                        println!("{}", self.create_house(&pts));
+                        let k = self.proj.houses.len() - 1;
+                        self.proj.houses[k].roof = 0;
+                        self.proj.houses[k].floors = 2;
+                        self.set_selection(vec![]);
+                    }
+                    for hs in &self.proj.houses {
+                        let (pos, _, parts) = hs.mesh(false);
+                        println!("   {} : {} sommets, {} triangles, boîte {:?}", hs.name, pos.len(), parts.iter().map(|p| p.1.len() / 3).sum::<usize>(), hs.bbox());
+                    }
+                    self.set_selection(vec![]);
+                    let look: Vec<f32> = std::env::var("DW_TEST_HOUSE_LOOK").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+                    let at = c + v3(look.first().copied().unwrap_or(0.0), look.get(1).copied().unwrap_or(0.0), 0.0);
+                    self.goto(v3(at.x, at.y, z), look.get(2).copied().unwrap_or(70.0));
+                    if look.len() >= 5 {
+                        self.cam.target.z = z + look.get(5).copied().unwrap_or(4.0);
+                        self.cam.yaw = look[3];
+                        self.cam.pitch = look[4];
+                        self.cam.snap();
+                    }
+                }
+                // DW_TEST_EXTEND="k[,angle]" : une route de type k, puis une autre qui part de son bout (relier au bout)
+                // en tournant de `angle` degrés ; la caméra regarde le raccord
+                if let Ok(spec) = std::env::var("DW_TEST_EXTEND") {
+                    let v: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    let k = v.first().copied().unwrap_or(0.0) as u8;
+                    let ang = v.get(1).copied().unwrap_or(45.0).to_radians();
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    self.terrain.road_kind = k;
+                    let (a, j) = (c + v3(-120.0, -30.0, 0.0), c);
+                    self.terrain.road_pts = vec![v3(a.x, a.y, h(self, a.x, a.y)), v3(j.x, j.y, h(self, j.x, j.y))];
+                    self.finish_road();
+                    println!("{}", self.status);
+                    let d = v3(j.x - a.x, j.y - a.y, 0.0).norm();
+                    let d2 = v3(d.x * ang.cos() - d.y * ang.sin(), d.x * ang.sin() + d.y * ang.cos(), 0.0);
+                    let b = j + d2 * 110.0;
+                    let js = self.road_snap(v3(j.x + 1.5, j.y - 1.0, 0.0)).map(|q| q.0).unwrap_or(j);
+                    self.terrain.road_pts = vec![js, v3(b.x, b.y, h(self, b.x, b.y))];
+                    self.finish_road();
+                    println!("{}", self.status);
+                    if let Some(t) = self.proj.terrain.as_ref() {
+                        println!("routes : {}, carrefours : {}", t.roads.len(), t.junctions.len());
+                        for r in &t.roads {
+                            println!("   {} points cliqués, {:.0} m, ouvertures {:?}", r.pts.len(), r.length(), r.gaps);
+                        }
+                    }
+                    self.goto(v3(j.x, j.y, h(self, j.x, j.y)), 45.0);
+                }
+                // DW_TEST_BRIDGE=1 : une avenue, une rue en mode pont qui passe au-dessus, une passerelle ; 2 : un pont
+                // au-dessus d'un ravin creusé ; DW_TEST_BRIDGE_LOOK=x,y,dist : caméra (décalage depuis le centre)
+                if let Some(mode) = std::env::var("DW_TEST_BRIDGE").ok().and_then(|v| v.parse::<u8>().ok()) {
+                    let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
+                    let build = |s: &mut DwApp, kind: u8, bridge: bool, a: V3, b: V3| {
+                        s.terrain.road_kind = kind;
+                        s.terrain.road_bridge = bridge;
+                        let (ha, hb) = (h(s, a.x, a.y), h(s, b.x, b.y));
+                        s.terrain.road_pts = vec![v3(a.x, a.y, ha), v3(b.x, b.y, hb)];
+                        s.finish_road();
+                        println!("{}", s.status);
+                        if let Some(r) = s.proj.terrain.as_ref().and_then(|t| t.roads.last()) {
+                            println!("   tronçons {:?} piles {:?} culées {:?} escaliers {:?}", r.spans, r.piers, r.abutments, r.stairs);
+                        }
+                    };
+                    if mode == 2 {
+                        if let Some(t) = self.proj.terrain.as_mut() {
+                            for k in 0..14 {
+                                let p = c + v3(0.0, -60.0 + k as f32 * 9.0, 0.0);
+                                t.brush(crate::terrain::Brush::Flatten, p, 30.0, 60.0, 1.0, 0, -16.0);
+                            }
+                        }
+                        build(self, 3, true, c + v3(-110.0, 0.0, 0.0), c + v3(110.0, 0.0, 0.0));
+                    } else {
+                        build(self, 1, false, c + v3(-150.0, 0.0, 0.0), c + v3(150.0, 0.0, 0.0));
+                        build(self, 0, true, c + v3(0.0, -150.0, 0.0), c + v3(0.0, 150.0, 0.0));
+                        build(self, 5, false, c + v3(60.0, -18.0, 0.0), c + v3(60.0, 18.0, 0.0));
+                        // une route ordinaire qui passe sous le pont : pas de carrefour
+                        build(self, 3, false, c + v3(-30.0, 60.0, 0.0), c + v3(30.0, 60.0, 0.0));
+                    }
+                    let n = self.proj.terrain.as_ref().map(|t| t.junctions.len()).unwrap_or(0);
+                    println!("carrefours : {n}");
+                    let look: Vec<f32> = std::env::var("DW_TEST_BRIDGE_LOOK").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+                    let at = c + v3(look.first().copied().unwrap_or(0.0), look.get(1).copied().unwrap_or(0.0), 0.0);
+                    let at = v3(at.x, at.y, h(self, at.x, at.y));
+                    self.goto(at, look.get(2).copied().unwrap_or(90.0));
+                    if look.len() >= 5 {
+                        self.cam.target.z = at.z + 4.0;
+                        self.cam.yaw = look[3];
+                        self.cam.pitch = look[4];
                         self.cam.snap();
                     }
                 }
@@ -549,6 +850,7 @@ impl DwApp {
                 if !dir.is_empty() && std::env::var("DW_TEST_READY_DONE").is_err() {
                     std::env::set_var("DW_TEST_READY_DONE", "1");
                     self.mlo_tick();
+                    self.house_doors_follow();
                     for r in &self.proj.mlo_res {
                         println!("MLO {} : cartes {:?}, fichiers {}, collisions {}, scripts {:?}, déplacement {:?}", r.name, r.ymaps, r.assets.len(), r.ybns.len(), r.scripts, { let m = self.mlo_move(r); (m.p1 - m.p0, m.q.heading_deg()) });
                     }
@@ -945,6 +1247,7 @@ impl DwApp {
         // fenêtres simples (egui::Window) : une seule fois par image, hors des deux passes du rangement des panneaux
         // (dessinées dans les deux, chaque lettre tapée était lue deux fois)
         self.groups_window(ctx);
+        self.atelier_window(ctx);
         self.dock_overlay(ctx);
         self.isolate_banner(ctx);
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(0.0)).show(ctx, |ui| {

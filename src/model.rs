@@ -326,7 +326,39 @@ impl MloArchetype {
     }
     /// Indices des entités dans chaque pièce (attachedObjects).
     pub fn attached(&self, room: usize) -> Vec<usize> {
-        self.entities.iter().enumerate().filter(|(_, e)| e.room == room).map(|(i, _)| i).collect()
+        self.entities.iter().enumerate().filter(|(i, e)| e.room == room && self.door_portal(*i).is_none()).map(|(i, _)| i).collect()
+    }
+
+    /// Portail dans lequel est posée une porte de l'intérieur : comme dans les intérieurs du jeu et des ressources
+    /// FiveM (ma_diner, burgershot relus avec CodeWalker), une porte est rattachée au passage qu'elle ferme
+    /// (attachedObjects du portail) et à aucune pièce — rattachée à une pièce, elle n'apparaissait pas en jeu
+    /// (retour de la personne, 13 nov. 2026). Critère : modèle « door », origine à moins de 0,8 m du cadre du portail.
+    pub fn door_portal(&self, ei: usize) -> Option<usize> {
+        let e = self.entities.get(ei)?;
+        if !e.archetype.to_lowercase().contains("door") {
+            return None;
+        }
+        let mut best: Option<(f32, usize)> = None;
+        for (pi, p) in self.portals.iter().enumerate() {
+            let (mut mn, mut mx) = (p.corners[0], p.corners[0]);
+            for c in &p.corners {
+                mn = mn.min(*c);
+                mx = mx.max(*c);
+            }
+            let m = 0.8;
+            let d = v3((mn.x - m - e.pos.x).max(e.pos.x - mx.x - m).max(0.0), (mn.y - m - e.pos.y).max(e.pos.y - mx.y - m).max(0.0), (mn.z - m - e.pos.z).max(e.pos.z - mx.z - m).max(0.0)).len();
+            let centre = (mn + mx) * 0.5;
+            let dist = (centre - e.pos).len();
+            if d <= 0.0 && best.map(|b| dist < b.0).unwrap_or(true) {
+                best = Some((dist, pi));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// Objets rattachés à un portail (les portes posées dedans).
+    pub fn portal_attached(&self, pi: usize) -> Vec<usize> {
+        (0..self.entities.len()).filter(|&i| self.door_portal(i) == Some(pi)).collect()
     }
     pub fn portal_count(&self, room: usize) -> usize {
         self.portals.iter().filter(|p| p.room_from as usize == room || p.room_to as usize == room).count()
@@ -371,6 +403,9 @@ pub struct Project {
     /// groupes d'objets (« Faire un groupe ») à poser ailleurs
     #[serde(default)]
     pub groups: Vec<crate::groups::Group>,
+    /// bâtiments de l'atelier (atelier.rs) : modèles « dw_bat_N »
+    #[serde(default)]
+    pub houses: Vec<crate::atelier::House>,
 }
 
 impl Project {

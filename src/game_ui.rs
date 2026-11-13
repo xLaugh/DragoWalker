@@ -286,6 +286,7 @@ impl DwApp {
                 self.game.gpu = Some(Arc::new(Mutex::new(crate::gpu::Gpu::new(w.model_source()))));
                 // vraies textures du sol (terrain, routes) lues dans les dictionnaires partagés du jeu
                 crate::groundtex::load(&w);
+                crate::atelier::load_game_textures(&w);
                 self.terrain.dirty = true;
                 self.game.world = Some(Box::new(w));
                 // la ville d'exemple laisse la place à la vraie carte : Legion Square
@@ -799,6 +800,8 @@ impl DwApp {
             .ents_in_radius(g, self.erase_radius)
             .into_iter()
             .filter(|&ei| editable(w, ei))
+            // un objet caché (H) n'est pas gommé : on ne le voit pas
+            .filter(|&ei| !self.game.hidden.contains(&ei))
             .filter(|&ei| {
                 let e = &w.ents[ei as usize];
                 if !self.erase_buildings {
@@ -815,6 +818,33 @@ impl DwApp {
         }
         let ids: HashSet<u64> = self.game_ents_to_project(&ents).into_iter().collect();
         self.proj.delete_ids(&ids)
+    }
+
+    /// Objets du jeu visibles (dessinés, pas cachés, pas déjà copiés dans le projet) dans `radius` m autour de `c`
+    /// (0 = toute la vue) dont le modèle contient `filter` ; `small_only` : seulement ceux de 20 m au plus
+    /// (comme la Gomme sans « gros objets »). Pour l'assistant IA (supprimer, sélectionner).
+    pub fn game_visible_matching(&self, c: V3, radius: f32, filter: &str, small_only: bool) -> Vec<u32> {
+        let Some(w) = self.game.world.as_ref() else { return Vec::new() };
+        let f = filter.to_lowercase();
+        self.game
+            .drawn
+            .iter()
+            .copied()
+            .filter(|&ei| editable(w, ei) && !self.game.hidden.contains(&ei))
+            .filter(|&ei| {
+                let e = &w.ents[ei as usize];
+                if w.ymaps[e.ymap as usize].in_project || (radius > 0.0 && e.pos.dist2d(c) > radius) {
+                    return false;
+                }
+                if small_only {
+                    let (mn, mx) = w.arch_box(e.arch);
+                    if (mx - mn).len() > 20.0 {
+                        return false;
+                    }
+                }
+                f.is_empty() || w.name_of(e.arch).to_lowercase().contains(&f)
+            })
+            .collect()
     }
 
     pub fn game_hover_text(&self) -> Option<String> {
@@ -972,17 +1002,18 @@ impl DwApp {
                 }
             });
             ui.label(RichText::new("Hauteur comptée depuis le centre de la vue ; molette + Alt pour l'ajuster dans la vue.").weak().small());
-            ui.horizontal(|ui| {
-                let n = self.game.hidden.len() + self.game.hidden_ids.len();
-                ui.label(format!("Objets cachés (touche H sur un objet) : {n}"));
-                if ui.add_enabled(n > 0, egui::Button::new("Tout réafficher")).clicked() {
-                    self.game.hidden.clear();
-                    self.game.hidden_ids.clear();
-                }
-            });
         } else {
             ui.checkbox(&mut self.game.terrain, "Relief du terrain");
         }
+        // objets cachés (H) : toujours réaffichables, même avec les boîtes à la place des vrais modèles
+        ui.horizontal(|ui| {
+            let n = self.game.hidden.len() + self.game.hidden_ids.len();
+            ui.label(format!("Objets cachés (touche H sur un objet) : {n}"));
+            if ui.add_enabled(n > 0, egui::Button::new("Tout réafficher")).clicked() {
+                self.game.hidden.clear();
+                self.game.hidden_ids.clear();
+            }
+        });
         let copies = self.proj.ymaps.iter().filter(|y| y.from_game).count();
         ui.separator();
         ui.label(RichText::new(format!("Fichiers du jeu copiés dans le projet : {copies}")).small());

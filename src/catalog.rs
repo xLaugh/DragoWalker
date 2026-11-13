@@ -127,6 +127,16 @@ pub fn set_shell_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
     }
 }
 
+static HOUSE_BOXES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
+
+/// Tailles des bâtiments de l'atelier.
+pub fn set_house_boxes(m: std::collections::HashMap<String, (V3, V3)>) {
+    let lock = HOUSE_BOXES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = lock.write() {
+        *g = m;
+    }
+}
+
 static CUT_BOXES:std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, (V3, V3)>>> = std::sync::OnceLock::new();
 
 /// Tailles des bâtiments du jeu édités (ce qui reste après les morceaux retirés).
@@ -168,6 +178,9 @@ pub fn game_box(name: &str) -> Option<(V3, V3)> {
         return Some(c);
     }
     if let Some(c) = SHELL_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
+        return Some(c);
+    }
+    if let Some(c) = HOUSE_BOXES.get().and_then(|l| l.read().ok()).and_then(|g| g.get(&n).copied()) {
         return Some(c);
     }
     let g = GAME_BOXES.get()?.read().ok()?;

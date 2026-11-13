@@ -216,11 +216,16 @@ pub fn probe(game: &str, cw: &str) {
                         *uses.entry(e.arch).or_insert(0) += 1;
                     }
                     let mut v: Vec<(String, usize, crate::math::V3)> = Vec::new();
+                    let boxes = std::env::var("DW_ARCH_BOX").is_ok();
                     for h in w.archetypes.keys() {
                         let n = w.name_of(*h).to_lowercase();
                         // « *mot » : le nom contient ce mot (sinon : commence par)
                         if pre.iter().any(|p| match p.strip_prefix('*') { Some(w) => n.contains(w), None => n.starts_with(p.as_str()) }) {
                             let (a, b) = w.arch_box(*h);
+                            // DW_ARCH_BOX=1 : boîte complète (sens d'un bras de lampadaire…)
+                            if boxes {
+                                println!("   boîte {n} : min ({:.2}, {:.2}, {:.2}) max ({:.2}, {:.2}, {:.2})", a.x, a.y, a.z, b.x, b.y, b.z);
+                            }
                             v.push((n, uses.get(h).copied().unwrap_or(0), b - a));
                         }
                     }
@@ -332,6 +337,24 @@ pub fn probe(game: &str, cw: &str) {
                         lat.sort_by(|a, b| a.total_cmp(b));
                         let med = |v: &Vec<f32>| v.get(v.len() / 2).copied().unwrap_or(0.0);
                         println!("{nm} : {} placés, {groups} dans un carrefour ; du côté des voitures regardées (avant le centre) {near}, après le centre {far} ; bras vers le centre {arm_in}, vers l'extérieur {arm_out} ; distance médiane au centre le long {:.1} m, en travers {:.1} m", list.len(), med(&dists), med(&lat));
+                    }
+                }
+                // DW_TEX_CHECK="dictionnaire:texture,…" : la texture se lit-elle, quelle taille, quelle transparence
+                if let Ok(list) = std::env::var("DW_TEX_CHECK") {
+                    for item in list.split(',') {
+                        let Some((txd, tex)) = item.trim().split_once(':') else { continue };
+                        let file = format!("{txd}.ytd");
+                        let r = w.vfs.files.iter().filter(|f| f.name.eq_ignore_ascii_case(&file)).last().and_then(|f| w.vfs.read_resource(f, &w.keys));
+                        let t = r.as_ref().and_then(|r| crate::gta::drawable::find_texture(r, 0, crypto::joaat(tex), 256));
+                        match t {
+                            Some(t) => {
+                                let px: Vec<u8> = crate::texdecode::decode_level(&t, 64).map(|r| r.px).unwrap_or_default();
+                                let n = (px.len() / 4).max(1);
+                                let clear = px.chunks(4).filter(|p| p[3] < 128).count();
+                                println!("texture {txd}:{tex} : {}x{} {:?}, {:.0} % transparent", t.w, t.h, t.fmt, clear as f32 * 100.0 / n as f32);
+                            }
+                            None => println!("texture {txd}:{tex} : introuvable"),
+                        }
                     }
                 }
                 // DW_TXD_GREP="mot1,mot2" : textures des dictionnaires du jeu (.ytd) dont le nom contient un de ces

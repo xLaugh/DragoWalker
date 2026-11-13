@@ -399,7 +399,7 @@ impl DwApp {
             (net.nodes.len(), net.links.len())
         }).unwrap_or((0, 0));
         ui.label(format!("{n} points de route, {l} liens générés depuis tes routes."));
-        ui.label(RichText::new("Les voitures du jeu rouleront sur tes routes (une voie par sens pour une rue, deux pour une avenue, trois pour l'autoroute). Ce réseau remplace celui du jeu dans les carrés de 512 m qu'il touche : idéal sur une carte custom, à éviter en pleine ville.").small().weak());
+        ui.label(RichText::new("Les voitures du jeu rouleront sur tes routes (une voie par sens pour une rue, deux pour une avenue, trois pour l'autoroute). Ce réseau n'est écrit que dans les carrés de 512 m où le jeu n'a pas de points de route ; là où le jeu en a, les siens sont gardés (les remplacer faisait planter le jeu) : idéal sur une carte custom loin de la ville. Charge le jeu avant d'exporter pour savoir quels carrés sont libres.").small().weak());
         if self.proj.terrain.is_some() {
             ui.add_space(4.0);
             ui.label(RichText::new("Voitures de PNJ qui roulent").strong());

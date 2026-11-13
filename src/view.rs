@@ -39,7 +39,8 @@ impl DwApp {
 
     fn erase_at(&mut self, g: V3) {
         let f = self.erase_filter.clone();
-        let ids: HashSet<u64> = self.items_in_radius(g, self.erase_radius, &f, self.erase_buildings).into_iter().collect();
+        // les objets cachés (H) ne sont pas gommés : on ne les voit pas
+        let ids: HashSet<u64> = self.items_in_radius(g, self.erase_radius, &f, self.erase_buildings).into_iter().filter(|id| !self.game.hidden_ids.contains(id)).collect();
         let mut n = 0;
         if !ids.is_empty() {
             n += self.proj.delete_ids(&ids);
@@ -212,15 +213,28 @@ impl DwApp {
         }
         // pose d'un groupe : la souris le pose, la molette le tourne
         let grouping = !editing && self.group_input(&ctx, &resp);
+        // atelier : tracé de l'emprise d'un bâtiment
+        let tracing = !editing && !grouping && (self.atelier.tracing || self.atelier.door_pick.is_some() || self.atelier.wall_pick.is_some() || self.atelier.light_pick.is_some() || self.atelier.win_pick.is_some());
+        if tracing {
+            self.atelier_input(&resp, &ctx);
+        }
+        // plan d'un intérieur vu de dessus
+        let planning = !editing && !grouping && !tracing && self.plan.mode != 0;
+        if planning {
+            self.plan_input(&resp, ptr, &ctx);
+        }
+        let tracing = tracing || planning;
         match self.tool {
-            _ if editing || grouping => {}
+            _ if editing || grouping || tracing => {}
             Tool::Select | Tool::Rect => self.select_tool(&resp, ptr, press_origin, mods),
             Tool::Terrain => self.terrain_tool(&resp, ptr, &ctx),
             Tool::Life => self.life_tool(&resp, ptr),
             Tool::Place => {
                 if resp.drag_started_by(PointerButton::Primary) {
                     let start = press_origin.or(ptr).unwrap_or_default();
-                    if let Some(g) = self.cam.ground_point(start, self.ground_z) {
+                    // la surface visible sous la souris (le pointeur n'a bougé que de quelques pixels depuis
+                    // l'appui) ; à défaut, le plan à hauteur fixe
+                    if let Some(g) = self.mouse_ground.or_else(|| self.cam.ground_point(start, self.ground_z)) {
                         self.push_undo();
                         let arch = self.place_arch.clone();
                         let id = self.place_prop(&arch, g, None);
@@ -257,6 +271,8 @@ impl DwApp {
                         let arch = self.place_arch.clone();
                         let id = self.place_prop(&arch, g, None);
                         self.set_selection(vec![id]);
+                        // Maj : posé au sol (bas de l'objet sur la surface), comme pour un trait
+                        self.snap_if_shift(&[id]);
                         self.status = format!("« {arch} » posé.");
                     }
                 }
@@ -346,6 +362,8 @@ impl DwApp {
                 }
             }
         }
+        self.atelier_draw(&painter);
+        self.plan_draw(&painter, hover_pos);
         match self.tool {
             Tool::Place => {
                 if let Some(g) = self.mouse_ground {
@@ -412,8 +430,8 @@ impl DwApp {
             Tool::Terrain => match self.terrain.brush {
                 crate::terrain::Brush::Road => "Route : clic pour poser des points · double-clic ou Entrée pour construire · Retour arrière / Échap",
                 crate::terrain::Brush::Vegetation => "Végétation : glisser pour semer · Ctrl + glisser pour retirer · + / - rayon",
-                crate::terrain::Brush::Paint => "Peindre : glisser pour changer le sol · + / - rayon · F2–F9 autres pinceaux",
-                _ => "Terrain : glisser pour sculpter · + / - rayon · F2–F9 pinceaux (menu Terrain)",
+                crate::terrain::Brush::Paint => "Peindre : glisser pour changer le sol · + / - rayon · F2–F11 autres pinceaux",
+                _ => "Terrain : glisser pour sculpter · + / - rayon · F2–F11 pinceaux (menu Terrain)",
             },
             Tool::Rect => "Rectangle : glisser n'importe où pour sélectionner tout ce qui est dedans · Ctrl ou Maj = ajouter · Suppr = tout supprimer",
             Tool::Life => match self.life.tool {
@@ -671,7 +689,7 @@ impl DwApp {
             self.server.open = true;
             self.server_test();
         }
-        // éditeur de terrain : F2–F9 pinceaux, + / - rayon, route en cours (Entrée, Retour arrière, Échap)
+        // éditeur de terrain : F2–F11 pinceaux, + / - rayon, route en cours (Entrée, Retour arrière, Échap)
         if self.proj.terrain.is_some() {
             use crate::terrain::Brush;
             let fk = ctx.input(|i| [Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8, Key::F9, Key::F10, Key::F11].map(|k| i.key_pressed(k)));

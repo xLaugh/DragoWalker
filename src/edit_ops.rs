@@ -92,20 +92,26 @@ impl DwApp {
         }
     }
 
-    /// Trouve l'intérieur (et sa pièce) qui contient un point du monde.
+    /// Trouve l'intérieur (et sa pièce) qui contient un point du monde. Dans un intérieur à étages, la pièce dont
+    /// la hauteur contient le point passe avant les autres pièces au même endroit (sinon la première trouvée).
     pub fn mlo_at(&self, world: V3) -> Option<(usize, usize, usize, V3)> {
+        let mut first: Option<(usize, usize, usize, V3)> = None;
         for (ti, t) in self.proj.ytyps.iter().enumerate() {
             for (mi, m) in t.mlos.iter().enumerate() {
                 let Some((p, q)) = self.proj.mlo_placement(&m.name) else { continue };
                 let local = q.inverse().rotate(world - p);
                 for (ri, r) in m.rooms.iter().enumerate().skip(1) {
                     if local.x >= r.bb_min.x && local.x <= r.bb_max.x && local.y >= r.bb_min.y && local.y <= r.bb_max.y {
-                        return Some((ti, mi, ri, local));
+                        // marge de 0,5 m : le point cliqué sur le sol peut être un peu sous la boîte de la pièce
+                        if local.z >= r.bb_min.z - 0.5 && local.z <= r.bb_max.z + 0.5 {
+                            return Some((ti, mi, ri, local));
+                        }
+                        first.get_or_insert((ti, mi, ri, local));
                     }
                 }
             }
         }
-        None
+        first
     }
 
     /// Pose un prop (dans le monde, ou dans un intérieur si le point est dans une pièce).
@@ -117,7 +123,11 @@ impl DwApp {
             if let Some((ti, mi, ri, local)) = self.mlo_at(p) {
                 let name = self.proj.ytyps[ti].mlos[mi].name.clone();
                 let (_, q) = self.proj.mlo_placement(&name).unwrap_or((V3::ZERO, Quat::IDENTITY));
-                let mut e = Entity::new(arch, v3(local.x, local.y, 0.0));
+                // hauteur : le point cliqué (dans le repère de l'intérieur) s'il est dans la hauteur de la pièce,
+                // sinon le bas de la pièce (avant : toujours z = 0, faux dans un intérieur à étages)
+                let (zmin, zmax) = self.proj.ytyps[ti].mlos[mi].rooms.get(ri).map(|r| (r.bb_min.z, r.bb_max.z)).unwrap_or((0.0, 0.0));
+                let z = if local.z >= zmin - 0.5 && local.z <= zmax + 0.5 { local.z } else { zmin };
+                let mut e = Entity::new(arch, v3(local.x, local.y, z));
                 e.flags = mech::MLO_ENTITY_FLAGS;
                 e.room = ri;
                 e.rot = q.inverse().mul(Quat::from_z(heading.to_radians())).normalized();
@@ -435,6 +445,12 @@ impl DwApp {
     }
 
     pub fn select_filtered(&mut self, filter: &str, radius: f32) -> usize {
+        self.select_matching(filter, radius, false)
+    }
+
+    /// Sélectionne les objets dont le modèle contient `filter` (ou porte exactement ce nom si `exact`, sans
+    /// tenir compte des majuscules), dans `radius` m autour du centre de la vue (0 = partout).
+    pub fn select_matching(&mut self, filter: &str, radius: f32, exact: bool) -> usize {
         let f = filter.to_lowercase();
         let c = self.cam.target;
         let mut ids = Vec::new();
@@ -443,7 +459,7 @@ impl DwApp {
                 continue;
             }
             let Some(e) = self.proj.world_entity(it) else { continue };
-            if !f.is_empty() && !e.archetype.to_lowercase().contains(&f) {
+            if !f.is_empty() && !(if exact { e.archetype.eq_ignore_ascii_case(&f) } else { e.archetype.to_lowercase().contains(&f) }) {
                 continue;
             }
             if radius > 0.0 && e.pos.dist2d(c) > radius {

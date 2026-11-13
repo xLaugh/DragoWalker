@@ -19,7 +19,8 @@ if ($ToBinary) {
         $name = $f.Name.ToLower()
         $fmt = $null
         if ($name.EndsWith('.ymap.xml') -or $name.EndsWith('.ytyp.xml')) { $fmt = 'RSC' }
-        elseif ($name.EndsWith('.ymf.xml')) { $fmt = 'PSO' }
+        elseif ($name.EndsWith('.ymf.xml') -or $name.EndsWith('.ymt.xml')) { $fmt = 'PSO' }
+        elseif ($name.EndsWith('.rel.xml')) { $fmt = 'AudioRel' }
         elseif ($name.EndsWith('.ydr.xml')) { $fmt = 'Ydr' }
         elseif ($name.EndsWith('.ydd.xml')) { $fmt = 'Ydd' }
         elseif ($name.EndsWith('.yft.xml')) { $fmt = 'Yft' }

@@ -687,7 +687,7 @@ impl DwApp {
             ui.horizontal_wrapped(|ui| {
                 let converting = s.server.job.is_some();
                 let can = s.server.installed() && !s.server.license.trim().is_empty() && !converting;
-                let label = if converting { "Conversion en cours…" } else if running { "Réexporter et recharger" } else { "Tester en jeu" };
+                let label = if converting { "Conversion en cours…" } else if running { "Réexporter et recharger" } else { "Lancer le test" };
                 if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong())).on_hover_text("Exporte la map dans le serveur, le démarre et connecte FiveM ; s'il tourne déjà, recharge la map sans te déconnecter").clicked() {
                     act = Some("test");
                 }

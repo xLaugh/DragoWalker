@@ -1133,6 +1133,64 @@ impl DwApp {
     }
 
     /// Noms des .ytyp du projet recopiés depuis un MLO (pas réécrits en XML à l'export).
+    /// Fichier de types (.ytyp) du projet où ranger un intérieur créé : jamais celui d'une ressource MLO importée.
+    /// Le premier qui n'en est pas une, sinon un nouveau « dw_interieurs ».
+    pub fn own_ytyp(&mut self) -> usize {
+        let ext = self.mlo_external_ytyps();
+        if let Some(i) = self.proj.ytyps.iter().position(|t| !ext.contains(&t.name.to_lowercase())) {
+            return i;
+        }
+        self.proj.ytyps.push(crate::model::Ytyp { name: "dw_interieurs".into(), mlos: vec![], visible: true, raw_archetypes: vec![] });
+        self.proj.ytyps.len() - 1
+    }
+
+    /// Intérieurs créés dans DragoWalker mais rangés par erreur dans le .ytyp d'une ressource MLO importée (avant le
+    /// 13 nov. 2026, un intérieur créé allait dans le fichier de l'intérieur ouvert) : ce fichier est recopié tel quel
+    /// à l'export, ils n'étaient donc jamais exportés. Sont déplacés vers un .ytyp du projet ceux qui ne sont placés
+    /// que hors des cartes de la ressource. Rend le nombre déplacé.
+    pub fn fix_misplaced_mlos(&mut self) -> usize {
+        let mut moves: Vec<(usize, usize)> = Vec::new();
+        for r in &self.proj.mlo_res {
+            let res_maps: std::collections::HashSet<String> = r.ymaps.iter().map(|m| Path::new(m).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default().trim_end_matches(".ymap").to_string()).collect();
+            for (ti, t) in self.proj.ytyps.iter().enumerate() {
+                if !r.ytyp_files.iter().any(|f| f.0.eq_ignore_ascii_case(&t.name)) {
+                    continue;
+                }
+                for (mi, m) in t.mlos.iter().enumerate() {
+                    let mut in_res = false;
+                    let mut elsewhere = false;
+                    for y in &self.proj.ymaps {
+                        if y.entities.iter().any(|e| e.mlo.is_some() && e.archetype.eq_ignore_ascii_case(&m.name)) {
+                            if res_maps.contains(&y.name.to_lowercase()) {
+                                in_res = true;
+                            } else {
+                                elsewhere = true;
+                            }
+                        }
+                    }
+                    if elsewhere && !in_res {
+                        moves.push((ti, mi));
+                    }
+                }
+            }
+        }
+        if moves.is_empty() {
+            return 0;
+        }
+        let mut taken = Vec::new();
+        // de la fin vers le début pour garder les numéros valables
+        moves.sort();
+        for &(ti, mi) in moves.iter().rev() {
+            taken.push(self.proj.ytyps[ti].mlos.remove(mi));
+        }
+        let dst = self.own_ytyp();
+        let n = taken.len();
+        taken.reverse();
+        self.proj.ytyps[dst].mlos.extend(taken);
+        self.cur_mlo = None;
+        n
+    }
+
     pub fn mlo_external_ytyps(&self) -> std::collections::HashSet<String> {
         self.proj.mlo_res.iter().flat_map(|r| r.ytyp_files.iter().filter(|f| !f.1.is_empty() && Path::new(&f.1).is_file()).map(|f| f.0.to_lowercase())).collect()
     }

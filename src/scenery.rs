@@ -228,7 +228,8 @@ impl DwApp {
                 return;
             }
             self.push_undo();
-            let z = a.z + 0.2;
+            // arrondi au décimètre : niveau lisible dans la liste des zones
+            let z = ((a.z + 0.2) * 10.0).round() / 10.0;
             let depth = self.terrain.water_depth;
             if let Some(t) = self.proj.terrain.as_mut() {
                 if self.terrain.water_dig {
@@ -331,7 +332,7 @@ impl DwApp {
         for (i, w) in t.waters.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{:.0} × {:.0} m", w.max[0] - w.min[0], w.max[1] - w.min[1]));
-                if ui.add(egui::DragValue::new(&mut zs[i]).speed(0.05).suffix(" m")).on_hover_text("Niveau de l'eau").changed() {
+                if ui.add(egui::DragValue::new(&mut zs[i]).speed(0.05).max_decimals(2).suffix(" m")).on_hover_text("Niveau de l'eau").changed() {
                     changed = true;
                 }
                 if ui.small_button("Supprimer").clicked() {
@@ -395,19 +396,29 @@ impl DwApp {
     }
 
     /// Export : water.xml complet + script client, et les effets (types d'objets dw_fx_* + modèle invisible).
-    /// Renvoie (types d'objets XML, entités XML) à ajouter au ytyp / ymap du terrain.
-    pub fn export_scenery(&self, stream: &std::path::Path, tiles: &mut u32) -> Result<(Vec<String>, String, Option<(V3, V3)>), String> {
-        let Some(t) = self.proj.terrain.as_ref() else { return Ok((Vec::new(), String::new(), None)) };
-        let root = stream.parent().unwrap_or(stream);
+    /// Renvoie (types d'objets XML, entités XML, étendue des effets, eau laissée de côté) à ajouter au ytyp / ymap
+    /// du terrain. Eau laissée de côté = le terrain a des zones d'eau mais le water.xml du jeu n'est pas lisible
+    /// (jeu non chargé) : sans lui, l'océan disparaîtrait en jeu, donc rien n'est écrit.
+    pub fn export_scenery(&self, stream: &std::path::Path, tiles: &mut u32) -> Result<(Vec<String>, String, Option<(V3, V3)>, bool), String> {
+        let Some(t) = self.proj.terrain.as_ref() else { return Ok((Vec::new(), String::new(), None, false)) };
+        // ressource FiveM : les modèles vont dans <ressource>/stream, l'eau et son script à la racine de la
+        // ressource ; export XML : tout dans le dossier choisi
+        let in_resource = stream.file_name().is_some_and(|n| n.eq_ignore_ascii_case("stream"));
+        let root = if in_resource { stream.parent().unwrap_or(stream) } else { stream };
         let mut archs = Vec::new();
         let mut ents = String::new();
         let mut ext: Option<(V3, V3)> = None;
-        // eau
-        if !t.waters.is_empty() {
-            let base = self.game.world.as_ref().and_then(|w| {
+        // eau : le water.xml du jeu (océan, lacs) + les zones du projet
+        let base = if t.waters.is_empty() {
+            None
+        } else {
+            self.game.world.as_ref().and_then(|w| {
                 w.vfs.files.iter().find(|f| f.name.eq_ignore_ascii_case("water.xml") && f.path().to_lowercase().contains("levels\\gta5")).and_then(|f| w.vfs.read_binary(f, &w.keys))
-            });
-            let mut s = base.map(|d| String::from_utf8_lossy(&d).to_string()).unwrap_or_else(|| "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<WaterData>\n <WaterQuads>\n </WaterQuads>\n <CalmingQuads />\n <WaveQuads />\n</WaterData>\n".to_string());
+            })
+        };
+        let water_skipped = !t.waters.is_empty() && base.is_none();
+        if let Some(base) = base {
+            let mut s = String::from_utf8_lossy(&base).to_string();
             let mut items = String::new();
             for w in &t.waters {
                 items += &format!(
@@ -471,6 +482,6 @@ impl DwApp {
                 });
             }
         }
-        Ok((archs, ents, ext))
+        Ok((archs, ents, ext, water_skipped))
     }
 }

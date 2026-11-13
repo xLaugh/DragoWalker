@@ -526,7 +526,11 @@ impl DwApp {
                 if ui.button("Annuler (Ctrl+Z)").clicked() {
                     act = Some("undo");
                 }
-                if ui.button("Tout remettre").clicked() {
+                if ui
+                    .button("Tout remettre")
+                    .on_hover_text("Remet tous les morceaux retirés et supprime toutes les ouvertures percées (Ctrl+Z pour revenir). Les portes et fenêtres du jeu déjà posées restent des objets du projet.")
+                    .clicked()
+                {
                     act = Some("reset");
                 }
                 if ui.button(RichText::new("Terminer").strong()).clicked() {
@@ -540,7 +544,12 @@ impl DwApp {
                 self.push_undo();
                 if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
                     c.removed.clear();
+                    c.openings.clear();
                 }
+                if let Some(b) = self.bedit.as_mut() {
+                    b.sel = None;
+                }
+                self.status = format!("« {source} » : morceaux remis, ouvertures supprimées.");
             }
             Some("done") => open = false,
             _ => {}

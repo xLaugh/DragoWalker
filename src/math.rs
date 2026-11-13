@@ -144,6 +144,10 @@ impl Quat {
             a
         }
     }
+    /// Même rotation avec un autre cap : tourne autour de l'axe Z du monde de l'écart, l'inclinaison X/Y est gardée.
+    pub fn with_heading_deg(self, deg: f32) -> Quat {
+        Quat::from_z((deg - self.heading_deg()).to_radians()).mul(self).normalized()
+    }
 }
 
 /// Petit générateur pseudo-aléatoire déterministe.
@@ -164,5 +168,24 @@ impl Rng {
     }
     pub fn range(&mut self, a: f32, b: f32) -> f32 {
         a + (b - a) * self.f()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changer_le_cap_garde_l_inclinaison() {
+        // objet penché de 20° autour de X, cap 30°
+        let h = (20f32.to_radians() * 0.5, 0.0);
+        let tilt = Quat { x: h.0.sin(), y: 0.0, z: 0.0, w: h.0.cos() };
+        let q = Quat::from_z(30f32.to_radians()).mul(tilt).normalized();
+        let r = q.with_heading_deg(100.0);
+        assert!((r.heading_deg() - 100.0).abs() < 0.01);
+        // l'angle entre le haut de l'objet et la verticale ne change pas
+        let up = |q: Quat| q.rotate(v3(0.0, 0.0, 1.0)).z;
+        assert!((up(r) - up(q)).abs() < 1e-4);
+        assert!((up(r) - 20f32.to_radians().cos()).abs() < 1e-4);
     }
 }

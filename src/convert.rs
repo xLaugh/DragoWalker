@@ -3,7 +3,7 @@
 
 use crate::app::DwApp;
 use crate::math::{v3, Quat, V3};
-use crate::model::{self, Entity, MloInstData, Ytyp};
+use crate::model::{self, Entity, MloInstData};
 
 /// Type de pièce deviné d'après sa surface (m²) — estimé.
 pub fn guess_room_type(area: f32) -> &'static str {
@@ -196,7 +196,9 @@ impl DwApp {
             if let Some(k) = prefer.iter().position(|p| n.starts_with(p) || n.contains(p)) {
                 score -= 3.0 - k as f32 * 0.5;
             }
-            if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
+            // à score égal, le nom le plus petit (ordre alphabétique) : le parcours de la table des types suit un
+            // ordre qui change d'un lancement à l'autre, le choix ne doit pas en dépendre
+            if best.as_ref().map(|b| score < b.0 || (score == b.0 && n < b.1)).unwrap_or(true) {
                 best = Some((score, n, a.bb_min, a.bb_max));
             }
         }
@@ -204,7 +206,7 @@ impl DwApp {
     }
 
     /// Ambiances (timecycle) d'intérieur du jeu : noms lus dans les fichiers timecycle_mods*.xml.
-    fn game_timecycles(&self) -> Vec<String> {
+    pub(crate) fn game_timecycles(&self) -> Vec<String> {
         let Some(w) = self.game.world.as_ref() else { return Vec::new() };
         let mut out = Vec::new();
         for f in w.vfs.files.iter().filter(|f| f.name.starts_with("timecycle_mods") && f.name.ends_with(".xml")) {
@@ -319,11 +321,8 @@ impl DwApp {
         let mportals: Vec<model::Portal> = portals.iter().map(|(f, t, c)| model::Portal::new(*f, *t, *c)).collect();
         let exits = mportals.iter().filter(|p| p.room_to == 0 || p.room_from == 0).count() as u32;
         let mlo = model::MloArchetype { name: name.clone(), lod_dist: 200.0, flags: 0, mlo_flags: 0, entities: Vec::new(), rooms: mrooms, portals: mportals, entity_sets: Vec::new() };
-        if self.proj.ytyps.is_empty() {
-            let n = self.proj.next_ytyp_name();
-            self.proj.ytyps.push(Ytyp { name: n, mlos: vec![], visible: true, raw_archetypes: vec![] });
-        }
-        let ti = self.cur_mlo.map(|(t, _)| t).unwrap_or(0).min(self.proj.ytyps.len() - 1);
+        // jamais dans le .ytyp d'une ressource MLO importée (recopié tel quel à l'export : l'intérieur n'y serait pas)
+        let ti = self.own_ytyp();
         self.proj.ytyps[ti].mlos.push(mlo);
         let mi = self.proj.ytyps[ti].mlos.len() - 1;
         self.cur_mlo = Some((ti, mi));

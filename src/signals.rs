@@ -143,7 +143,7 @@ impl DwApp {
                 if auto {
                     for (name, p, q) in junction_props(j) {
                         // pied posé sur ce qu'il y a vraiment dessous (trottoir, chaussée, accotement ou terrain)
-                        let p = v3(p.x, p.y, t.surface_at(p.x, p.y).unwrap_or(p.z));
+                        let p = v3(p.x, p.y, t.surface_below(p.x, p.y, j.pos[2] + 2.0).unwrap_or(p.z));
                         let mut e = crate::model::Entity::new(name, p);
                         e.rot = q;
                         e.lod_dist = lod_of(name, self.game.world.as_deref());
@@ -165,6 +165,47 @@ impl DwApp {
         let _ = n;
         self.clean_selection();
         self.sync_game_project();
+    }
+
+    /// Lampadaires de toutes les routes (Road::lamp_spots) : objets du jeu, retirés puis reposés. Le bras de
+    /// prop_streetlight_01 part vers −Y du modèle (boîte du jeu : y de −2,42 à 0,46) : −Y est tourné vers la chaussée ;
+    /// prop_streetlight_03d a ses deux bras le long de Y, mis en travers de l'autoroute.
+    pub fn refresh_furniture(&mut self) {
+        let Some(t) = self.proj.terrain.as_ref() else { return };
+        let old: std::collections::HashSet<u64> = t.roads.iter().flat_map(|r| r.props.iter().copied()).collect();
+        if !old.is_empty() {
+            self.proj.delete_ids(&old);
+        }
+        let lod_of = |name: &str, w: Option<&crate::gta::world::GameWorld>| w.and_then(|w| w.archetypes.get(&crate::gta::crypto::joaat(name))).map(|a| a.lod_dist).filter(|d| *d > 0.0).unwrap_or(150.0);
+        let mut placed: Vec<Vec<crate::model::Entity>> = Vec::new();
+        if let Some(t) = self.proj.terrain.as_ref() {
+            for r in &t.roads {
+                let mut v = Vec::new();
+                for (p, toward, double) in r.lamp_spots() {
+                    let name = if double { crate::roads::LAMP_DOUBLE } else { crate::roads::LAMP_SINGLE };
+                    let p = v3(p.x, p.y, t.surface_below(p.x, p.y, p.z + 1.0).unwrap_or(p.z));
+                    let mut e = crate::model::Entity::new(name, p);
+                    e.rot = if double { facing(toward) } else { facing(toward * -1.0) };
+                    e.lod_dist = lod_of(name, self.game.world.as_deref());
+                    v.push(e);
+                }
+                placed.push(v);
+            }
+        }
+        let yi = self.ensure_target_ymap();
+        if let Some(t) = self.proj.terrain.as_mut() {
+            for (r, list) in t.roads.iter_mut().zip(placed) {
+                r.props = list.iter().map(|e| e.id).collect();
+                self.proj.ymaps[yi].entities.extend(list);
+            }
+        }
+        self.clean_selection();
+        self.sync_game_project();
+    }
+
+    /// Nombre de lampadaires posés par DragoWalker.
+    pub fn lamps_count(&self) -> usize {
+        self.proj.terrain.as_ref().map(|t| t.roads.iter().map(|r| r.props.len()).sum()).unwrap_or(0)
     }
 
     /// Nombre de feux et de panneaux posés par DragoWalker.
