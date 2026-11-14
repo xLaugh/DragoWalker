@@ -8,14 +8,14 @@ param(
     [string]$ToXmlList
 )
 $ErrorActionPreference = 'Stop'
-$asm = [Reflection.Assembly]::LoadFrom((Resolve-Path $Dll).Path)
+$asm = [Reflection.Assembly]::LoadFrom((Resolve-Path -LiteralPath $Dll).Path)
 $xmlMeta = $asm.GetType('CodeWalker.GameFiles.XmlMeta')
 $metaXml = $asm.GetType('CodeWalker.GameFiles.MetaXml')
 $fmtType = $asm.GetType('CodeWalker.GameFiles.MetaFormat')
 $rpfFile = $asm.GetType('CodeWalker.GameFiles.RpfFile')
 
 if ($ToBinary) {
-    foreach ($f in (Get-ChildItem -Path $ToBinary -Filter '*.xml' -File)) {
+    foreach ($f in (Get-ChildItem -LiteralPath $ToBinary -Filter '*.xml' -File)) {
         $name = $f.Name.ToLower()
         $fmt = $null
         if ($name.EndsWith('.ymap.xml') -or $name.EndsWith('.ytyp.xml')) { $fmt = 'RSC' }
@@ -55,7 +55,7 @@ if ($ToBinary) {
                 $doc = [System.Xml.XmlDocument]::new()
                 $doc.Load($f.FullName)
                 $folder = Join-Path $f.DirectoryName ($f.Name.Substring(0, $f.Name.IndexOf('.')))
-                if (-not (Test-Path $folder)) { $folder = $f.DirectoryName }
+                if (-not (Test-Path -LiteralPath $folder)) { $folder = $f.DirectoryName }
                 $texType = $asm.GetType('CodeWalker.GameFiles.Texture')
                 $listType = [System.Collections.Generic.List``1].MakeGenericType($texType)
                 $list = [Activator]::CreateInstance($listType)
@@ -89,7 +89,7 @@ if ($ToBinary) {
             $doc = [System.Xml.XmlDocument]::new()
             $doc.Load($f.FullName)
             $folder = Join-Path $f.DirectoryName ($f.Name.Substring(0, $f.Name.IndexOf('.')))
-            if (-not (Test-Path $folder)) { $folder = $f.DirectoryName }
+            if (-not (Test-Path -LiteralPath $folder)) { $folder = $f.DirectoryName }
             $p = New-Object 'object[]' 3
             $p[0] = $doc.psobject.BaseObject
             $p[1] = [Enum]::Parse($fmtType, $fmt)

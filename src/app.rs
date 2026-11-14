@@ -8,7 +8,7 @@ use crate::mech;
 use crate::model::{Entity, Project, Ymap};
 use crate::render::ViewOpts;
 use crate::sample;
-use eframe::egui::{self, Color32, Pos2};
+use eframe::egui::{self, Pos2};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -81,6 +81,11 @@ pub struct DwApp {
     pub redo: Vec<Project>,
     /// sauvegarde automatique, récupération, journal d'erreurs, confirmation à la fermeture (safety.rs)
     pub safe: crate::safety::Safety,
+    /// appui de souris pour lequel un pas d'annulation a déjà été pris (curseurs, valeurs glissées : un seul pas
+    /// par geste, voir safety.rs undo_once)
+    pub undo_gesture: Option<f64>,
+    /// réglage « Mémoire graphique » (Mo, 0 = automatique), lu une fois dans settings.json
+    pub gpu_budget_mb: Option<u32>,
     pub status: String,
     pub frame: u64,
     pub shot_path: Option<PathBuf>,
@@ -176,6 +181,10 @@ pub struct DwApp {
     pub atelier: crate::atelier::AtelierState,
     /// plan des intérieurs vu de dessus
     pub plan: crate::plan::PlanState,
+    /// Studio MLO : espace à part pour construire un intérieur (studio.rs)
+    pub studio: crate::studio::StudioState,
+    /// intérieurs : meubler à la main, ambiance par pièce, réduction des portails (meubler.rs)
+    pub furn: crate::meubler::FurnState,
     /// éditeur de terrain
     pub terrain: crate::terrain::TerrainState,
     pub terrain_last_upload: f64,
@@ -233,7 +242,8 @@ pub fn save_setting(key: &str, value: serde_json::Value) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, v.to_string());
+        // écriture atomique : un arrêt pendant l'écriture ne vide pas tous les réglages
+        let _ = crate::safety::write_atomic(&p, v.to_string().as_bytes());
     }
 }
 
@@ -243,7 +253,7 @@ pub fn remove_setting(key: &str) {
         let mut v = load_settings();
         if let Some(o) = v.as_object_mut() {
             if o.remove(key).is_some() {
-                let _ = std::fs::write(p, v.to_string());
+                let _ = crate::safety::write_atomic(&p, v.to_string().as_bytes());
             }
         }
     }
@@ -259,28 +269,14 @@ pub fn save_api_key(k: &str) {
 }
 
 fn setup_style(ctx: &egui::Context) {
-    // toujours le thème sombre, même si Windows est en mode clair
-    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(37, 40, 46);
-    v.window_fill = Color32::from_rgb(37, 40, 46);
-    v.extreme_bg_color = Color32::from_rgb(24, 26, 30);
-    v.selection.bg_fill = Color32::from_rgb(214, 120, 30);
-    v.hyperlink_color = Color32::from_rgb(255, 170, 70);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(70, 76, 88);
-    v.widgets.active.bg_fill = Color32::from_rgb(214, 120, 30);
-    ctx.set_visuals(v);
-    let mut s = (*ctx.style()).clone();
-    s.spacing.item_spacing = egui::vec2(6.0, 5.0);
-    s.spacing.button_padding = egui::vec2(7.0, 3.0);
-    ctx.set_style(s);
+    crate::look::setup(ctx);
 }
 
 impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         crate::update::start();
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![] };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -305,6 +301,8 @@ impl DwApp {
             area_radius: 60.0,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_gesture: None,
+            gpu_budget_mb: None,
             safe: crate::safety::Safety::new(shot_path.is_none() || std::env::var_os("DW_SAFETY_TEST").is_some()),
             status: "Bienvenue dans DragoWalker. Clic droit + glisser : tourner la vue · ZQSD/WASD : se déplacer · molette : zoom.".into(),
             frame: 0,
@@ -340,7 +338,7 @@ impl DwApp {
             mlo_d: 6.0,
             mlo_h: 3.2,
             cur_mlo: None,
-            opts: ViewOpts { show_grid: true, show_rooms: true, show_sample: true, show_perf: std::env::var_os("DW_TEST_PERF").is_some() },
+            opts: ViewOpts { show_grid: true, show_rooms: true, show_sample: true, show_perf: std::env::var_os("DW_TEST_PERF").is_some(), studio: None },
             project_path: None,
             rng: Rng::new(7),
             ground_z: 0.0,
@@ -373,6 +371,8 @@ impl DwApp {
             library: crate::library::Library::new(),
             lists: crate::lists::Lists::default(),
             plan: Default::default(),
+            studio: Default::default(),
+            furn: Default::default(),
             atelier: crate::atelier::AtelierState { square: true, wall_door: true, open: std::env::var("DW_ATELIER").is_ok(), ..Default::default() },
             intlib: crate::intlib::IntLib::new(std::env::var("DW_INTLIB").is_ok(), std::env::var("DW_INTLIB_FILTER").unwrap_or_default()),
             terrain: crate::terrain::TerrainState::default(),
@@ -434,7 +434,7 @@ impl DwApp {
 
 impl eframe::App for DwApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        crate::safety::clean_exit(self.safe.recovery.is_some());
+        self.safe.clean_exit();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

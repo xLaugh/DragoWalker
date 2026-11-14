@@ -18,8 +18,25 @@ fn script_path() -> Result<PathBuf, String> {
     // le script est écrit avec un BOM UTF-8 pour que PowerShell 5 lise bien les accents
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(SCRIPT.as_bytes());
-    std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+    // déjà là et identique : pas réécrit (une autre conversion, dans un autre fil, peut être en train de le lire)
+    if std::fs::read(&p).map(|old| old == bytes).unwrap_or(false) {
+        return Ok(p);
+    }
+    let tmp = dir.join(format!("cw_convert_{}_{}.ps1", std::process::id(), unique()));
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    if std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if !std::fs::read(&p).map(|old| old == bytes).unwrap_or(false) {
+            return Err(format!("écriture de {} impossible", p.display()));
+        }
+    }
     Ok(p)
+}
+
+/// Numéro propre à chaque appel (fichiers de travail de deux conversions en même temps).
+pub fn unique() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn run(args: &[&str]) -> Result<Vec<(bool, String, String)>, String> {
@@ -63,9 +80,13 @@ pub fn to_xml(dll: &Path, pairs: &[(PathBuf, PathBuf)]) -> Result<usize, String>
     if todo.is_empty() {
         return Ok(pairs.len());
     }
-    let list = std::env::temp_dir().join("dragowalker_cw").join("liste.txt");
+    // une liste par conversion : deux conversions en même temps (test en jeu et export) ne se la volent pas
+    let dir = std::env::temp_dir().join("dragowalker_cw");
+    let _ = std::fs::create_dir_all(&dir);
+    let list = dir.join(format!("liste_{}_{}.txt", std::process::id(), unique()));
     let txt: Vec<String> = todo.iter().map(|(a, b)| format!("{}|{}", a.display(), b.display())).collect();
     std::fs::write(&list, txt.join("\n")).map_err(|e| e.to_string())?;
-    let r = run(&["-Dll", &dll.to_string_lossy(), "-ToXmlList", &list.to_string_lossy()])?;
-    Ok(r.iter().filter(|x| x.0).count())
+    let r = run(&["-Dll", &dll.to_string_lossy(), "-ToXmlList", &list.to_string_lossy()]);
+    let _ = std::fs::remove_file(&list);
+    Ok(r?.iter().filter(|x| x.0).count())
 }

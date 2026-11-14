@@ -52,13 +52,83 @@ impl DwApp {
         }
     }
 
+    /// Aperçu de la pose sous la souris : (nom du type, position, orientation, échelle xy, échelle z). Le groupe en
+    /// cours de pose, sinon le prop glissé depuis la bibliothèque, sinon l'objet de l'outil Poser (bibliothèque,
+    /// catalogue).
+    fn pose_ghost(&self, ctx: &egui::Context, rect: Rect, grouping: bool) -> Vec<(String, V3, crate::math::Quat, f32, f32)> {
+        if self.group_place.is_some() {
+            return self.group_ghost();
+        }
+        // meuble en cours de pose dans un intérieur (meubler.rs)
+        if let Some((a, p, q, _)) = self.furn_ghost_world() {
+            return vec![(a, p, q, 1.0, 1.0)];
+        }
+        if let (Some(h), Some(w)) = (self.library.dragging, self.game.world.as_ref()) {
+            // même point que le lâcher (library.rs) : relief du jeu, sinon plan du sol
+            let at = ctx.pointer_hover_pos().filter(|p| rect.contains(*p) && !ctx.is_pointer_over_area()).and_then(|p| self.game_ground(p).or_else(|| self.cam.ground_point(p, self.ground_z)));
+            return at.map(|g| vec![(w.name_of(h), self.snap_pos(g), crate::math::Quat::IDENTITY, 1.0, 1.0)]).unwrap_or_default();
+        }
+        match self.mouse_ground {
+            Some(g) if self.tool == Tool::Place && !grouping && !self.place_arch.is_empty() => vec![(self.place_arch.clone(), self.snap_pos(g), crate::math::Quat::IDENTITY, 1.0, 1.0)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// La pose montrée par l'aperçu est impossible (meuble hors des pièces) : aperçu teinté en rouge, cadres rouges.
+    fn pose_ghost_bad(&self) -> bool {
+        self.group_place.is_none() && self.furn_ghost_world().map(|g| !g.3).unwrap_or(false)
+    }
+
+    /// Cadres de l'aperçu de pose (verts, rouges si la pose est impossible), seulement pour les modèles que la
+    /// carte graphique n'a pas (encore) : les autres sont dessinés en vrai, semi-transparents. Le seul cadre de
+    /// l'aperçu (meubler.rs n'en trace plus).
+    fn draw_ghost_frames(&self, painter: &egui::Painter, ghost: &[(String, V3, crate::math::Quat, f32, f32)], gpu: Option<&std::sync::Arc<std::sync::Mutex<crate::gpu::Gpu>>>) {
+        if ghost.is_empty() {
+            return;
+        }
+        let gl = gpu.and_then(|g| g.lock().ok());
+        let col = if self.pose_ghost_bad() { render::GHOST_FRAME_BAD } else { render::GHOST_FRAME };
+        let mut n = 0;
+        for (name, p, q, sxy, sz) in ghost {
+            if gl.as_ref().map(|g| g.has_model(render::arch_hash(name))).unwrap_or(false) {
+                continue;
+            }
+            n += 1;
+            if n > crate::groups::GROUP_MAX_GHOST_BOXES {
+                break;
+            }
+            let mut e = Entity::new(name, *p);
+            e.id = 0;
+            e.rot = *q;
+            e.scale_xy = *sxy;
+            e.scale_z = *sz;
+            render::draw_ghost_col(painter, &self.cam, &self.proj, &e, col);
+        }
+    }
+
     pub fn view(&mut self, ui: &mut egui::Ui, dt: f32) {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.cam.rect = rect;
         let ctx = ui.ctx().clone();
         let hover_pos = resp.hover_pos();
         // mode test : la souris est simulée au centre de la vue
-        let hover_pos = hover_pos.or_else(|| std::env::var("DW_TEST_PROBE").or_else(|_| std::env::var("DW_TEST_CLICKS")).or_else(|_| std::env::var("DW_TEST_ANALYSE")).ok().map(|_| crate::app::test_point(rect)));
+        let hover_pos = hover_pos.or_else(|| std::env::var("DW_TEST_PROBE").or_else(|_| std::env::var("DW_TEST_CLICKS")).or_else(|_| std::env::var("DW_TEST_ANALYSE")).or_else(|_| std::env::var("DW_TEST_GHOST")).or_else(|_| std::env::var("DW_TEST_MEUBLER")).ok().map(|_| crate::app::test_point(rect)));
+        // mode test : DW_TEST_GHOST="modèle" prend l'outil Poser avec ce modèle (aperçu sous la souris simulée) ;
+        // DW_TEST_GHOST="groupe:n" pose le n-ième groupe de la bibliothèque « Mes groupes » (lue, jamais écrite)
+        // (l'image 100 peut revenir : la capture attend les modèles en remettant le compteur à 60)
+        static GHOST_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frame == 100 && !GHOST_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(n) = std::env::var("DW_TEST_GHOST") {
+                if let Some(li) = n.strip_prefix("groupe:").and_then(|v| v.parse::<usize>().ok()) {
+                    self.group_lib_load();
+                    self.status = self.group_lib_place(li);
+                    println!("aperçu : {}", self.status);
+                } else if !n.is_empty() && n != "1" {
+                    self.place_arch = n;
+                    self.tool = Tool::Place;
+                }
+            }
+        }
         let mods = ctx.input(|i| i.modifiers);
 
         // caméra : clic droit tourne (vue carte : déplace), clic molette déplace, molette zoome
@@ -80,8 +150,8 @@ impl DwApp {
         if resp.hovered() {
             let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                if self.group_place.is_some() {
-                    // pose d'un groupe : la molette le tourne (groups.rs)
+                if self.group_place.is_some() || self.furn.place.is_some() {
+                    // pose d'un groupe ou d'un meuble : la molette le tourne (groups.rs, meubler.rs)
                 } else if self.tool == Tool::Erase && mods.alt {
                     self.erase_radius = (self.erase_radius * if scroll > 0.0 { 1.1 } else { 0.9 }).clamp(1.0, 500.0);
                 } else if mods.alt && self.game.cut_on {
@@ -183,7 +253,7 @@ impl DwApp {
                 // pas de survol quand la souris ne choisit pas (pose d'un objet ou d'un groupe), comme CodeWalker qui
                 // ne garde la liste des objets dessinés que si la sélection à la souris est active
                 // (WorldForm::BeginMouseHitTest 0x060002a4 : RenderedDrawablesListEnable)
-                let u = if self.tool != Tool::Place && self.group_place.is_none() { hover_pos.and_then(|p| self.hover_under(p, !(mods.command || mods.shift))) } else { None };
+                let u = if self.tool != Tool::Place && self.group_place.is_none() && self.furn.place.is_none() { hover_pos.and_then(|p| self.hover_under(p, !(mods.command || mods.shift))) } else { None };
                 self.hover = match u {
                     Some(crate::game_ui::Under::Proj(id)) if self.tool == Tool::Select => Some(id),
                     _ => None,
@@ -213,8 +283,10 @@ impl DwApp {
         }
         // pose d'un groupe : la souris le pose, la molette le tourne
         let grouping = !editing && self.group_input(&ctx, &resp);
+        // pose d'un meuble dans la pièce d'un intérieur (meubler.rs)
+        let grouping = grouping || (!editing && self.furn_input(&ctx, &resp, hover_pos));
         // atelier : tracé de l'emprise d'un bâtiment
-        let tracing = !editing && !grouping && (self.atelier.tracing || self.atelier.door_pick.is_some() || self.atelier.wall_pick.is_some() || self.atelier.light_pick.is_some() || self.atelier.win_pick.is_some());
+        let tracing = !editing && !grouping && (self.atelier.tracing || self.atelier.door_pick.is_some() || self.atelier.wall_pick.is_some() || self.atelier.light_pick.is_some() || self.atelier.win_pick.is_some() || self.atelier.stair_pick.is_some());
         if tracing {
             self.atelier_input(&resp, &ctx);
         }
@@ -306,10 +378,10 @@ impl DwApp {
             }
         }
         // aperçu de l'export d'un MLO (fenêtre « Pièces du MLO ») : ses façades là où elles seront posées
-        let mut mlo_extra = self.mlo_preview_insts();
-        // groupe en cours de pose, sous la souris
-        mlo_extra.extend(self.group_ghost());
-        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default(), extra: mlo_extra });
+        let mlo_extra = self.mlo_preview_insts();
+        // aperçu de la pose : vrais modèles semi-transparents (gpu.rs ghost_pass), cadres verts s'ils manquent
+        let ghost = self.pose_ghost(&ctx, rect, grouping);
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default(), extra: mlo_extra, ghost: ghost.iter().map(|(n, p, q, sxy, sz)| (render::arch_hash(n), *p, *q, *sxy, *sz)).collect(), ghost_bad: self.pose_ghost_bad() });
         render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
         drop(gctx);
         self.game.drawn = drawn;
@@ -346,7 +418,10 @@ impl DwApp {
         // aperçu de l'herbe du jeu : retiré avec le pinceau (voir A_FAIRE.md)
         self.draw_occluders(&painter);
         self.draw_perf(&painter, rect);
+        self.draw_ghost_frames(&painter, &ghost, gpu.as_ref());
         self.draw_group_ghost(&painter);
+        self.draw_furn_ghost(&painter);
+        self.draw_ambiance_preview(&painter, rect);
         self.draw_scenery_overlay(&painter, hover_pos);
         self.draw_life_overlay(&painter, hover_pos);
         // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
@@ -367,9 +442,6 @@ impl DwApp {
         match self.tool {
             Tool::Place => {
                 if let Some(g) = self.mouse_ground {
-                    let mut e = Entity::new(&self.place_arch, self.snap_pos(g));
-                    e.id = 0;
-                    render::draw_ghost(&painter, &self.cam, &self.proj, &e);
                     if self.place_into_mlo && self.mlo_at(g).is_some() {
                         if let Some(p) = hover_pos {
                             painter.text(p + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, "» dans l'intérieur", egui::FontId::proportional(13.0), Color32::from_rgb(80, 220, 255));

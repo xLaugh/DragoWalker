@@ -157,6 +157,8 @@ pub struct ViewOpts {
     pub show_sample: bool,
     /// compteur de performance en haut à gauche de la vue
     pub show_perf: bool,
+    /// Studio MLO : hauteur du sol de l'intérieur (fond sombre, grille de 1 m à cette hauteur, pas de sol)
+    pub studio: Option<f32>,
 }
 
 /// Ce qu'il faut pour dessiner le monde du jeu.
@@ -195,7 +197,20 @@ pub struct GameCtx<'a> {
     pub waters: Vec<[f32; 5]>,
     /// objets en plus à dessiner : (modèle, position, orientation, échelle xy, échelle z)
     pub extra: Vec<(u32, V3, crate::math::Quat, f32, f32)>,
+    /// aperçu de la pose (objet, groupe ou prop glissé qui suit la souris), mêmes champs : dessiné en dernier,
+    /// semi-transparent et teinté (gpu.rs ghost_pass)
+    pub ghost: Vec<(u32, V3, crate::math::Quat, f32, f32)>,
+    /// la pose montrée par l'aperçu est impossible (meuble hors des pièces…) : teinte rouge
+    pub ghost_bad: bool,
 }
+
+/// Teinte et opacité de l'aperçu de pose : vert clair à 45 % — **estimé** (lisible sur le décor sans le cacher).
+pub const GHOST_TINT: [f32; 4] = [0.45, 1.0, 0.55, 0.45];
+/// Teinte de l'aperçu d'une pose impossible : rouge clair, même opacité — **estimé**.
+pub const GHOST_TINT_BAD: [f32; 4] = [1.0, 0.4, 0.35, 0.45];
+/// Couleur des cadres de l'aperçu (modèle pas encore chargé) : pose possible, pose impossible.
+pub const GHOST_FRAME: Color32 = Color32::from_rgb(120, 255, 140);
+pub const GHOST_FRAME_BAD: Color32 = Color32::from_rgb(255, 90, 70);
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -423,6 +438,19 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             bmax: [mx.x, mx.y, mx.z],
         });
     }
+    // aperçu de la pose : à part, dessiné en dernier
+    let mut ghosts: Vec<Inst> = Vec::with_capacity(g.ghost.len());
+    for (h, p, q, sxy, sz) in &g.ghost {
+        gl.want(*h);
+        let (mn, mx) = w.arch_box(*h);
+        ghosts.push(Inst {
+            arch: *h,
+            m: model_matrix([p.x, p.y, p.z], [q.x, q.y, q.z, q.w], [*sxy, *sxy, *sz]),
+            color: [0.75, 0.7, 0.65],
+            bmin: [mn.x, mn.y, mn.z],
+            bmax: [mx.x, mx.y, mx.z],
+        });
+    }
     // terrain de l'éditeur
     if let (Some((arch, o, mn, mx)), None, None) = (g.terrain, g.isolate, g.only) {
         // libéré de la carte graphique : renvoyé depuis sa copie en mémoire (gpu.rs custom_src)
@@ -454,6 +482,8 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         },
         time: START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(),
         clip_z: g.cut_z.unwrap_or(1.0e9),
+        ghosts,
+        ghost_tint: if g.ghost_bad { GHOST_TINT_BAD } else { GHOST_TINT },
     });
     let gpu2 = gpu.clone();
     painter.add(egui::PaintCallback {
@@ -656,8 +686,16 @@ pub fn draw_scene(
 ) {
     drawn.clear();
     let rect = cam.rect;
-    // ciel (dégradé)
-    if cam.map_view {
+    // ciel (dégradé) ; dans le studio, fond sombre comme un logiciel 3D
+    if opts.studio.is_some() {
+        let mut sky = Mesh::default();
+        let (top, low) = if cam.map_view { (Color32::from_rgb(30, 32, 38), Color32::from_rgb(30, 32, 38)) } else { (Color32::from_rgb(44, 48, 56), Color32::from_rgb(24, 26, 31)) };
+        for (p, c) in [(rect.left_top(), top), (rect.right_top(), top), (rect.right_bottom(), low), (rect.left_bottom(), low)] {
+            sky.vertices.push(Vertex { pos: p, uv: egui::epaint::WHITE_UV, color: c });
+        }
+        sky.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(EShape::mesh(sky));
+    } else if cam.map_view {
         painter.rect_filled(rect, 0.0, Color32::from_rgb(38, 84, 120));
     } else {
         let mut sky = Mesh::default();
@@ -673,7 +711,9 @@ pub fn draw_scene(
 
     // sol
     let mut ground = Mesh::default();
-    if opts.show_sample {
+    if opts.studio.is_some() {
+        // studio : pas de sol, seulement la grille
+    } else if opts.show_sample {
         for (q, col) in sample::ground() {
             let cp: Vec<V3> = q.iter().map(|p| cam.to_cam(*p)).collect();
             let cp = clip_near(&cp, cam.near);
@@ -696,8 +736,21 @@ pub fn draw_scene(
     }
     painter.add(EShape::mesh(ground));
 
+    // grille du studio : 1 m, ligne plus marquée tous les 5 m, axes de l'intérieur en couleur
+    if let (true, Some(z)) = (opts.show_grid, opts.studio) {
+        let n = 40;
+        let cx = cam.target.x.round();
+        let cy = cam.target.y.round();
+        let z = z - 0.02;
+        for i in -n..=n {
+            let (x, y) = (cx + i as f32, cy + i as f32);
+            let a = |v: f32| if (v.rem_euclid(5.0)).abs() < 0.01 { 46 } else { 18 };
+            line3(painter, cam, v3(x, cy - n as f32, z), v3(x, cy + n as f32, z), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, a(x))));
+            line3(painter, cam, v3(cx - n as f32, y, z), v3(cx + n as f32, y, z), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, a(y))));
+        }
+    }
     // grille (10 m près de la cible)
-    if opts.show_grid {
+    if opts.show_grid && opts.studio.is_none() {
         let step = if cam.map_view { (cam.cur_ortho / 10.0).max(10.0) } else { (cam.cur_dist / 6.0).max(10.0) };
         let step = 10f32.powf(step.log10().round());
         let n = 20;
@@ -854,10 +907,11 @@ pub fn draw_scene(
     }
 }
 
-/// Dessine un cadre de prévisualisation (prop à poser).
-pub fn draw_ghost(painter: &Painter, cam: &Camera, proj: &Project, e: &Entity) {
+/// Dessine un cadre de prévisualisation (prop à poser) dans une couleur donnée (GHOST_FRAME, GHOST_FRAME_BAD :
+/// pose impossible).
+pub fn draw_ghost_col(painter: &Painter, cam: &Camera, proj: &Project, e: &Entity, col: Color32) {
     let w = e.corners(proj);
-    draw_box_edges(painter, cam, &w, Stroke::new(1.5_f32, Color32::from_rgb(120, 255, 140)));
+    draw_box_edges(painter, cam, &w, Stroke::new(1.5_f32, col));
 }
 
 #[allow(dead_code)]

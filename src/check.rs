@@ -287,7 +287,7 @@ impl DwApp {
         let proj_checks = self.project_checks();
         let folder_report = self.check_folder_report.clone();
         let mut pick_folder = false;
-        self.show_panel(ctx, "controle", "Contrôle avant l'export", crate::docking::Dock::Floating, [560.0, 520.0], &mut open, |_s, ui| {
+        self.show_panel(ctx, "controle", "Contrôle avant l'export", crate::docking::Dock::Floating, [560.0, 520.0], &mut open, |s, ui| {
             ui.label(RichText::new("Projet").strong());
             for (lvl, msg) in &proj_checks {
                 let (mark, col) = match lvl {
@@ -329,6 +329,10 @@ impl DwApp {
                 }
             });
             ui.label(RichText::new("Tailles des réserves lues dans gameconfig.xml du jeu ; la carte du jeu en occupe déjà une part : orange au-delà de la moitié.").small().weak());
+            // portails près de la limite : les réunir (meubler.rs)
+            if stats.iter().any(|(_, _, p, alert)| *alert && p.as_ref().map(|p| p.0 == "PortalInst").unwrap_or(false)) {
+                s.portals_ui(ui, None);
+            }
             ui.separator();
             ui.label(RichText::new("Dossier de ressource FiveM").strong());
             if ui.button("Contrôler un dossier…").on_hover_text("Vérifie une ressource déjà exportée (la tienne ou une autre) : fichiers .xml ou .zip oubliés dans stream/, fichiers vides, fichiers déclarés absents").clicked() {
@@ -419,7 +423,17 @@ pub fn scan_resource_dir(dir: &std::path::Path) -> Vec<(Level, String)> {
         if line.contains("data_file") {
             let parts: Vec<&str> = line.split(['\'', '"']).filter(|s| !s.trim().is_empty() && !s.contains("data_file")).collect();
             if let Some(f) = parts.get(1) {
-                if f.contains('/') && !f.contains('*') && !dir.join(f).is_file() {
+                // données audio : déclarées par leur nom de base « x.dat », le fichier est « x.dat151.rel » (jeu),
+                // « x.dat54.rel » (sons)… — FiveM ajoute le numéro et « .rel »
+                let audio_rel = |f: &str| -> bool {
+                    let p = dir.join(f);
+                    let (Some(parent), Some(base)) = (p.parent(), p.file_name().map(|n| n.to_string_lossy().to_lowercase())) else { return false };
+                    base.ends_with(".dat") && std::fs::read_dir(parent).into_iter().flatten().flatten().any(|e| {
+                        let n = e.file_name().to_string_lossy().to_lowercase();
+                        n.starts_with(&base) && n.ends_with(".rel") && n[base.len()..n.len() - 4].chars().all(|c| c.is_ascii_digit())
+                    })
+                };
+                if f.contains('/') && !f.contains('*') && !dir.join(f).is_file() && !audio_rel(f) {
                     missing.push(f.to_string());
                 }
             }

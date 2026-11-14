@@ -29,6 +29,17 @@ fn text(out: &mut String, ind: &str, tag: &str, t: &str) {
     }
 }
 
+/// Objet d'un intérieur tel qu'écrit : distance d'affichage par défaut de DragoWalker (200 m) → -1, la distance du
+/// modèle lui-même, comme la plupart des objets des MLO FiveM analysés le 14 nov. 2026 ; une distance choisie à la
+/// main est gardée.
+fn mlo_child(e: &Entity) -> Entity {
+    let mut c = e.clone();
+    if (c.lod_dist - crate::mech::ENTITY_LOD_DIST).abs() < 1e-3 {
+        c.lod_dist = -1.0;
+    }
+    c
+}
+
 /// Écrit les champs d'une CEntityDef. La rotation du fichier est l'inverse de l'orientation.
 fn entity_fields(out: &mut String, ind: &str, e: &Entity, invert: bool) {
     text(out, ind, "archetypeName", &e.archetype);
@@ -229,7 +240,7 @@ pub fn write_ytyp(t: &Ytyp) -> String {
                 o.push_str("   <entities>\n");
                 for e in &m.entities {
                     o.push_str("    <Item type=\"CEntityDef\">\n");
-                    entity_fields(&mut o, "     ", e, true);
+                    entity_fields(&mut o, "     ", &mlo_child(e), true);
                     o.push_str("    </Item>\n");
                 }
                 o.push_str("   </entities>\n");
@@ -285,14 +296,18 @@ pub fn write_ytyp(t: &Ytyp) -> String {
                 for s in &m.entity_sets {
                     o.push_str("    <Item>\n");
                     text(&mut o, "     ", "name", &s.name);
-                    o.push_str("     <locations />\n");
+                    // pièce de chaque objet de l'ensemble (CMloEntitySet.locations, dans l'ordre des objets) ; une pièce
+                    // qui n'existe plus : celle où l'objet se trouve (comme les objets de l'intérieur plus haut)
+                    let nr = m.rooms.len();
+                    let locs: Vec<usize> = s.entities.iter().map(|e| if e.room < nr { e.room } else { crate::model::room_at(m, e.pos) }).collect();
+                    uint_array(&mut o, "     ", "locations", &locs);
                     if s.entities.is_empty() {
                         o.push_str("     <entities />\n");
                     } else {
                         o.push_str("     <entities>\n");
                         for e in &s.entities {
                             o.push_str("      <Item type=\"CEntityDef\">\n");
-                            entity_fields(&mut o, "       ", e, true);
+                            entity_fields(&mut o, "       ", &mlo_child(e), true);
                             o.push_str("      </Item>\n");
                         }
                         o.push_str("     </entities>\n");
@@ -500,10 +515,15 @@ pub fn read_ytyp(src: &str, fallback_name: &str) -> Result<Ytyp, String> {
             }
             if let Some(sets) = child(it, "entitySets") {
                 for s in sets.children().filter(|c| c.is_element()) {
-                    let mut set = EntitySet { name: ctext(s, "name"), entities: Vec::new() };
+                    let mut set = EntitySet { name: ctext(s, "name"), entities: Vec::new(), default_on: false };
                     if let Some(ents) = child(s, "entities") {
                         for e in ents.children().filter(|c| c.is_element()) {
                             set.entities.push(read_entity(src, e, true));
+                        }
+                    }
+                    for (i, room) in parse_uints(child(s, "locations")).into_iter().enumerate() {
+                        if let Some(e) = set.entities.get_mut(i) {
+                            e.room = room;
                         }
                     }
                     m.entity_sets.push(set);
@@ -544,5 +564,22 @@ mod tests {
         assert_eq!(back.mlos[0].rooms.len(), 3);
         assert_eq!(back.mlos[0].portals.len(), 2);
         assert_eq!(back.mlos[0].entities[0].room, 2);
+    }
+    #[test]
+    fn pieces_des_ensembles() {
+        let mut m = build_mlo("dw_test", 2, 1, 6.0, 5.0, 3.0);
+        let mut set = EntitySet { name: "set".into(), entities: vec![], default_on: false };
+        for r in [2usize, 1] {
+            let mut e = Entity::new("prop_table_03", v3(1.0, 0.0, 0.0));
+            e.room = r;
+            set.entities.push(e);
+        }
+        m.entity_sets.push(set);
+        let t = Ytyp { name: "t".into(), mlos: vec![m], visible: true, raw_archetypes: vec![] };
+        let s = write_ytyp(&t);
+        assert!(!s.contains("<locations />"));
+        let back = read_ytyp(&s, "t").unwrap();
+        let rooms: Vec<usize> = back.mlos[0].entity_sets[0].entities.iter().map(|e| e.room).collect();
+        assert_eq!(rooms, vec![2, 1]);
     }
 }

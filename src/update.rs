@@ -181,10 +181,16 @@ fn parse_sums(text: &str, file: &str) -> Option<String> {
 fn verify(data: &[u8], file: &str, sums_url: &Option<String>) -> Result<(), String> {
     let Some(url) = sums_url else { return Ok(()) };
     let text = agent().get(url).timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("empreintes illisibles : {e}"))?.into_string().map_err(|e| e.to_string())?;
-    match parse_sums(&text, file) {
+    check_sums(data, file, &text)
+}
+
+/// Compare l'empreinte du fichier à celle du SHA256SUMS : un fichier absent de la liste est refusé (la liste
+/// existe, elle devrait le contenir : release incomplète ou fichier inattendu).
+fn check_sums(data: &[u8], file: &str, sums: &str) -> Result<(), String> {
+    match parse_sums(sums, file) {
         Some(expected) if sha256_hex(data) == expected => Ok(()),
         Some(_) => Err("l'empreinte SHA-256 du fichier téléchargé ne correspond pas à celle de la release (fichier corrompu ou altéré), rien n'a été installé".into()),
-        None => Ok(()),
+        None => Err(format!("{file} n'est pas dans la liste des empreintes SHA-256 de la release : rien n'a été installé")),
     }
 }
 
@@ -342,6 +348,10 @@ mod tests {
         assert_eq!(parse_sums(sums, "dragowalker-0.2.4.zip").as_deref(), Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
         assert_eq!(parse_sums(sums, "DragoWalker-0.2.4-setup.exe").map(|h| h.len()), Some(64));
         assert!(parse_sums(sums, "invalide.txt").is_none() && parse_sums(sums, "autre.zip").is_none());
+        // fichier absent d'une liste qui existe : refusé ; bonne et mauvaise empreinte
+        assert!(check_sums(b"abc", "autre.zip", sums).is_err());
+        assert!(check_sums(b"abc", "DragoWalker-0.2.4.zip", sums).is_ok());
+        assert!(check_sums(b"abd", "DragoWalker-0.2.4.zip", sums).is_err());
     }
 
     #[test]

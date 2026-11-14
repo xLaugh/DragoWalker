@@ -28,6 +28,8 @@ MinVersion=10.0
 OutputDir={#SrcDir}\..
 OutputBaseFilename=DragoWalker-{#AppVersion}-setup
 UninstallDisplayIcon={app}\DragoWalker.exe
+; logo DW (chemin relatif à ce script)
+SetupIconFile=..\assets\dragowalker.ico
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

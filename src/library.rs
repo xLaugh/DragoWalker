@@ -781,6 +781,35 @@ impl DwApp {
 }
 
 impl DwApp {
+    /// Prépare quelques vignettes demandées par un autre panneau (catalogue des meubles, meubler.rs) : même cache
+    /// que la bibliothèque, quelques-unes par image pour ne pas ralentir.
+    pub fn library_make_thumbs(&mut self, todo: &[u32]) {
+        for &h in todo.iter().take(THUMBS_PER_FRAME) {
+            let tm = self.game.world.as_ref().and_then(|w| load_tex_model(w, h, 32, 0));
+            let m = if tm.is_none() { self.game.world.as_ref().and_then(|w| w.load_model(h, 30000)) } else { None };
+            match (tm, m) {
+                (Some(tm), _) => {
+                    let t = make_thumb_tex(&tm, self.library.frame);
+                    self.library.thumbs.insert(h, t);
+                }
+                (None, Some(m)) => {
+                    let t = make_thumb(&m, self.library.frame);
+                    self.library.thumbs.insert(h, t);
+                }
+                (None, None) => {
+                    self.library.missing.insert(h);
+                }
+            }
+        }
+        if self.library.thumbs.len() > THUMB_CACHE {
+            let mut v: Vec<(u64, u32)> = self.library.thumbs.iter().map(|(k, t)| (t.last, *k)).collect();
+            v.sort();
+            for (_, k) in v.into_iter().take(self.library.thumbs.len() - THUMB_CACHE) {
+                self.library.thumbs.remove(&k);
+            }
+        }
+    }
+
     /// Grand aperçu qui tourne, avec les vraies textures du jeu posées sur le modèle.
     pub fn textured_preview(&mut self, ui: &mut egui::Ui, h: u32, name: &str) {
         self.textured_preview_with(ui, h, name, &|w| load_tex_model(w, h, 32, 256));

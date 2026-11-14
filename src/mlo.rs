@@ -56,6 +56,20 @@ pub struct MloRes {
     /// garde son choix par défaut (piece_default)
     #[serde(default)]
     pub picks: Vec<(String, bool)>,
+    /// intérieurs définis par les .ytyp du créateur à l'import (en minuscules) : un intérieur créé ensuite dans un
+    /// de ces fichiers n'en fait pas partie (fix_misplaced_mlos) ; vide pour un projet importé avant le 13 nov. 2026
+    #[serde(default)]
+    pub mlo_names: Vec<String>,
+}
+
+/// Copie un fichier du créateur dans le dossier exporté en lui donnant la date de maintenant : la copie garde sinon
+/// la date d'origine et passerait pour un reste d'un export précédent (liste de l'export, export.rs).
+pub fn copy_fresh(src: &Path, dest: &Path) -> std::io::Result<u64> {
+    let n = std::fs::copy(src, dest)?;
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dest) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    Ok(n)
 }
 
 /// Sorte de pièce d'une ressource MLO (fenêtre « Pièces du MLO »).
@@ -181,6 +195,128 @@ pub struct MloState {
     pub focus: Option<String>,
     /// pièces du MLO de la fenêtre : (nom, pièces, jeu chargé quand elles ont été lues)
     pub pieces_cache: (String, Vec<Piece>, bool),
+    /// variantes (entity sets) des intérieurs du projet montrées dans la vue : (nom de l'intérieur, nom de la
+    /// variante), en minuscules ; pas enregistré dans le projet
+    pub set_preview: std::collections::HashSet<(String, String)>,
+    /// nom tapé pour la prochaine variante (onglet Intérieur)
+    pub set_new_name: String,
+}
+
+/// Nom libre pour une nouvelle variante : le nom tapé (ou celui par défaut de CodeWalker), suivi d'un numéro s'il
+/// est déjà pris (sans tenir compte des majuscules, comme le jeu qui ne garde que le hachage).
+pub fn unique_set_name(m: &crate::model::MloArchetype, wanted: &str) -> String {
+    let base = wanted.trim();
+    let base = if base.is_empty() { crate::mech::ENTITY_SET_DEFAULT_NAME } else { base };
+    let taken = |n: &str| m.entity_sets.iter().any(|s| s.name.eq_ignore_ascii_case(n));
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..).map(|k| format!("{base}{k}")).find(|n| !taken(n)).unwrap_or_default()
+}
+
+/// Déplace les objets `ids` de l'intérieur dans la variante `si` (pièce gardée). Rend le nombre déplacé.
+pub fn move_into_set(m: &mut crate::model::MloArchetype, si: usize, ids: &[u64]) -> usize {
+    if si >= m.entity_sets.len() {
+        return 0;
+    }
+    let (moved, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut m.entities).into_iter().partition(|e| ids.contains(&e.id));
+    m.entities = kept;
+    let n = moved.len();
+    m.entity_sets[si].entities.extend(moved);
+    n
+}
+
+/// Remet dans l'intérieur l'objet `k` de la variante `si` (tous si `None`). Les objets reçoivent un nouvel
+/// identifiant (ceux des variantes ne comptent pas dans Project::max_id : pas de doublon après un rechargement).
+/// Rend leurs identifiants.
+pub fn take_out_of_set(m: &mut crate::model::MloArchetype, si: usize, k: Option<usize>) -> Vec<u64> {
+    let Some(s) = m.entity_sets.get_mut(si) else { return Vec::new() };
+    let out: Vec<crate::model::Entity> = match k {
+        Some(k) if k < s.entities.len() => vec![s.entities.remove(k)],
+        Some(_) => Vec::new(),
+        None => std::mem::take(&mut s.entities),
+    };
+    let mut ids = Vec::new();
+    for mut e in out {
+        e.id = crate::model::new_id();
+        ids.push(e.id);
+        m.entities.push(e);
+    }
+    ids
+}
+
+/// Une ligne de dw_entity_sets.lua : un intérieur placé (point dans sa première pièce), ses variantes et celles
+/// actives par défaut.
+pub fn entity_sets_lua_line(name: &str, p: V3, sets: &[String], defaults: &[String]) -> String {
+    let list = |v: &[String]| v.iter().map(|s| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))).collect::<Vec<_>>().join(", ");
+    format!("  {{ name = '{}', x = {:.3}, y = {:.3}, z = {:.3}, sets = {{ {} }}, defaults = {{ {} }} }},", name.replace('\'', "\\'"), p.x, p.y, p.z, list(sets), list(defaults))
+}
+
+/// Script client dw_entity_sets.lua (exemple commenté) à partir de ses lignes.
+pub fn entity_sets_lua(lines: &[String]) -> String {
+    format!(
+        "-- DragoWalker : variantes des intérieurs (entity sets)
+--
+-- Chaque intérieur placé du projet, un point dans sa première pièce, ses variantes (sets) et celles cochées
+-- « Actif par défaut » dans DragoWalker (defaults). Seules ces dernières sont activées par ce script.
+--
+-- Activer une variante depuis un autre script client (x, y, z : ceux de l'intérieur dans la liste plus bas) :
+--   ActivateInteriorEntitySet(GetInteriorAtCoords(x, y, z), 'nom_de_la_variante')
+--   RefreshInterior(GetInteriorAtCoords(x, y, z))
+-- ou, en gardant l'intérieur :
+--   local interieur = GetInteriorAtCoords(x, y, z)
+--   ActivateInteriorEntitySet(interieur, 'nom_de_la_variante')
+--   RefreshInterior(interieur)
+-- La désactiver : DeactivateInteriorEntitySet(interieur, 'nom_de_la_variante') puis RefreshInterior(interieur).
+-- Ou, depuis ce fichier : DwSetVariante(1, 'nom_de_la_variante', true) (1 = premier intérieur de la liste).
+
+local interiors = {{
+{}
+}}
+
+-- Active ou désactive une variante de l'intérieur numéro i de la liste
+function DwSetVariante(i, set, on)
+  local it = interiors[i]
+  if not it then return end
+  local id = GetInteriorAtCoords(it.x, it.y, it.z)
+  if id == 0 then return end
+  if on then
+    ActivateInteriorEntitySet(id, set)
+  else
+    DeactivateInteriorEntitySet(id, set)
+  end
+  RefreshInterior(id)
+end
+
+-- variantes actives par défaut : posées dès que l'intérieur est chargé (et de nouveau s'il est rechargé)
+CreateThread(function()
+  local any = false
+  for _, it in ipairs(interiors) do
+    if #it.defaults > 0 then any = true end
+  end
+  if not any then return end
+  while true do
+    for _, it in ipairs(interiors) do
+      if #it.defaults > 0 then
+        local id = GetInteriorAtCoords(it.x, it.y, it.z)
+        if id ~= 0 and IsValidInterior(id) then
+          local changed = false
+          for _, set in ipairs(it.defaults) do
+            if not IsInteriorEntitySetActive(id, set) then
+              ActivateInteriorEntitySet(id, set)
+              changed = true
+            end
+          end
+          if changed then RefreshInterior(id) end
+        end
+      end
+    end
+    Wait(2000)
+  end
+end)
+",
+        lines.join("\n")
+    )
 }
 
 /// Rayon contre une boîte donnée par ses 8 coins (coin 0, puis +x = 1, +y = 2, +z = 4) : distance d'entrée.
@@ -915,6 +1051,7 @@ impl DwApp {
                     Ok(mut t) => {
                         t.name = stem.clone();
                         interiors += t.mlos.len();
+                        res.mlo_names.extend(t.mlos.iter().map(|m| m.name.to_lowercase()));
                         self.proj.ytyps.retain(|y| !y.name.eq_ignore_ascii_case(&stem));
                         self.proj.ytyps.push(t);
                         res.ytyp_files.push((stem.clone(), if bin.as_os_str().is_empty() { String::new() } else { bin.to_string_lossy().to_string() }));
@@ -1150,6 +1287,9 @@ impl DwApp {
     /// que hors des cartes de la ressource. Rend le nombre déplacé.
     pub fn fix_misplaced_mlos(&mut self) -> usize {
         let mut moves: Vec<(usize, usize)> = Vec::new();
+        // projet importé avant que la liste des intérieurs du créateur soit gardée : son intérieur est celui qui a
+        // sa collision (même nom que lui, comme dans export_mlos)
+        let legacy_own = |r: &MloRes, name: &str| -> bool { r.ybns.iter().any(|b| stem_of(Path::new(b)).eq_ignore_ascii_case(name)) };
         for r in &self.proj.mlo_res {
             let res_maps: std::collections::HashSet<String> = r.ymaps.iter().map(|m| Path::new(m).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default().trim_end_matches(".ymap").to_string()).collect();
             for (ti, t) in self.proj.ytyps.iter().enumerate() {
@@ -1157,6 +1297,11 @@ impl DwApp {
                     continue;
                 }
                 for (mi, m) in t.mlos.iter().enumerate() {
+                    // intérieur du créateur : jamais sorti de son fichier, même placé ailleurs que dans ses cartes
+                    let creators = if r.mlo_names.is_empty() { legacy_own(r, &m.name) } else { r.mlo_names.contains(&m.name.to_lowercase()) };
+                    if creators {
+                        continue;
+                    }
                     let mut in_res = false;
                     let mut elsewhere = false;
                     for y in &self.proj.ymaps {
@@ -1191,8 +1336,22 @@ impl DwApp {
         n
     }
 
+    /// Noms (en minuscules) des .ytyp venus d'une ressource MLO importée, qu'ils soient fournis en binaire ou
+    /// seulement en XML, et même si le dossier de la ressource a bougé : leurs intérieurs sont ceux du créateur
+    /// (ni coque, ni collision, ni son de DragoWalker ; jamais d'intérieur créé rangé dedans).
     pub fn mlo_external_ytyps(&self) -> std::collections::HashSet<String> {
+        self.proj.mlo_res.iter().flat_map(|r| r.ytyp_files.iter().map(|f| f.0.to_lowercase())).collect()
+    }
+
+    /// .ytyp importés dont le fichier binaire du créateur est là : recopiés tels quels à l'export (les autres, fournis
+    /// en XML seulement ou introuvables, sont réécrits depuis le projet).
+    pub fn mlo_copied_ytyps(&self) -> std::collections::HashSet<String> {
         self.proj.mlo_res.iter().flat_map(|r| r.ytyp_files.iter().filter(|f| !f.1.is_empty() && Path::new(&f.1).is_file()).map(|f| f.0.to_lowercase())).collect()
+    }
+
+    /// Vrai si le .ytyp n° `ti` du projet vient d'une ressource MLO importée.
+    pub fn mlo_ytyp_imported(&self, ti: usize) -> bool {
+        self.proj.ytyps.get(ti).map(|t| self.mlo_external_ytyps().contains(&t.name.to_lowercase())).unwrap_or(false)
     }
 
     /// Hachages des intérieurs définis par les .ytyp de la ressource (une collision du même nom est celle de
@@ -1379,12 +1538,12 @@ impl DwApp {
                     // nom différent pour ne pas écraser celui de DragoWalker — **estimé** (FiveM lit les .ymf du dossier stream)
                     dest = stream.join(format!("{}_manifest.ymf", r.name.replace(' ', "_").to_lowercase()));
                 }
-                if std::fs::copy(p, &dest).is_ok() {
+                if copy_fresh(p, &dest).is_ok() {
                     copied += 1;
                 }
             }
             for (n, f) in &r.ytyp_files {
-                if !f.is_empty() && std::fs::copy(f, stream.join(format!("{n}.ytyp"))).is_ok() {
+                if !f.is_empty() && copy_fresh(Path::new(f), &stream.join(format!("{n}.ytyp"))).is_ok() {
                     copied += 1;
                 }
             }
@@ -1416,7 +1575,7 @@ impl DwApp {
                     // reste d'un export précédent dans ce dossier : retiré, sinon FiveM le chargerait encore
                     let _ = std::fs::remove_file(stream.join(fname));
                 } else if interior || !moved_mlo {
-                    if std::fs::copy(p, stream.join(fname)).is_ok() {
+                    if copy_fresh(p, &stream.join(fname)).is_ok() {
                         copied += 1;
                         interior_cols += interior as usize;
                     }
@@ -1441,10 +1600,10 @@ impl DwApp {
                             }
                         }
                         None => {
-                            if let Some(fname) = b.file_name() {
-                                let _ = std::fs::copy(b, stream.join(fname));
-                            }
-                            report.push(format!("Collision {} du MLO « {} » pas déplacée (CodeWalker n'a pas pu la lire) : elle reste à l'ancien endroit.", b.display(), r.name));
+                            // pas recopiée : sous son nom (celui du jeu pour une collision du quartier d'origine,
+                            // retirée plus haut) elle remplacerait celle du jeu là-bas, ou laisserait des murs
+                            // invisibles à l'ancien endroit
+                            report.push(format!("Collision {} du MLO « {} » pas mise (CodeWalker n'a pas pu la lire pour la déplacer avec lui) : vérifie le dossier de CodeWalker (onglet Jeu) et exporte à nouveau.", b.display(), r.name));
                         }
                     }
                 }
@@ -1482,7 +1641,7 @@ impl DwApp {
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::copy(&src, &dest).is_ok() {
+                if copy_fresh(&src, &dest).is_ok() {
                     man += &format!("{kind} '{}'\n", rel.replace('\\', "/"));
                     if moved_mlo {
                         report.push(format!("Script {rel} du MLO « {} » recopié ; s'il contient des positions (portes verrouillées…), elles sont celles de l'endroit d'origine.", r.name));
@@ -1496,7 +1655,7 @@ impl DwApp {
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::copy(&src, &dest).is_ok() {
+                if copy_fresh(&src, &dest).is_ok() {
                     man += &format!("files {{ '{}' }}\ndata_file '{ty}' '{}'\n", rel.replace('\\', "/"), rel.replace('\\', "/"));
                 }
             }
@@ -1506,7 +1665,7 @@ impl DwApp {
             if !r.credit_files.is_empty() {
                 let _ = std::fs::create_dir_all(&cdir);
                 for c in &r.credit_files {
-                    if std::fs::copy(Path::new(&r.dir).join(c), cdir.join(c)).is_ok() {
+                    if copy_fresh(&Path::new(&r.dir).join(c), &cdir.join(c)).is_ok() {
                         credits += 1;
                     }
                 }
@@ -1799,7 +1958,7 @@ impl DwApp {
     /// Aperçu de l'export : façades et routes du jeu retouchées par le créateur (modèle du créateur), cochées, là
     /// où elles seront posées. Seulement quand le MLO est vu seul dans la fenêtre « Pièces du MLO ».
     pub fn mlo_preview_insts(&self) -> Vec<(u32, V3, Quat, f32, f32)> {
-        let mut out = Vec::new();
+        let mut out = self.set_preview_insts();
         let (Some(name), Some(w)) = (self.mlo_state.pieces_open.as_ref(), self.game.world.as_deref()) else { return out };
         if !self.mlo_state.solo || self.mlo_state.pieces_cache.0 != *name {
             return out;
@@ -1813,6 +1972,50 @@ impl DwApp {
             out.push((e.arch, mv.point(e.pos), mv.q.mul(e.rot()).normalized(), e.sxy(), e.sz()));
         }
         out
+    }
+
+    /// Aperçu des variantes (entity sets) des intérieurs du projet, bouton « Aperçu » de l'onglet Intérieur : leurs
+    /// objets, là où l'intérieur est placé (comme ceux de l'intérieur, Project::world_entity).
+    fn set_preview_insts(&self) -> Vec<(u32, V3, Quat, f32, f32)> {
+        let mut out = Vec::new();
+        if self.mlo_state.set_preview.is_empty() {
+            return out;
+        }
+        for m in self.proj.ytyps.iter().filter(|t| t.visible).flat_map(|t| t.mlos.iter()) {
+            let mk = m.name.to_lowercase();
+            let Some((p, q)) = self.proj.mlo_placement(&m.name) else { continue };
+            for s in m.entity_sets.iter().filter(|s| self.mlo_state.set_preview.contains(&(mk.clone(), s.name.to_lowercase()))) {
+                for e in &s.entities {
+                    out.push((crate::render::arch_hash(&e.archetype), p + q.rotate(e.pos), q.mul(e.rot).normalized(), e.scale_xy, e.scale_z));
+                }
+            }
+        }
+        out
+    }
+
+    /// Script client des variantes (dw_entity_sets.lua) : chaque intérieur placé du projet qui a des variantes
+    /// (point au centre de sa première pièce, pour GetInteriorAtCoords), ses variantes, et l'activation de celles
+    /// cochées « Actif par défaut ». Rend le nombre d'intérieurs (0 : pas de fichier, l'ancien est retiré).
+    pub fn export_entity_sets(&self, out: &Path) -> Result<usize, String> {
+        let mut lines = Vec::new();
+        for inst in self.proj.ymaps.iter().filter(|y| !y.sample).flat_map(|y| y.entities.iter()).filter(|e| e.mlo.is_some()) {
+            let Some(m) = self.proj.find_mlo(&inst.archetype) else { continue };
+            if m.entity_sets.is_empty() {
+                continue;
+            }
+            let local = m.rooms.get(1).map(|r| (r.bb_min + r.bb_max) * 0.5).unwrap_or(V3::ZERO);
+            let p = inst.pos + inst.rot.rotate(local);
+            let sets: Vec<String> = m.entity_sets.iter().map(|s| s.name.clone()).collect();
+            let defaults: Vec<String> = m.entity_sets.iter().filter(|s| s.default_on).map(|s| s.name.clone()).collect();
+            lines.push(entity_sets_lua_line(&m.name, p, &sets, &defaults));
+        }
+        let path = out.join("dw_entity_sets.lua");
+        if lines.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(0);
+        }
+        std::fs::write(&path, entity_sets_lua(&lines)).map_err(|e| e.to_string())?;
+        Ok(lines.len())
     }
 
     /// Objets du projet montrés quand le MLO est vu seul : ses cartes et son intérieur, sans les modèles décochés.
@@ -2102,5 +2305,63 @@ impl DwApp {
             self.sync_game_project();
             self.status = format!("MLO « {} » retiré du projet.", r.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod set_tests {
+    use super::*;
+    use crate::model::{Entity, EntitySet, MloArchetype, Room};
+
+    fn mlo() -> MloArchetype {
+        let mut m = MloArchetype { name: "dw_test".into(), lod_dist: 100.0, flags: 0, mlo_flags: 0, entities: Vec::new(), rooms: vec![Room::new("limbo", V3::ZERO, V3::ZERO), Room::new("salon", V3::ZERO, v3(5.0, 5.0, 3.0))], portals: Vec::new(), entity_sets: Vec::new() };
+        for n in ["a", "b", "c"] {
+            let mut e = Entity::new(n, v3(1.0, 1.0, 0.0));
+            e.room = 1;
+            m.entities.push(e);
+        }
+        m
+    }
+
+    #[test]
+    fn noms_uniques() {
+        let mut m = mlo();
+        assert_eq!(unique_set_name(&m, "  "), crate::mech::ENTITY_SET_DEFAULT_NAME);
+        m.entity_sets.push(EntitySet { name: "Fete".into(), entities: Vec::new(), default_on: false });
+        assert_eq!(unique_set_name(&m, "fete"), "fete2");
+        m.entity_sets.push(EntitySet { name: "fete2".into(), entities: Vec::new(), default_on: false });
+        assert_eq!(unique_set_name(&m, "fete"), "fete3");
+        assert_eq!(unique_set_name(&m, "travaux"), "travaux");
+    }
+
+    #[test]
+    fn deplacer_et_remettre() {
+        let mut m = mlo();
+        m.entity_sets.push(EntitySet { name: "s".into(), entities: Vec::new(), default_on: false });
+        let ids: Vec<u64> = m.entities.iter().take(2).map(|e| e.id).collect();
+        assert_eq!(move_into_set(&mut m, 0, &ids), 2);
+        assert_eq!(move_into_set(&mut m, 5, &ids), 0);
+        assert_eq!(m.entities.len(), 1);
+        assert_eq!(m.entity_sets[0].entities.iter().map(|e| e.archetype.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(m.entity_sets[0].entities[0].room, 1);
+        // un seul objet, avec un nouvel identifiant
+        let back = take_out_of_set(&mut m, 0, Some(1));
+        assert_eq!(back.len(), 1);
+        assert!(!ids.contains(&back[0]));
+        assert_eq!(m.entities.last().unwrap().archetype, "b");
+        assert!(take_out_of_set(&mut m, 0, Some(9)).is_empty());
+        assert_eq!(take_out_of_set(&mut m, 0, None).len(), 1);
+        assert!(m.entity_sets[0].entities.is_empty());
+        assert_eq!(m.entities.len(), 3);
+    }
+
+    #[test]
+    fn script_des_variantes() {
+        let l = entity_sets_lua_line("dw_bar", v3(1.0, -2.0, 30.5), &["fete".into(), "l'autre".into()], &["fete".into()]);
+        assert_eq!(l, "  { name = 'dw_bar', x = 1.000, y = -2.000, z = 30.500, sets = { 'fete', 'l\\'autre' }, defaults = { 'fete' } },");
+        let s = entity_sets_lua(&[l]);
+        assert!(s.contains("ActivateInteriorEntitySet(GetInteriorAtCoords(x, y, z)"));
+        assert!(s.contains("RefreshInterior(id)"));
+        assert!(s.contains("local interiors = {\n  { name = 'dw_bar'"));
     }
 }

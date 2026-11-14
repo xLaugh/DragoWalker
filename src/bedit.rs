@@ -7,6 +7,9 @@
 //!     surligné en rouge avant le clic ;
 //!   - glisser un rectangle : retire tout ce dont le centre tombe dedans, même derrière ; Ctrl : remet ;
 //!   - Ctrl+Z annule.
+//! - « Mode Blender » (meshedit.rs) : « Déplacer un sommet » (glisser le sommet surligné dans le plan de la caméra,
+//!   Maj : à la verticale) et « Extruder un mur » (glisser une face plane le long de sa normale ; faces latérales
+//!   créées). Gardés dans le projet, appliqués à la vue, à l'export et à la collision.
 //! - Le projet garde, pour chaque modèle découpé, le centre (repère du modèle) de chaque triangle retiré.
 //! - Vue : le modèle du jeu sans ces triangles est envoyé à la carte graphique sous le nom du modèle découpé.
 //! - Export : le .ydr du jeu est relu en XML par CodeWalker, chaque triangle (de tous les niveaux de détail) est
@@ -33,6 +36,12 @@ pub struct BuildingCut {
     /// ouvertures percées dans les murs (portes, fenêtres) : voir openings.rs
     #[serde(default)]
     pub openings: Vec<crate::openings::Opening>,
+    /// sommets déplacés (repère du modèle) : voir meshedit.rs
+    #[serde(default)]
+    pub moves: Vec<crate::meshedit::VertexMove>,
+    /// faces extrudées : voir meshedit.rs
+    #[serde(default)]
+    pub extrusions: Vec<crate::meshedit::Extrusion>,
 }
 
 /// Tolérance pour reconnaître un triangle retiré par son centre (m) — **estimé**.
@@ -132,6 +141,11 @@ pub fn clone_loaded(l: &Loaded) -> Loaded {
     Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), layer_keys: l.layer_keys.clone(), textures: l.textures.clone() }
 }
 
+/// Comme `clone_loaded`, sans les textures (seule la forme change : elles sont déjà sur la carte graphique).
+fn clone_shape(l: &Loaded) -> Loaded {
+    Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), layer_keys: l.layer_keys.clone(), textures: Vec::new() }
+}
+
 /// Triangles d'un modèle : (sommets, partie, centre).
 pub fn model_tris(l: &Loaded) -> Vec<([u32; 3], u16, V3)> {
     let mut out = Vec::new();
@@ -151,8 +165,9 @@ pub fn model_tris(l: &Loaded) -> Vec<([u32; 3], u16, V3)> {
 
 /// Le modèle sans les triangles retirés (mêmes parties, mêmes textures), sous un autre nom ; et la boîte de ce
 /// qui reste.
-pub fn cut_loaded(src: &Loaded, arch: u32, removed: &[bool]) -> (Loaded, Option<(V3, V3)>) {
-    let mut out = clone_loaded(src);
+/// Sans `with_tex`, les textures ne sont pas recopiées.
+pub fn cut_loaded(src: &Loaded, arch: u32, removed: &[bool], with_tex: bool) -> (Loaded, Option<(V3, V3)>) {
+    let mut out = if with_tex { clone_loaded(src) } else { clone_shape(src) };
     out.arch = arch;
     let Some(m) = out.model.as_mut() else { return (out, None) };
     let mut idx = Vec::with_capacity(m.idx.len());
@@ -197,7 +212,57 @@ fn sig_cut(c: &BuildingCut) -> u64 {
         }
         o.sill.hash(&mut h);
     }
+    sig_edits(c).hash(&mut h);
     h.finish()
+}
+
+/// Signature des sommets déplacés et des extrusions.
+fn sig_edits(c: &BuildingCut) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in &c.moves {
+        for v in m.from.iter().chain(m.to.iter()) {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    for e in &c.extrusions {
+        sig(&e.tris).hash(&mut h);
+        for v in e.nrm.iter().chain([e.dist].iter()) {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Le modèle découpé complet (triangles retirés, sommets déplacés, extrusions, ouvertures) sous un autre nom, et
+/// la boîte de ce qui reste.
+pub fn edited_loaded(src: &Loaded, arch: u32, c: &BuildingCut) -> (Loaded, Option<(V3, V3)>) {
+    edited_loaded_ex(src, arch, c, true)
+}
+
+/// Comme `edited_loaded` ; sans `with_tex`, les textures ne sont pas recopiées (seule la forme a changé).
+fn edited_loaded_ex(src: &Loaded, arch: u32, c: &BuildingCut, with_tex: bool) -> (Loaded, Option<(V3, V3)>) {
+    let set = RemovedSet::new(&c.removed);
+    let mask: Vec<bool> = model_tris(src).iter().map(|t| set.contains(t.2)).collect();
+    let (mut out, mut bx) = cut_loaded(src, arch, &mask, with_tex);
+    if let Some(m) = out.model.as_mut() {
+        let edited = !c.moves.is_empty() || !c.extrusions.is_empty();
+        crate::meshedit::edit_rmodel(m, &c.moves, &c.extrusions);
+        crate::openings::apply_to_rmodel(m, &c.openings);
+        if edited {
+            let big = 3.0e38f32;
+            let (mut mn, mut mx) = (v3(big, big, big), v3(-big, -big, -big));
+            for &i in &m.idx {
+                if let Some(v) = m.verts.get(i as usize) {
+                    let p = v3(v.pos[0], v.pos[1], v.pos[2]);
+                    mn = mn.min(p);
+                    mx = mx.max(p);
+                }
+            }
+            bx = (mn.x <= mx.x).then_some((mn, mx));
+        }
+    }
+    (out, bx)
 }
 
 /// Signature des triangles retirés (pour savoir s'il faut renvoyer le modèle).
@@ -226,14 +291,77 @@ pub struct BEdit {
     removed_sig: u64,
     pub drag: Option<Pos2>,
     hover: Vec<u32>,
-    /// 0 : retirer des morceaux ; 1 : percer des ouvertures
+    /// 0 : retirer des morceaux ; 1 : percer des ouvertures ; 2 : déplacer un sommet ; 3 : extruder un mur
     pub mode: u8,
+    /// positions actuelles (sommets déplacés, faces extrudées) de chaque triangle d'origine
+    cur: Vec<[V3; 3]>,
+    /// couche de chaque triangle d'origine : 0, ou n s'il est sur le dessus de l'extrusion n (la dernière qui le
+    /// contient)
+    tlayer: Vec<u32>,
+    edit_sig: u64,
+    /// sommets proposés au déplacement : (position actuelle, position d'origine, couche), un par position actuelle
+    vcands: Vec<(V3, V3, u32)>,
+    /// distance d'une extrusion en cours de glisser dans la liste « Faces extrudées »
+    ex_edit: Option<ExEdit>,
+    /// sommet en cours de déplacement
+    vdrag: Option<VDrag>,
+    /// face en cours d'extrusion
+    fdrag: Option<FDrag>,
     /// préréglage d'ouverture choisi (openings::PRESETS)
     pub preset: usize,
     /// ouverture choisie dans la liste
     pub sel: Option<usize>,
     /// ouverture proposée sous la souris (mode 1)
     pub proposal: Option<crate::openings::Opening>,
+}
+
+/// Distance d'extrusion glissée dans la liste : appliquée au projet au plus tous les `EX_EDIT_EVERY` secondes et
+/// au relâcher (avant, chaque image reconstruisait le modèle et renvoyait toutes ses textures).
+struct ExEdit {
+    i: usize,
+    d: f32,
+    /// moment de la dernière application
+    last: f64,
+    /// signature du modèle découpé après la dernière application (Ctrl+Z entre-temps : glisser abandonné)
+    sig: u64,
+}
+
+/// Intervalle entre deux applications d'une distance glissée dans la liste (s) — choix de DragoWalker.
+const EX_EDIT_EVERY: f64 = 0.15;
+
+/// Sommet en cours de déplacement (repère du modèle, sauf `anchor`).
+struct VDrag {
+    /// position d'origine (clé du déplacement)
+    orig: V3,
+    /// couche du sommet : 0 (modèle) ou n (dessus de l'extrusion n)
+    layer: u32,
+    /// signature du modèle découpé au début du glisser (Ctrl+Z pendant le glisser : abandonné)
+    sig: u64,
+    /// position affichée au début du glisser
+    start: V3,
+    /// position déplacée (sans extrusion) au début du glisser
+    base_to: V3,
+    /// point de départ dans le monde
+    anchor: V3,
+    /// position affichée actuelle
+    now: V3,
+}
+
+/// Face en cours d'extrusion.
+struct FDrag {
+    tris: Vec<u32>,
+    /// normale (repère du modèle)
+    nrm: V3,
+    /// point de la face saisi (monde)
+    anchor: V3,
+    start_dist: f32,
+    dist: f32,
+    /// extrusion déjà existante reprise
+    ex: Option<usize>,
+    /// signature du modèle découpé au début du glisser (Ctrl+Z pendant le glisser : abandonné)
+    sig: u64,
+    /// point de l'écran au départ (repli quand on regarde la face de face)
+    press: Pos2,
 }
 
 /// Modèles découpés envoyés à la carte graphique.
@@ -332,7 +460,7 @@ impl DwApp {
                 }
                 let name = format!("{CUT_PREFIX}{n}");
                 self.push_undo();
-                self.proj.building_cuts.push(BuildingCut { name: name.clone(), source: source.clone(), removed: Vec::new(), openings: Vec::new() });
+                self.proj.building_cuts.push(BuildingCut { name: name.clone(), source: source.clone(), ..Default::default() });
                 if let Some(em) = self.proj.ent_mut(r) {
                     em.archetype = name.clone();
                     em.lod_dist = em.lod_dist.max(lod);
@@ -352,7 +480,7 @@ impl DwApp {
         let n = tris.len();
         self.cut_state.src.insert(source.clone(), loaded);
         self.cut_state.sent.remove(&cut_name);
-        self.bedit = Some(BEdit { entity: id, cut: cut_name.clone(), source: source.clone(), tris, verts, groups, removed: vec![false; n], removed_sig: u64::MAX, drag: None, hover: Vec::new(), mode: 0, preset: 0, sel: None, proposal: None });
+        self.bedit = Some(BEdit { entity: id, cut: cut_name.clone(), source: source.clone(), tris, verts, groups, removed: vec![false; n], removed_sig: u64::MAX, drag: None, hover: Vec::new(), mode: 0, cur: Vec::new(), tlayer: Vec::new(), edit_sig: u64::MAX, vcands: Vec::new(), ex_edit: None, vdrag: None, fdrag: None, preset: 0, sel: None, proposal: None });
         self.isolate_sel = Some([id].into_iter().collect());
         let (mn, mx) = e.local_box(&self.proj);
         self.goto(e.pos, (mx - mn).len().max(20.0) * 1.3);
@@ -406,7 +534,7 @@ impl DwApp {
                     n += 1;
                 }
                 let name = format!("{CUT_PREFIX}{n}");
-                self.proj.building_cuts.push(BuildingCut { name: name.clone(), source: source.clone(), removed: Vec::new(), openings: Vec::new() });
+                self.proj.building_cuts.push(BuildingCut { name: name.clone(), source: source.clone(), ..Default::default() });
                 if let Some(em) = self.proj.ent_mut(r) {
                     em.archetype = name.clone();
                     em.lod_dist = em.lod_dist.max(lod);
@@ -427,14 +555,74 @@ impl DwApp {
     /// Triangles retirés de l'édition en cours, à jour avec le projet (Ctrl+Z compris).
     fn bedit_refresh(&mut self) {
         let Some(be) = self.bedit.as_mut() else { return };
-        let Some(cut) = self.proj.building_cuts.iter().find(|c| c.name == be.cut) else { return };
+        let Some(cut) = self.proj.building_cuts.iter().find(|c| c.name == be.cut) else {
+            be.vdrag = None;
+            be.fdrag = None;
+            be.ex_edit = None;
+            return;
+        };
+        // le modèle a changé pendant un glisser (Ctrl+Z, Ctrl+Y…) : le glisser est abandonné (son numéro
+        // d'extrusion ou son sommet ne veulent plus rien dire)
+        let sc = sig_cut(cut);
+        if be.vdrag.as_ref().map(|d| d.sig != sc).unwrap_or(false) {
+            be.vdrag = None;
+        }
+        if be.fdrag.as_ref().map(|d| d.sig != sc).unwrap_or(false) {
+            be.fdrag = None;
+        }
+        if be.ex_edit.as_ref().map(|d| d.sig != sc || d.i >= cut.extrusions.len()).unwrap_or(false) {
+            be.ex_edit = None;
+        }
         let s = sig(&cut.removed);
-        if s == be.removed_sig {
+        let se = sig_edits(cut);
+        if s == be.removed_sig && se == be.edit_sig {
             return;
         }
-        let set = RemovedSet::new(&cut.removed);
-        be.removed = be.tris.iter().map(|t| set.contains(t.2)).collect();
-        be.removed_sig = s;
+        if s != be.removed_sig {
+            let set = RemovedSet::new(&cut.removed);
+            be.removed = be.tris.iter().map(|t| set.contains(t.2)).collect();
+            be.removed_sig = s;
+        }
+        // positions actuelles : comme dans meshedit::apply_edits (déplacements, puis extrusions par centre
+        // d'origine, chacune suivie des déplacements de son dessus)
+        let ms = crate::meshedit::MoveSet::new(&cut.moves);
+        let vm: Vec<V3> = be.verts.iter().map(|v| ms.get(*v).unwrap_or(*v)).collect();
+        let orig = |i: u32| be.verts.get(i as usize).copied().unwrap_or(V3::ZERO);
+        let g = |i: u32| vm.get(i as usize).copied().unwrap_or(V3::ZERO);
+        let mut cur: Vec<[V3; 3]> = be.tris.iter().map(|(t, _, _)| [g(t[0]), g(t[1]), g(t[2])]).collect();
+        let mut tlayer = vec![0u32; be.tris.len()];
+        for (ei, e) in cut.extrusions.iter().enumerate() {
+            if e.dist.abs() < 1e-4 || e.tris.is_empty() {
+                continue;
+            }
+            let set = RemovedSet::new(&e.tris);
+            let o = crate::meshedit::v3a(e.nrm).norm() * e.dist;
+            let lm = crate::meshedit::MoveSet::layer(&cut.moves, ei as u32 + 1);
+            for (ti, t) in be.tris.iter().enumerate() {
+                if set.contains(t.2) {
+                    for k in 0..3 {
+                        cur[ti][k] = cur[ti][k] + o + lm.delta(orig(t.0[k])).unwrap_or(V3::ZERO);
+                    }
+                    tlayer[ti] = ei as u32 + 1;
+                }
+            }
+        }
+        be.cur = cur;
+        be.tlayer = tlayer;
+        let mut seen = std::collections::HashSet::new();
+        be.vcands.clear();
+        for (ti, (t, _, _)) in be.tris.iter().enumerate() {
+            if be.removed[ti] {
+                continue;
+            }
+            for k in 0..3 {
+                let c = be.cur[ti][k];
+                if seen.insert(vkey(c)) {
+                    be.vcands.push((c, orig(t[k]), be.tlayer[ti]));
+                }
+            }
+        }
+        be.edit_sig = se;
     }
 
     /// Modèles découpés : envoyés à la carte graphique quand ils changent, et leur taille au catalogue.
@@ -455,7 +643,7 @@ impl DwApp {
             if self.cut_state.sent.get(&c.name) == Some(&s) {
                 continue;
             }
-            let (name, source, removed, openings) = (c.name.clone(), c.source.clone(), c.removed.clone(), c.openings.clone());
+            let (name, source) = (c.name.clone(), c.source.clone());
             if !self.cut_state.src.contains_key(&source) {
                 let Some(w) = self.game.world.as_deref() else { return };
                 let src = w.model_source();
@@ -465,14 +653,16 @@ impl DwApp {
                 self.cut_state.src.insert(source.clone(), l);
             }
             let Some(l) = self.cut_state.src.get(&source) else { continue };
-            let set = RemovedSet::new(&removed);
-            let mask: Vec<bool> = model_tris(l).iter().map(|t| set.contains(t.2)).collect();
-            let (mut cut, bx) = cut_loaded(l, crate::gta::crypto::joaat(&name), &mask);
-            if let Some(m) = cut.model.as_mut() {
-                crate::openings::apply_to_rmodel(m, &openings);
-            }
+            // déjà envoyé à cette carte graphique : seule la forme change (retraits, sommets, extrusions,
+            // ouvertures), les textures n'y sont ni recopiées ni renvoyées
+            let shape_only = self.cut_state.sent.contains_key(&name);
+            let (cut, bx) = edited_loaded_ex(l, crate::gta::crypto::joaat(&name), &self.proj.building_cuts[ci], !shape_only);
             if let Ok(mut g) = gpu.lock() {
-                g.add_custom(cut);
+                if shape_only {
+                    g.update_custom_shape(cut);
+                } else {
+                    g.add_custom(cut);
+                }
             }
             if let Some(b) = bx {
                 self.cut_state.boxes.insert(name.clone(), b);
@@ -504,11 +694,18 @@ impl DwApp {
         self.show_panel(ctx, "bedit", "Éditer le bâtiment", crate::docking::Dock::Floating, [440.0, 440.0], &mut open, |s, ui| {
             ui.label(RichText::new(format!("{source}  (copie éditée : {cut})")).strong());
             let mut mode = s.bedit.as_ref().map(|b| b.mode).unwrap_or(0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut mode, 0, "Retirer des morceaux");
                 ui.selectable_value(&mut mode, 1, "Percer des ouvertures");
+                ui.selectable_value(&mut mode, 2, "Déplacer un sommet");
+                ui.selectable_value(&mut mode, 3, "Extruder un mur");
             });
             if let Some(b) = s.bedit.as_mut() {
+                if b.mode != mode {
+                    b.vdrag = None;
+                    b.fdrag = None;
+                    b.ex_edit = None;
+                }
                 b.mode = mode;
             }
             if mode == 0 {
@@ -518,8 +715,10 @@ impl DwApp {
                 ui.label(RichText::new("Glisser un rectangle : retire tout ce qui est dedans (même derrière). Avec Ctrl : le remet.").small());
                 ui.label(RichText::new("Clic droit : tourner · molette : zoomer · Ctrl+Z : annuler.").small().weak());
                 ui.label(RichText::new("À l'export : un nouveau modèle avec seulement ce qui reste (textures du jeu, collision générée). Les autres copies de ce bâtiment ne changent pas.").small().weak());
-            } else {
+            } else if mode == 1 {
                 s.openings_panel(ui);
+            } else {
+                s.blender_panel(ui, mode);
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -528,7 +727,7 @@ impl DwApp {
                 }
                 if ui
                     .button("Tout remettre")
-                    .on_hover_text("Remet tous les morceaux retirés et supprime toutes les ouvertures percées (Ctrl+Z pour revenir). Les portes et fenêtres du jeu déjà posées restent des objets du projet.")
+                    .on_hover_text("Remet tous les morceaux retirés, tous les sommets déplacés, supprime les extrusions et les ouvertures percées (Ctrl+Z pour revenir). Les portes et fenêtres du jeu déjà posées restent des objets du projet.")
                     .clicked()
                 {
                     act = Some("reset");
@@ -545,11 +744,13 @@ impl DwApp {
                 if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
                     c.removed.clear();
                     c.openings.clear();
+                    c.moves.clear();
+                    c.extrusions.clear();
                 }
                 if let Some(b) = self.bedit.as_mut() {
                     b.sel = None;
                 }
-                self.status = format!("« {source} » : morceaux remis, ouvertures supprimées.");
+                self.status = format!("« {source} » : morceaux et sommets remis, extrusions et ouvertures supprimées.");
             }
             Some("done") => open = false,
             _ => {}
@@ -570,22 +771,8 @@ impl DwApp {
 
     /// Morceau sous la souris : triangle touché, puis triangles de la même partie reliés par leurs sommets.
     fn bedit_pick(&self, s: Pos2) -> Vec<u32> {
-        let (Some(be), Some((p, q, sc))) = (self.bedit.as_ref(), self.bedit_xf()) else { return Vec::new() };
-        let (o, d) = self.cam.ray(s);
-        let w = |v: V3| p + q.rotate(v.mulv(sc));
-        let mut best: Option<(f32, usize)> = None;
-        for (ti, (t, _, _)) in be.tris.iter().enumerate() {
-            if be.removed.get(ti).copied().unwrap_or(false) {
-                continue;
-            }
-            let g = |i: u32| w(be.verts.get(i as usize).copied().unwrap_or(V3::ZERO));
-            if let Some(tt) = ray_tri(o, d, g(t[0]), g(t[1]), g(t[2])) {
-                if best.map(|b| tt < b.0).unwrap_or(true) {
-                    best = Some((tt, ti));
-                }
-            }
-        }
-        let Some((_, start)) = best else { return Vec::new() };
+        let Some(be) = self.bedit.as_ref() else { return Vec::new() };
+        let Some((_, start, _, _)) = self.bedit_hit_local(s) else { return Vec::new() };
         let mut seen = vec![false; be.tris.len()];
         let mut stack = vec![start as u32];
         seen[start] = true;
@@ -646,6 +833,10 @@ impl DwApp {
         if self.bedit.is_none() {
             return;
         }
+        if self.bedit.as_ref().map(|b| b.mode >= 2).unwrap_or(false) {
+            self.bedit_blender_input(resp, ptr, press_origin, mods);
+            return;
+        }
         if self.bedit.as_ref().map(|b| b.mode == 1).unwrap_or(false) {
             if resp.clicked_by(egui::PointerButton::Primary) {
                 if let Some(p) = ptr {
@@ -691,7 +882,10 @@ impl DwApp {
             .iter()
             .enumerate()
             .filter(|(ti, _)| be.removed.get(*ti).copied().unwrap_or(false) == removed_ones)
-            .filter(|(_, t)| self.cam.project(p + q.rotate(t.2.mulv(sc))).map(|(s, _)| r.contains(s)).unwrap_or(false))
+            .filter(|(ti, _)| {
+                let Some(c) = be.cur.get(*ti) else { return false };
+                self.cam.project(p + q.rotate(((c[0] + c[1] + c[2]) * (1.0 / 3.0)).mulv(sc))).map(|(s, _)| r.contains(s)).unwrap_or(false)
+            })
             .map(|(ti, _)| ti as u32)
             .collect()
     }
@@ -702,6 +896,10 @@ impl DwApp {
             return;
         }
         self.bedit_refresh();
+        if self.bedit.as_ref().map(|b| b.mode >= 2).unwrap_or(false) {
+            self.bedit_blender_draw(painter, hover_pos, ctx);
+            return;
+        }
         if self.bedit.as_ref().map(|b| b.mode == 1).unwrap_or(false) {
             self.bedit_draw_openings(painter, hover_pos, ctx);
             return;
@@ -723,8 +921,7 @@ impl DwApp {
         let mut mesh = egui::Mesh::default();
         let col = Color32::from_rgba_unmultiplied(255, 60, 40, 110);
         for &ti in &island {
-            let (t, _, _) = &be.tris[ti as usize];
-            let pts: Vec<Option<(Pos2, f32)>> = t.iter().map(|vi| self.cam.project(p + q.rotate(be.verts.get(*vi as usize).copied().unwrap_or(V3::ZERO).mulv(sc)))).collect();
+            let pts: Vec<Option<(Pos2, f32)>> = be.cur[ti as usize].iter().map(|v| self.cam.project(p + q.rotate(v.mulv(sc)))).collect();
             if let (Some((a, _)), Some((b, _)), Some((c, _))) = (pts[0], pts[1], pts[2]) {
                 let base = mesh.vertices.len() as u32;
                 mesh.colored_vertex(a, col);
@@ -804,8 +1001,34 @@ impl DwApp {
                 report.push(format!("« {} » : tout a été retiré, rien à exporter.", c.name));
                 continue;
             };
+            // parties du modèle que DragoWalker ne sait pas lire (disposition des sommets inconnue) : laissées telles
+            // quelles, signalées
+            if !(c.moves.is_empty() && c.extrusions.is_empty() && c.openings.is_empty()) {
+                match crate::openings::read_ydr_xml(&cropped) {
+                    Some(xx) if !xx.skipped.is_empty() => report.push(format!("« {} » : {} partie(s) du modèle laissée(s) telle(s) quelle(s) (sommets déplacés, extrusions et ouvertures absents de ces parties) — {}.", c.name, xx.skipped.len(), xx.skipped.join(" ; "))),
+                    Some(_) => {}
+                    None => report.push(format!("« {} » : modèle illisible par DragoWalker, sommets déplacés, extrusions et ouvertures non appliqués.", c.name)),
+                }
+            }
+            // sommets déplacés (tous les niveaux de détail) et faces extrudées (niveau fin) : avant les ouvertures
+            let (mut cropped, mut mn, mut mx) = (cropped, mn, mx);
+            if let Some((x, nm, ne)) = crate::meshedit::apply_to_ydr_xml(&cropped, &c.moves, &c.extrusions) {
+                cropped = x;
+                report.push(format!("« {} » : {nm} sommet(s) déplacé(s), {} face(s) extrudée(s) ({ne} triangle(s), niveau de détail fin seulement).", c.name, c.extrusions.len()));
+                // boîte du type : agrandie par ce qui dépasse
+                if let Some(xx) = crate::openings::read_ydr_xml(&cropped) {
+                    for g in &xx.geoms {
+                        for k in &g.mesh.idx {
+                            if let Some(v) = g.mesh.verts.get(*k as usize) {
+                                let p = crate::openings::pos_of(&g.mesh.layout, v);
+                                mn = mn.min(p);
+                                mx = mx.max(p);
+                            }
+                        }
+                    }
+                }
+            }
             // ouvertures : vraie coupe des murs sur le modèle du jeu (tous les niveaux de détail)
-            let mut cropped = cropped;
             if !c.openings.is_empty() {
                 match crate::openings::apply_to_ydr_xml(&cropped, &c.openings) {
                     Some((x, n)) => {
@@ -837,19 +1060,12 @@ impl DwApp {
                 c.name
             ));
             // collision de chaque copie, sur ce qui reste (les bâtiments du jeu n'ont pas de collision propre)
-            // avec des ouvertures, la collision suit le modèle percé : on passe par les portes
-            let col_model = if c.openings.is_empty() {
-                l.model.clone()
-            } else {
-                let mask: Vec<bool> = kept.iter().map(|k| !k).collect();
-                let (mut fin, _) = cut_loaded(&l, h, &mask);
-                if let Some(fm) = fin.model.as_mut() {
-                    crate::openings::apply_to_rmodel(fm, &c.openings);
-                }
-                fin.model
-            };
+            // avec des ouvertures, la collision suit le modèle percé : on passe par les portes ; avec des sommets
+            // déplacés ou des faces extrudées, elle suit le modèle modifié
+            let plain = c.openings.is_empty() && c.moves.is_empty() && c.extrusions.is_empty();
+            let col_model = if plain { l.model.clone() } else { edited_loaded(&l, h, c).0.model };
             if let Some(m) = col_model.as_ref() {
-                let ktris: Vec<(u32, u32, u32, u8)> = if c.openings.is_empty() {
+                let ktris: Vec<(u32, u32, u32, u8)> = if plain {
                     tris.iter().zip(kept.iter()).filter(|(_, k)| **k).map(|(t, _)| (t.0[0], t.0[1], t.0[2], 0u8)).collect()
                 } else {
                     m.geoms.iter().flat_map(|g| m.idx[(g.first as usize).min(m.idx.len())..((g.first + g.count) as usize).min(m.idx.len())].chunks_exact(3).map(|t| (t[0], t[1], t[2], 0u8))).collect()
@@ -882,12 +1098,11 @@ impl DwApp {
     fn bedit_floor(&self, p: V3) -> Option<f32> {
         let be = self.bedit.as_ref()?;
         let mut best: Option<f32> = None;
-        for (ti, (t, _, _)) in be.tris.iter().enumerate() {
+        for (ti, c) in be.cur.iter().enumerate() {
             if be.removed.get(ti).copied().unwrap_or(false) {
                 continue;
             }
-            let g = |i: u32| be.verts.get(i as usize).copied().unwrap_or(V3::ZERO);
-            if let Some(tt) = ray_tri(p, v3(0.0, 0.0, -1.0), g(t[0]), g(t[1]), g(t[2])) {
+            if let Some(tt) = ray_tri(p, v3(0.0, 0.0, -1.0), c[0], c[1], c[2]) {
                 if tt > 0.02 {
                     best = Some(best.map_or(tt, |b| b.min(tt)));
                 }
@@ -898,27 +1113,10 @@ impl DwApp {
 
     /// L'ouverture que le clic percerait sous la souris : le mur touché, son orientation, le sol dessous.
     pub fn bedit_opening_at(&self, s: Pos2) -> Option<crate::openings::Opening> {
-        let (be, (p, q, sc)) = (self.bedit.as_ref()?, self.bedit_xf()?);
-        let (o, d) = self.cam.ray(s);
-        let inv = q.inverse();
-        let un = |v: V3| v3(v.x / sc.x, v.y / sc.y, v.z / sc.z);
-        let (ol, dl) = (un(inv.rotate(o - p)), un(inv.rotate(d)));
-        let mut best: Option<(f32, usize)> = None;
-        for (ti, (t, _, _)) in be.tris.iter().enumerate() {
-            if be.removed.get(ti).copied().unwrap_or(false) {
-                continue;
-            }
-            let g = |i: u32| be.verts.get(i as usize).copied().unwrap_or(V3::ZERO);
-            if let Some(tt) = ray_tri(ol, dl, g(t[0]), g(t[1]), g(t[2])) {
-                if best.map(|b| tt < b.0).unwrap_or(true) {
-                    best = Some((tt, ti));
-                }
-            }
-        }
-        let (t, ti) = best?;
-        let tri = &be.tris[ti].0;
-        let g = |i: u32| be.verts.get(i as usize).copied().unwrap_or(V3::ZERO);
-        let mut n = (g(tri[1]) - g(tri[0])).cross(g(tri[2]) - g(tri[0])).norm();
+        let be = self.bedit.as_ref()?;
+        let (t, ti, ol, dl) = self.bedit_hit_local(s)?;
+        let tri = &be.cur[ti];
+        let mut n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).norm();
         if n.dot(dl) > 0.0 {
             n = -n;
         }
@@ -929,7 +1127,7 @@ impl DwApp {
         let hit = ol + dl * t;
         let dir = v3(n.x, n.y, 0.0).norm();
         let (name, w, h, sill, bottom) = crate::openings::PRESETS[be.preset.min(crate::openings::PRESETS.len() - 1)];
-        let min_z = be.verts.iter().fold(f32::MAX, |m, v| m.min(v.z));
+        let min_z = be.cur.iter().flatten().fold(f32::MAX, |m, v| m.min(v.z));
         let floor = self.bedit_floor(hit - dir * 0.5).or_else(|| self.bedit_floor(hit + dir * 0.5)).unwrap_or(min_z);
         Some(crate::openings::Opening { pos: [hit.x, hit.y, floor + bottom + h * 0.5], dir: [dir.x, dir.y], w, h, depth: 0.8, kind: name.to_string(), sill, prop: String::new() })
     }
@@ -1148,6 +1346,501 @@ impl DwApp {
             b.sel = n.checked_sub(1);
         }
         self.status = format!("Ouverture « {kind} » percée (n° {n}) : ajuste-la dans le panneau, Ctrl+Z pour annuler.");
+    }
+}
+
+// ------------------------------------------------------------------ « mode Blender » : sommets et extrusions
+
+/// Distance à l'écran (px) en deçà de laquelle un sommet est proposé sous la souris.
+const VERTEX_PICK_PX: f32 = 14.0;
+
+/// Paramètre du point de la droite `a + u·s` (u normé) le plus proche du rayon `o + d·t` ; rien si parallèles.
+fn line_param(a: V3, u: V3, o: V3, d: V3) -> Option<f32> {
+    let b = u.dot(d);
+    let den = 1.0 - b * b;
+    if den < 1e-4 {
+        return None;
+    }
+    let w0 = a - o;
+    Some((b * d.dot(w0) - u.dot(w0)) / den)
+}
+
+/// Retire l'extrusion `i` et les déplacements de son dessus ; ceux des extrusions suivantes suivent leur numéro.
+fn remove_extrusion(c: &mut BuildingCut, i: usize) {
+    if i >= c.extrusions.len() {
+        return;
+    }
+    c.extrusions.remove(i);
+    let n = i as u32 + 1;
+    c.moves.retain(|m| m.ex != n);
+    for m in c.moves.iter_mut() {
+        if m.ex > n {
+            m.ex -= 1;
+        }
+    }
+}
+
+/// Déplacement qui s'applique à un sommet de position d'origine `orig` de la couche `layer` (0 : modèle ; n :
+/// dessus de l'extrusion n), le plus proche, comme meshedit::MoveSet.
+fn move_index(moves: &[crate::meshedit::VertexMove], orig: V3, layer: u32) -> Option<usize> {
+    moves
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.ex == layer)
+        .map(|(i, m)| (i, (crate::meshedit::v3a(m.from) - orig).len()))
+        .filter(|(_, d)| *d <= crate::meshedit::MOVE_MATCH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+impl DwApp {
+    /// Triangle (non retiré, positions actuelles) touché par le rayon de la souris : (distance, triangle, rayon
+    /// dans le repère du modèle).
+    fn bedit_hit_local(&self, s: Pos2) -> Option<(f32, usize, V3, V3)> {
+        let (be, (p, q, sc)) = (self.bedit.as_ref()?, self.bedit_xf()?);
+        let (o, d) = self.cam.ray(s);
+        let inv = q.inverse();
+        let un = |v: V3| v3(v.x / sc.x, v.y / sc.y, v.z / sc.z);
+        let (ol, dl) = (un(inv.rotate(o - p)), un(inv.rotate(d)));
+        let mut best: Option<(f32, usize)> = None;
+        for (ti, c) in be.cur.iter().enumerate() {
+            if be.removed.get(ti).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(tt) = ray_tri(ol, dl, c[0], c[1], c[2]) {
+                if best.map(|b| tt < b.0).unwrap_or(true) {
+                    best = Some((tt, ti));
+                }
+            }
+        }
+        best.map(|(t, ti)| (t, ti, ol, dl))
+    }
+
+    /// Sommet proposé sous la souris : le plus proche à l'écran (14 px au plus), pas caché derrière la surface
+    /// touchée. Rend (position actuelle, position d'origine, couche).
+    fn bedit_pick_vertex(&self, s: Pos2) -> Option<(V3, V3, u32)> {
+        let (be, (p, q, sc)) = (self.bedit.as_ref()?, self.bedit_xf()?);
+        let (o, d) = self.cam.ray(s);
+        let hit = self.bedit_hit_local(s).map(|h| h.0);
+        let mut best: Option<(f32, f32, usize)> = None;
+        for (i, (c, _, _)) in be.vcands.iter().enumerate() {
+            let w = p + q.rotate(c.mulv(sc));
+            let Some((sp, _)) = self.cam.project(w) else { continue };
+            let px = sp.distance(s);
+            if px > VERTEX_PICK_PX {
+                continue;
+            }
+            let along = (w - o).dot(d);
+            if hit.map(|t| along > t + 0.3).unwrap_or(false) {
+                continue;
+            }
+            let better = best.map(|b| px < b.0 - 0.5 || ((px - b.0).abs() <= 0.5 && along < b.1)).unwrap_or(true);
+            if better {
+                best = Some((px, along, i));
+            }
+        }
+        best.map(|b| be.vcands[b.2])
+    }
+
+    /// Face plane autour d'un triangle : triangles de la même partie reliés par leurs sommets, dans le même plan.
+    fn bedit_face_from(&self, start: usize) -> Vec<u32> {
+        let Some(be) = self.bedit.as_ref() else { return Vec::new() };
+        if start >= be.cur.len() {
+            return Vec::new();
+        }
+        let pos = |t: usize| be.cur[t];
+        let nb = |t: usize, out: &mut Vec<usize>| {
+            let (tr, g, _) = &be.tris[t];
+            for vi in tr {
+                let k = vkey(be.verts.get(*vi as usize).copied().unwrap_or(V3::ZERO));
+                if let Some(l) = be.groups.get(&(*g, k.0, k.1, k.2)) {
+                    out.extend(l.iter().map(|x| *x as usize));
+                }
+            }
+        };
+        let ok = |t: usize| !be.removed.get(t).copied().unwrap_or(true);
+        crate::meshedit::planar_region(start, &pos, &nb, &ok).into_iter().map(|t| t as u32).collect()
+    }
+
+    /// Face sous la souris pour l'extrusion : (triangles, normale tournée vers la caméra, point touché, extrusion
+    /// existante qui la contient). Une face déjà extrudée est reprise telle quelle (même normale).
+    fn bedit_pick_face(&self, s: Pos2) -> Option<(Vec<u32>, V3, V3, Option<usize>)> {
+        let be = self.bedit.as_ref()?;
+        let (t, ti, ol, dl) = self.bedit_hit_local(s)?;
+        let hit = ol + dl * t;
+        let cut = self.proj.building_cuts.iter().find(|c| c.name == be.cut)?;
+        let c0 = be.tris[ti].2;
+        if let Some(i) = cut.extrusions.iter().position(|e| RemovedSet::new(&e.tris).contains(c0)) {
+            let set = RemovedSet::new(&cut.extrusions[i].tris);
+            let face: Vec<u32> = be.tris.iter().enumerate().filter(|(k, t)| !be.removed[*k] && set.contains(t.2)).map(|(k, _)| k as u32).collect();
+            return Some((face, crate::meshedit::v3a(cut.extrusions[i].nrm).norm(), hit, Some(i)));
+        }
+        let face = self.bedit_face_from(ti);
+        let mut n = crate::meshedit::face_normal(&face.iter().map(|&k| be.cur[k as usize]).collect::<Vec<_>>());
+        if n.dot(dl) > 0.0 {
+            n = -n;
+        }
+        Some((face, n, hit, None))
+    }
+
+    /// Garde le déplacement d'un sommet (position d'origine `orig`, couche `layer`) : `delta` s'ajoute à sa
+    /// position déplacée `base_to` (couche n > 0 : `to − from` est le décalage du dessus de l'extrusion n). Avec
+    /// point d'annulation. Rend faux si rien ne change.
+    fn bedit_commit_move(&mut self, orig: V3, layer: u32, base_to: V3, delta: V3) -> bool {
+        let Some(cut) = self.bedit.as_ref().map(|b| b.cut.clone()) else { return false };
+        if delta.len() < 1e-4 || !self.proj.building_cuts.iter().any(|c| c.name == cut) {
+            return false;
+        }
+        self.push_undo();
+        let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) else { return false };
+        let to = base_to + delta;
+        match move_index(&c.moves, orig, layer) {
+            Some(i) if (to - crate::meshedit::v3a(c.moves[i].from)).len() < 1e-4 => {
+                c.moves.remove(i);
+            }
+            Some(i) => c.moves[i].to = crate::meshedit::a3(to),
+            None => c.moves.push(crate::meshedit::VertexMove { from: crate::meshedit::a3(orig), to: crate::meshedit::a3(to), ex: layer }),
+        }
+        self.bedit_refresh();
+        true
+    }
+
+    /// Garde l'extrusion d'une face (nouvelle, ou `ex` existante dont la distance change ; presque nulle : retirée).
+    /// Avec point d'annulation. Rend faux si rien ne change.
+    fn bedit_commit_extrude(&mut self, tris: &[u32], nrm: V3, dist: f32, ex: Option<usize>) -> bool {
+        let Some(be) = self.bedit.as_ref() else { return false };
+        let cut = be.cut.clone();
+        let centers: Vec<[f32; 3]> = tris.iter().filter_map(|&t| be.tris.get(t as usize)).map(|t| crate::meshedit::a3(t.2)).collect();
+        let tiny = dist.abs() < 0.005;
+        let old = ex.and_then(|i| self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.extrusions.get(i)).map(|e| e.dist));
+        match (ex, old) {
+            (Some(_), Some(d)) if (d - dist).abs() < 1e-4 => return false,
+            // extrusion reprise disparue entre-temps (annulation) : rien
+            (Some(_), None) => return false,
+            (None, _) if tiny || centers.is_empty() => return false,
+            _ => {}
+        }
+        if !self.proj.building_cuts.iter().any(|c| c.name == cut) {
+            return false;
+        }
+        self.push_undo();
+        let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) else { return false };
+        match ex {
+            Some(i) if i < c.extrusions.len() => {
+                if tiny {
+                    remove_extrusion(c, i);
+                } else {
+                    c.extrusions[i].dist = dist;
+                }
+            }
+            _ => c.extrusions.push(crate::meshedit::Extrusion { tris: centers, nrm: crate::meshedit::a3(nrm.norm()), dist }),
+        }
+        self.bedit_refresh();
+        true
+    }
+
+    /// Souris dans la vue en mode « Déplacer un sommet » (2) ou « Extruder un mur » (3).
+    fn bedit_blender_input(&mut self, resp: &egui::Response, ptr: Option<Pos2>, press_origin: Option<Pos2>, mods: egui::Modifiers) {
+        let Some((p, q, sc)) = self.bedit_xf() else { return };
+        let mode = self.bedit.as_ref().map(|b| b.mode).unwrap_or(0);
+        let tw = |v: V3| p + q.rotate(v.mulv(sc));
+        let inv = q.inverse();
+        let untw = |w: V3| {
+            let l = inv.rotate(w - p);
+            v3(l.x / sc.x, l.y / sc.y, l.z / sc.z)
+        };
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(at) = press_origin.or(ptr) {
+                let cut = self.bedit.as_ref().map(|b| b.cut.clone()).unwrap_or_default();
+                let sc = self.proj.building_cuts.iter().find(|c| c.name == cut).map(sig_cut).unwrap_or(0);
+                if mode == 2 {
+                    if let Some((cur, orig, layer)) = self.bedit_pick_vertex(at) {
+                        let base_to = self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| move_index(&c.moves, orig, layer).map(|i| crate::meshedit::v3a(c.moves[i].to))).unwrap_or(orig);
+                        if let Some(b) = self.bedit.as_mut() {
+                            b.vdrag = Some(VDrag { orig, layer, sig: sc, start: cur, base_to, anchor: tw(cur), now: cur });
+                        }
+                    }
+                } else if let Some((tris, nrm, hit, ex)) = self.bedit_pick_face(at) {
+                    let start_dist = ex.and_then(|i| self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.extrusions.get(i)).map(|e| e.dist)).unwrap_or(0.0);
+                    if let Some(b) = self.bedit.as_mut() {
+                        b.fdrag = Some(FDrag { tris, nrm, anchor: tw(hit), start_dist, dist: start_dist, ex, sig: sc, press: at });
+                    }
+                }
+            }
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(s) = ptr {
+                let (o, d) = self.cam.ray(s);
+                let fwd = self.cam.fwd;
+                if let Some(vd) = self.bedit.as_mut().and_then(|b| b.vdrag.as_mut()) {
+                    let a = vd.anchor;
+                    let w = if mods.shift {
+                        // Maj : à la verticale (z du monde)
+                        line_param(a, v3(0.0, 0.0, 1.0), o, d).map(|t| a + v3(0.0, 0.0, t)).unwrap_or(a)
+                    } else {
+                        // plan de la caméra passant par le sommet
+                        let den = d.dot(fwd);
+                        if den.abs() < 1e-6 { a } else { o + d * ((a - o).dot(fwd) / den) }
+                    };
+                    vd.now = vd.start + (untw(w) - untw(a));
+                }
+                if let Some(fd) = self.bedit.as_mut().and_then(|b| b.fdrag.as_mut()) {
+                    let nw = q.rotate(fd.nrm.mulv(sc));
+                    let k = nw.len().max(1e-6);
+                    // face vue de face : la droite de la normale est parallèle au rayon, on suit la hauteur à l'écran
+                    let sw = line_param(fd.anchor, nw * (1.0 / k), o, d).unwrap_or(-(s.y - fd.press.y) * 0.02);
+                    fd.dist = ((fd.start_dist + sw / k) * 100.0).round() / 100.0;
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            let (vd, fd) = match self.bedit.as_mut() {
+                Some(b) => (b.vdrag.take(), b.fdrag.take()),
+                None => (None, None),
+            };
+            if let Some(vd) = vd {
+                let delta = vd.now - vd.start;
+                if self.bedit_commit_move(vd.orig, vd.layer, vd.base_to, delta) {
+                    self.status = format!("Sommet déplacé de {:.2} m (Ctrl+Z pour annuler).", delta.len());
+                }
+            }
+            if let Some(fd) = fd {
+                if self.bedit_commit_extrude(&fd.tris, fd.nrm, fd.dist, fd.ex) {
+                    self.status = if fd.dist.abs() < 0.005 { "Extrusion retirée (Ctrl+Z pour annuler).".into() } else { format!("Face de {} triangle(s) extrudée de {:.2} m (Ctrl+Z pour annuler).", fd.tris.len(), fd.dist) };
+                }
+            }
+        }
+        if resp.clicked_by(egui::PointerButton::Primary) {
+            self.status = if mode == 2 { "Maintiens le clic sur un sommet (point jaune) et glisse ; Maj : à la verticale.".into() } else { "Maintiens le clic sur une face (en bleu) et glisse pour la faire avancer ou reculer.".into() };
+        }
+    }
+
+    /// Dessin en mode « Déplacer un sommet » / « Extruder un mur ».
+    fn bedit_blender_draw(&mut self, painter: &egui::Painter, hover_pos: Option<Pos2>, ctx: &egui::Context) {
+        let Some((p, q, sc)) = self.bedit_xf() else { return };
+        let Some(be) = self.bedit.as_ref() else { return };
+        let tw = |v: V3| p + q.rotate(v.mulv(sc));
+        let pr = |v: V3| self.cam.project(tw(v)).map(|x| x.0);
+        let over_ui = ctx.is_pointer_over_area();
+        let font = egui::FontId::proportional(13.0);
+        let label = |at: Option<Pos2>, text: String| {
+            if let Some(hp) = at {
+                painter.text(hp + egui::vec2(16.0, 14.0), egui::Align2::LEFT_TOP, text, font.clone(), Color32::WHITE);
+            }
+        };
+        let fill = |tris: &mut dyn Iterator<Item = [V3; 3]>, col: Color32| {
+            let mut mesh = egui::Mesh::default();
+            for t in tris {
+                if let (Some(a), Some(b), Some(c)) = (pr(t[0]), pr(t[1]), pr(t[2])) {
+                    let base = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(a, col);
+                    mesh.colored_vertex(b, col);
+                    mesh.colored_vertex(c, col);
+                    mesh.add_triangle(base, base + 1, base + 2);
+                }
+            }
+            if !mesh.vertices.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+        };
+        if be.mode == 2 {
+            if let Some(vd) = &be.vdrag {
+                // triangles qui touchent ce sommet, avec sa nouvelle position
+                let delta = vd.now - vd.start;
+                let stroke = egui::Stroke::new(1.5_f32, Color32::from_rgb(255, 170, 40));
+                for (ti, (t, _, _)) in be.tris.iter().enumerate() {
+                    if be.removed[ti] || be.tlayer.get(ti).copied().unwrap_or(0) != vd.layer {
+                        continue;
+                    }
+                    let hit: Vec<bool> = t.iter().map(|vi| (be.verts.get(*vi as usize).copied().unwrap_or(V3::ZERO) - vd.orig).len() <= crate::meshedit::MOVE_MATCH).collect();
+                    if !hit.iter().any(|h| *h) {
+                        continue;
+                    }
+                    let c = be.cur[ti];
+                    let pts: Vec<V3> = (0..3).map(|k| if hit[k] { c[k] + delta } else { c[k] }).collect();
+                    for k in 0..3 {
+                        if let (Some(a), Some(b)) = (pr(pts[k]), pr(pts[(k + 1) % 3])) {
+                            painter.line_segment([a, b], stroke);
+                        }
+                    }
+                }
+                if let Some(s) = pr(vd.now) {
+                    painter.circle_filled(s, 5.0, Color32::from_rgb(255, 170, 40));
+                }
+                label(hover_pos, format!("déplacement : {:+.2} {:+.2} {:+.2} m", delta.x, delta.y, delta.z));
+                return;
+            }
+            let Some(hp) = hover_pos.filter(|_| !over_ui) else { return };
+            // sommets proches de la souris en gris, celui qui serait pris en jaune
+            let mut n = 0;
+            for (c, _, _) in &be.vcands {
+                if let Some(s) = pr(*c) {
+                    if s.distance(hp) < 150.0 && n < 600 {
+                        painter.circle_filled(s, 2.0, Color32::from_gray(200));
+                        n += 1;
+                    }
+                }
+            }
+            if let Some((c, _, layer)) = self.bedit_pick_vertex(hp) {
+                if let Some(s) = pr(c) {
+                    painter.circle_stroke(s, 6.0, egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 220, 60)));
+                    painter.circle_filled(s, 3.0, Color32::from_rgb(255, 220, 60));
+                }
+                label(Some(hp), if layer > 0 { format!("glisser : déplacer ce sommet du dessus de l'extrusion {layer} (Maj : à la verticale)") } else { "glisser : déplacer ce sommet (Maj : à la verticale)".into() });
+            }
+            return;
+        }
+        // mode 3 : extrusion
+        if let Some(fd) = &be.fdrag {
+            let off = fd.nrm * (fd.dist - fd.start_dist);
+            fill(&mut fd.tris.iter().map(|&t| be.cur[t as usize].map(|v| v + off)), Color32::from_rgba_unmultiplied(255, 170, 40, 120));
+            label(hover_pos, format!("extrusion : {:+.2} m", fd.dist));
+            return;
+        }
+        let Some(hp) = hover_pos.filter(|_| !over_ui) else { return };
+        if let Some((face, _, _, ex)) = self.bedit_pick_face(hp) {
+            fill(&mut face.iter().map(|&t| be.cur[t as usize]), Color32::from_rgba_unmultiplied(70, 160, 255, 110));
+            let cut = self.proj.building_cuts.iter().find(|c| c.name == be.cut);
+            let text = match ex.and_then(|i| cut.and_then(|c| c.extrusions.get(i))) {
+                Some(e) => format!("glisser : changer l'extrusion ({:+.2} m)", e.dist),
+                None => format!("glisser : extruder cette face ({} triangle(s))", face.len()),
+            };
+            label(Some(hp), text);
+        }
+    }
+
+    /// Panneau des modes « Déplacer un sommet » (2) et « Extruder un mur » (3).
+    fn blender_panel(&mut self, ui: &mut egui::Ui, mode: u8) {
+        let Some(cut) = self.bedit.as_ref().map(|b| b.cut.clone()) else { return };
+        let Some(c) = self.proj.building_cuts.iter().find(|c| c.name == cut) else { return };
+        let (nmoves, list) = (c.moves.len(), c.extrusions.clone());
+        if mode == 2 {
+            ui.label(format!("{nmoves} sommet(s) déplacé(s)"));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Glisser un sommet (point jaune sous la souris) : il suit la souris dans le plan de l'écran ; avec Maj, seulement à la verticale.").small());
+            ui.label(RichText::new("Tous les sommets à cette position bougent ensemble : coutures de texture, parties voisines, et versions lointaines du bâtiment (à 2 cm près). Le dessus d'une face extrudée bouge seul, sans le bas.").small().weak());
+            ui.label(RichText::new("Clic droit : tourner · molette : zoomer · Ctrl+Z : annuler.").small().weak());
+            if ui.add_enabled(nmoves > 0, egui::Button::new("Remettre tous les sommets")).clicked() {
+                self.push_undo();
+                if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
+                    c.moves.clear();
+                }
+            }
+            return;
+        }
+        ui.label(RichText::new("Glisser une face plane (surlignée en bleu) : elle avance le long de sa normale, vers toi pour sortir, vers le mur pour creuser. Des faces latérales ferment le volume, avec la texture de la face.").small());
+        ui.label(RichText::new("Seul le modèle détaillé est extrudé : les versions lointaines du bâtiment ne changent pas. La collision générée suit.").small().weak());
+        ui.separator();
+        ui.label(RichText::new(format!("Faces extrudées : {}", list.len())).strong());
+        // glisser une distance : appliquée au projet au plus tous les EX_EDIT_EVERY s et au relâcher (le modèle
+        // est reconstruit à chaque application) ; saisie au clavier : appliquée tout de suite
+        let now = ui.input(|i| i.time);
+        let pending = self.bedit.as_ref().and_then(|b| b.ex_edit.as_ref().map(|x| (x.i, x.d)));
+        // (numéro, distance, début du glisser, glisser en cours, fin du glisser)
+        let mut edited: Option<(usize, f32, bool, bool, bool)> = None;
+        let mut delete: Option<usize> = None;
+        for (i, e) in list.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}. {} triangle(s)", i + 1, e.tris.len()));
+                let mut d = pending.filter(|p| p.0 == i).map(|p| p.1).unwrap_or(e.dist);
+                let r = ui.add(egui::DragValue::new(&mut d).speed(0.01).range(-20.0..=20.0).suffix(" m"));
+                if r.changed() || r.drag_started() || r.drag_stopped() {
+                    edited = Some((i, d, r.drag_started(), r.dragged() && !r.drag_stopped(), r.drag_stopped()));
+                }
+                if ui.small_button("Supprimer").clicked() {
+                    delete = Some(i);
+                }
+            });
+        }
+        let cut_sig = |s: &Self| s.proj.building_cuts.iter().find(|c| c.name == cut).map(sig_cut).unwrap_or(0);
+        let apply = |s: &mut Self, i: usize, d: f32| {
+            if let Some(e) = s.proj.building_cuts.iter_mut().find(|c| c.name == cut).and_then(|c| c.extrusions.get_mut(i)) {
+                e.dist = d;
+            }
+        };
+        if let Some((i, d, started, dragging, stopped)) = edited {
+            if started {
+                self.push_undo();
+                let sig = cut_sig(self);
+                if let Some(b) = self.bedit.as_mut() {
+                    b.ex_edit = Some(ExEdit { i, d, last: now, sig });
+                }
+            } else if dragging || stopped {
+                // glisser abandonné (Ctrl+Z pendant le glisser) : plus rien jusqu'au relâcher
+                let mine = self.bedit.as_ref().and_then(|b| b.ex_edit.as_ref()).map(|x| (x.i == i, x.last)).filter(|x| x.0);
+                if let Some((_, last)) = mine {
+                    if stopped || now - last >= EX_EDIT_EVERY {
+                        apply(self, i, d);
+                    }
+                    let sig = cut_sig(self);
+                    if let Some(b) = self.bedit.as_mut() {
+                        b.ex_edit = if stopped { None } else { Some(ExEdit { i, d, last: if now - last >= EX_EDIT_EVERY { now } else { last }, sig }) };
+                    }
+                }
+            } else {
+                // saisie au clavier, flèches
+                self.push_undo();
+                apply(self, i, d);
+            }
+        }
+        if let Some(i) = delete {
+            if self.proj.building_cuts.iter().find(|c| c.name == cut).map(|c| i < c.extrusions.len()).unwrap_or(false) {
+                self.push_undo();
+                if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
+                    remove_extrusion(c, i);
+                }
+                if let Some(b) = self.bedit.as_mut() {
+                    b.ex_edit = None;
+                    b.fdrag = None;
+                }
+            }
+        }
+    }
+
+    /// Mode test (avec DW_TEST_BEDIT) : DW_TEST_BEDIT_MOVE="x,y,z,dx,dy,dz" déplace le sommet du modèle le plus
+    /// proche de (x, y, z) ; DW_TEST_BEDIT_EXTRUDE="x,y,z,distance" extrude la face plane du triangle dont le centre
+    /// est le plus proche (normale tournée vers l'extérieur du modèle). Repère du modèle. Rend vrai si l'un des
+    /// deux est donné.
+    pub fn bedit_test_edits(&mut self) -> bool {
+        let parse = |k: &str, n: usize| std::env::var(k).ok().map(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == n);
+        let (mv, ex) = (parse("DW_TEST_BEDIT_MOVE", 6), parse("DW_TEST_BEDIT_EXTRUDE", 4));
+        if mv.is_none() && ex.is_none() {
+            return false;
+        }
+        self.bedit_refresh();
+        if let Some(v) = mv {
+            let at = v3(v[0], v[1], v[2]);
+            let pick = self.bedit.as_ref().and_then(|b| b.vcands.iter().copied().min_by(|a, b| (a.0 - at).len().total_cmp(&(b.0 - at).len())));
+            if let Some((cur, orig, layer)) = pick {
+                let cut = self.bedit.as_ref().map(|b| b.cut.clone()).unwrap_or_default();
+                let base_to = self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| move_index(&c.moves, orig, layer).map(|i| crate::meshedit::v3a(c.moves[i].to))).unwrap_or(orig);
+                let ok = self.bedit_commit_move(orig, layer, base_to, v3(v[3], v[4], v[5]));
+                println!("sommet {cur:?} (origine {orig:?}, couche {layer}) déplacé de {:?} : {ok}", v3(v[3], v[4], v[5]));
+            }
+        }
+        if let Some(v) = ex {
+            let at = v3(v[0], v[1], v[2]);
+            let Some(be) = self.bedit.as_ref() else { return true };
+            let ctr = |c: &[V3; 3]| (c[0] + c[1] + c[2]) * (1.0 / 3.0);
+            let start = be.cur.iter().enumerate().filter(|(k, _)| !be.removed[*k]).min_by(|a, b| (ctr(a.1) - at).len().total_cmp(&(ctr(b.1) - at).len())).map(|(k, _)| k);
+            if let Some(start) = start {
+                let face = self.bedit_face_from(start);
+                let Some(be) = self.bedit.as_ref() else { return true };
+                let ftris: Vec<[V3; 3]> = face.iter().map(|&k| be.cur[k as usize]).collect();
+                let mut n = crate::meshedit::face_normal(&ftris);
+                let (mn, mx) = be.verts.iter().fold((v3(3e38, 3e38, 3e38), v3(-3e38, -3e38, -3e38)), |(a, b), v| (a.min(*v), b.max(*v)));
+                let fc = ftris.iter().fold(V3::ZERO, |a, t| a + ctr(t)) * (1.0 / ftris.len().max(1) as f32);
+                if n.dot(fc - (mn + mx) * 0.5) < 0.0 {
+                    n = -n;
+                }
+                let ok = self.bedit_commit_extrude(&face, n, v[3], None);
+                println!("face de {} triangle(s) autour de {:?}, normale {n:?}, extrudée de {} m : {ok}", face.len(), fc, v[3]);
+                if let Some((p, q, sc)) = self.bedit_xf() {
+                    self.goto(p + q.rotate(fc.mulv(sc)), 25.0);
+                }
+            }
+        }
+        true
     }
 }
 

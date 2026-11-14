@@ -50,6 +50,9 @@ pub const LOD_IN_PARENT_YMAP: u32 = 8;
 /// WorldForm::UpdateMouseHits(DrawableBase, Archetype, YmapEntityDef) 0x060002ab (IL_05b6–IL_05d4).
 pub const PICK_HALF_DIAG: f32 = 0.5;
 pub const MLO_ENTITY_FLAGS: u32 = 1572872;
+/// Drapeaux du placement d'un intérieur (CMloInstanceDef) : ceux de 45 des 63 placements des MLO FiveM analysés
+/// le 14 nov. 2026 (G:\MLOFIVEM).
+pub const MLO_INSTANCE_FLAGS: u32 = 1572864;
 pub const ENTITY_LOD_DIST: f32 = 200.0;
 pub const ENTITY_LOD_LEVEL: &str = "LODTYPES_DEPTH_ORPHANHD";
 pub const ENTITY_PRIORITY: &str = "PRI_REQUIRED";

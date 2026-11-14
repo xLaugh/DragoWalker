@@ -601,9 +601,28 @@ impl DwApp {
         let src = w.model_source();
         let claimed = std::sync::Mutex::new(HashSet::new());
         let mut cache = Vec::new();
-        let l = src.load(h, &claimed, &mut cache);
+        // bâtiment de l'atelier : il se transforme depuis l'atelier (ses pièces suivent ses étages)
+        if self.house_of(&e.archetype).is_some() {
+            self.status = format!("« {} » est un bâtiment de l'atelier : utilise « Transformer en intérieur » dans l'atelier (bouton Atelier).", e.archetype);
+            return;
+        }
+        // bâtiment édité (« dw_cut_N ») : son nom n'existe pas dans le jeu ; on analyse le modèle du jeu d'origine
+        // avec les modifications (morceaux retirés, sommets déplacés, extrusions, ouvertures) — avant, l'analyse ne
+        // trouvait rien et s'arrêtait sans rien montrer (retour de la personne, 14 nov. 2026)
+        let cut = self.proj.building_cuts.iter().find(|c| c.name.eq_ignore_ascii_case(&e.archetype)).cloned();
+        let l = match &cut {
+            Some(c) => {
+                let base = src.load(crate::gta::crypto::joaat(&c.source), &claimed, &mut cache);
+                if base.model.is_none() {
+                    self.status = format!("Modèle d'origine « {} » du bâtiment édité « {} » introuvable dans le jeu chargé.", c.source, e.archetype);
+                    return;
+                }
+                crate::bedit::edited_loaded(&base, h, c).0
+            }
+            None => src.load(h, &claimed, &mut cache),
+        };
         let Some(m) = l.model else {
-            self.status = format!("Modèle de « {} » introuvable.", e.archetype);
+            self.status = format!("Modèle de « {} » introuvable dans le jeu chargé : seul un bâtiment du jeu (ou un bâtiment édité) s'analyse.", e.archetype);
             return;
         };
         let a = crate::analyse::analyse(id, &e.archetype, &m, e.pos, e.rot, e.scale_xy, e.scale_z);
@@ -622,6 +641,10 @@ impl DwApp {
 
     /// Hauteur de coupe actuelle (rien n'est dessiné au-dessus), si la coupe est active.
     pub fn cut_z(&self) -> Option<f32> {
+        // Studio MLO : coupe juste sous le plafond de l'étage dessiné (on voit dans les pièces)
+        if let (true, true, Some(z)) = (self.studio.on, self.studio.cut, self.opts.studio) {
+            return Some(z + crate::studio::CUT_ABOVE_FLOOR);
+        }
         if self.game.cut_on {
             Some(self.cam.target.z + self.game.cut_h)
         } else {

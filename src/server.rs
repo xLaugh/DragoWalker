@@ -86,6 +86,9 @@ pub fn part_pools(key: &str) -> &'static str {
 pub enum After {
     Start,
     Reload,
+    /// export manuel (menu Fichier) : compte rendu seulement ; dossier et début du compte rendu dans
+    /// `ServerState::export_info`
+    Export,
 }
 
 /// Conversion en cours : (résultat quand elle est finie, suite, début).
@@ -118,6 +121,8 @@ pub struct ServerState {
     /// test en jeu en cours : un plantage de FiveM écrit après cet instant ouvre l'analyse
     pub watch: Option<std::time::SystemTime>,
     pub watch_at: f64,
+    /// export manuel en cours de conversion : (dossier exporté, ressource FiveM, compte rendu de l'export)
+    pub export_info: Option<(PathBuf, bool, String)>,
 }
 
 impl ServerState {
@@ -145,6 +150,7 @@ impl ServerState {
             resource: String::new(),
             watch: None,
             watch_at: 0.0,
+            export_info: None,
         }
     }
 
@@ -457,7 +463,8 @@ impl DwApp {
     fn server_export(&mut self) -> Result<String, String> {
         let res_dir = self.server.data().join("resources");
         std::fs::create_dir_all(&res_dir).map_err(|e| e.to_string())?;
-        let name = self.proj.name.replace(' ', "_").to_lowercase();
+        // même nom de dossier que l'export (export::resource_name : minuscules, sans accent ni caractère spécial)
+        let name = crate::export::resource_name(&self.proj.name);
         if name == TOOLS {
             return Err("Change le nom du projet (dw_tools est réservé).".into());
         }
@@ -490,9 +497,29 @@ impl DwApp {
         }
     }
 
+    /// Export manuel : conversion de `pending_convert` dans un fil à part (même chemin que le test en jeu).
+    pub fn server_convert_export(&mut self, out: PathBuf, fivem: bool, export_report: String) {
+        self.server.export_info = Some((out, fivem, export_report));
+        self.server_convert_then(After::Export);
+    }
+
     /// Fin de la conversion : démarre le serveur ou recharge la map.
     fn server_after(&mut self, then: After, rep: Vec<String>) {
         let mut rep = rep.join(" ");
+        if let After::Export = then {
+            let (out, fivem, before) = self.server.export_info.take().unwrap_or_default();
+            if fivem {
+                let scan = crate::check::scan_resource_dir(&out);
+                let problems: Vec<String> = scan.iter().filter(|r| r.0 == crate::check::Level::Error).map(|r| r.1.clone()).collect();
+                if !problems.is_empty() {
+                    rep += &format!(" ⚠ Contrôle de l'export : {}", problems.join(" · "));
+                }
+                self.check_folder_report = scan;
+            }
+            let before = before.replace("Conversion en binaires du jeu en cours (en arrière-plan)…", "").trim().to_string();
+            self.status = format!("Export terminé. {before} {rep}");
+            return;
+        }
         // contrôle du dossier exporté : ce que le jeu ne pourra pas charger
         let scan = crate::check::scan_resource_dir(&self.server.data().join("resources").join(&self.server.resource));
         let problems: Vec<String> = scan.iter().filter(|r| r.0 == crate::check::Level::Error).map(|r| r.1.clone()).collect();
@@ -523,6 +550,8 @@ impl DwApp {
                 }
                 Err(e) => self.status = e,
             },
+            // traité plus haut
+            After::Export => {}
         }
     }
 

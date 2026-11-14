@@ -270,7 +270,7 @@ impl DwApp {
         let scale = self.terrain.fx_scale * f.scale;
         let Some(t) = self.proj.terrain.as_mut() else { return };
         if ctrl {
-            if let Some((i, _)) = t.emitters.iter().enumerate().map(|(i, e)| (i, (e.pos - p).len())).filter(|x| x.1 < 5.0).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+            if let Some((i, _)) = t.emitters.iter().enumerate().map(|(i, e)| (i, (e.pos - p).len())).filter(|x| x.1 < 5.0).min_by(|a, b| a.1.total_cmp(&b.1)) {
                 let e = t.emitters.remove(i);
                 self.status = format!("Effet « {} » retiré.", e.fx);
             }
@@ -341,6 +341,8 @@ impl DwApp {
             });
         }
         if changed {
+            // un pas d'annulation par glisser du niveau
+            self.undo_once(ui.ctx());
             if let Some(t) = self.proj.terrain.as_mut() {
                 for (w, z) in t.waters.iter_mut().zip(zs) {
                     w.z = z;

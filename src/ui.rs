@@ -15,210 +15,249 @@ impl DwApp {
     /// Ctrl+V coller, Ctrl+U panneau d'outils, Suppr supprimer, Échap ; menus Édition du ProjectForm
     /// (InitializeComponent 0x06000e92) : Ctrl+Z, Ctrl+Y, Ctrl+X, Ctrl+C, Ctrl+V, Maj+Suppr.
     pub fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let item = |ui: &mut egui::Ui, enabled: bool, text: &str, keys: &str| ui.add_enabled(enabled, egui::Button::new(text).shortcut_text(keys)).clicked();
+        use crate::look::{ic, menu_item as item};
+        let t = crate::i18n::t;
         egui::menu::bar(ui, |ui| {
-            ui.menu_button(crate::i18n::t("Fichier"), |ui| {
-                if item(ui, true, crate::i18n::t("Nouveau projet"), crate::i18n::t("Ctrl+N")) {
+            crate::look::logo(ui, 22.0).on_hover_text("DragoWalker");
+            ui.label(RichText::new("DragoWalker").strong().size(15.0).color(crate::look::ACCENT_LIGHT));
+            ui.add_space(8.0);
+            ui.menu_button(t("Fichier"), |ui| {
+                if item(ui, true, ic::FILE_PLUS, t("Nouveau projet"), t("Ctrl+N")) {
                     self.new_project();
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Ouvrir un projet…"), crate::i18n::t("Ctrl+O")) {
+                if item(ui, true, ic::FOLDER_OPEN, t("Ouvrir un projet…"), t("Ctrl+O")) {
                     self.open_project_dialog();
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Enregistrer le projet"), crate::i18n::t("Ctrl+S")) {
+                if item(ui, true, ic::FLOPPY_DISK, t("Enregistrer le projet"), t("Ctrl+S")) {
                     self.save_project(false);
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Enregistrer sous…"), crate::i18n::t("Ctrl+Maj+S")) {
+                if item(ui, true, ic::FLOPPY_DISK_BACK, t("Enregistrer sous…"), t("Ctrl+Maj+S")) {
                     self.save_project(true);
                     ui.close_menu();
                 }
                 ui.separator();
-                if item(ui, true, crate::i18n::t("Importer ymap / ytyp (XML CodeWalker)…"), crate::i18n::t("Ctrl+I")) {
+                if item(ui, true, ic::DOWNLOAD_SIMPLE, t("Importer ymap / ytyp (XML CodeWalker)…"), t("Ctrl+I")) {
                     self.import_dialog();
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Importer une ressource MLO (dossier FiveM)…"), "") {
+                if item(ui, true, ic::PACKAGE, t("Importer une ressource MLO (dossier FiveM)…"), "") {
                     self.import_mlo_dialog();
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Exporter en XML…"), crate::i18n::t("Ctrl+E")) {
+                ui.separator();
+                if item(ui, true, ic::FILE_CODE, t("Exporter en XML…"), t("Ctrl+E")) {
                     self.export_xml(false);
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Exporter une ressource FiveM…"), crate::i18n::t("Ctrl+Maj+E")) {
+                if item(ui, true, ic::EXPORT, t("Exporter une ressource FiveM…"), t("Ctrl+Maj+E")) {
                     self.export_xml(true);
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Contrôle avant l'export…"), "") {
+                if item(ui, true, ic::CHECK_CIRCLE, t("Contrôle avant l'export…"), "") {
                     self.check_open = true;
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Analyser un plantage FiveM…"), "") {
-                    self.crash.open = true;
-                    ui.close_menu();
-                }
-                if item(ui, true, crate::i18n::t("Tester en jeu (serveur local)"), crate::i18n::t("F12")) {
+                ui.separator();
+                if item(ui, true, ic::PLAY, t("Tester en jeu (serveur local)"), t("F12")) {
                     self.server.open = true;
                     self.server_test();
                     ui.close_menu();
                 }
+                if item(ui, true, ic::BUG, t("Analyser un plantage FiveM…"), "") {
+                    self.crash.open = true;
+                    ui.close_menu();
+                }
                 ui.separator();
-                if item(ui, true, crate::i18n::t("Quitter"), crate::i18n::t("Alt+F4")) {
+                if item(ui, true, ic::SIGN_OUT, t("Quitter"), t("Alt+F4")) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button(crate::i18n::t("Édition"), |ui| {
+            ui.menu_button(t("Édition"), |ui| {
                 let has_sel = !self.selected.is_empty();
-                if item(ui, !self.undo.is_empty(), crate::i18n::t("Annuler"), crate::i18n::t("Ctrl+Z")) {
+                if item(ui, !self.undo.is_empty(), ic::ARROW_COUNTER_CLOCKWISE, t("Annuler"), t("Ctrl+Z")) {
                     self.do_undo();
                     ui.close_menu();
                 }
-                if item(ui, !self.redo.is_empty(), crate::i18n::t("Rétablir"), crate::i18n::t("Ctrl+Y")) {
+                if item(ui, !self.redo.is_empty(), ic::ARROW_CLOCKWISE, t("Rétablir"), t("Ctrl+Y")) {
                     self.do_redo();
                     ui.close_menu();
                 }
                 ui.separator();
-                if item(ui, has_sel, crate::i18n::t("Couper"), crate::i18n::t("Ctrl+X")) {
+                if item(ui, has_sel, ic::SCISSORS, t("Couper"), t("Ctrl+X")) {
                     self.copy_selected();
                     self.delete_selected();
                     ui.close_menu();
                 }
-                if item(ui, has_sel, crate::i18n::t("Copier"), crate::i18n::t("Ctrl+C")) {
+                if item(ui, has_sel, ic::COPY, t("Copier"), t("Ctrl+C")) {
                     self.copy_selected();
                     ui.close_menu();
                 }
-                if item(ui, !self.clipboard.is_empty(), crate::i18n::t("Coller"), crate::i18n::t("Ctrl+V")) {
+                if item(ui, !self.clipboard.is_empty(), ic::CLIPBOARD, t("Coller"), t("Ctrl+V")) {
                     self.paste();
                     ui.close_menu();
                 }
-                if item(ui, has_sel, crate::i18n::t("Dupliquer la sélection"), crate::i18n::t("Ctrl+D")) {
+                if item(ui, has_sel, ic::COPY_SIMPLE, t("Dupliquer la sélection"), t("Ctrl+D")) {
                     let off = self.copy_offset();
                     self.duplicate_selected(off);
                     ui.close_menu();
                 }
-                if item(ui, has_sel || self.isolate_sel.is_some(), if self.isolate_sel.is_some() { crate::i18n::t("Revenir à tout voir") } else { crate::i18n::t("Isoler la sélection") }, crate::i18n::t("Ctrl+H")) {
-                    self.toggle_isolate();
-                    ui.close_menu();
-                }
-                if item(ui, has_sel, crate::i18n::t("Poser au sol"), crate::i18n::t("Maj / Fin")) {
-                    let n = self.snap_selected_to_ground(true);
-                    self.status = format!("{n} objet(s) posé(s) au sol.");
-                    ui.close_menu();
-                }
-                if item(ui, has_sel, crate::i18n::t("Supprimer la sélection"), crate::i18n::t("Suppr")) {
+                if item(ui, has_sel, ic::TRASH, t("Supprimer la sélection"), t("Suppr")) {
                     self.delete_selected();
                     ui.close_menu();
                 }
                 ui.separator();
-                if item(ui, true, crate::i18n::t("Sélection intelligente"), crate::i18n::t("J")) {
+                if item(ui, has_sel || self.isolate_sel.is_some(), if self.isolate_sel.is_some() { ic::EYE } else { ic::EYE_SLASH }, if self.isolate_sel.is_some() { t("Revenir à tout voir") } else { t("Isoler la sélection") }, t("Ctrl+H")) {
+                    self.toggle_isolate();
+                    ui.close_menu();
+                }
+                if item(ui, has_sel, ic::ARROW_LINE_DOWN, t("Poser au sol"), t("Maj / Fin")) {
+                    let n = self.snap_selected_to_ground(true);
+                    self.status = format!("{n} objet(s) posé(s) au sol.");
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::MAGIC_WAND, t("Sélection intelligente"), t("J")) {
                     self.smart_select();
                     ui.close_menu();
                 }
-                if item(ui, true, crate::i18n::t("Tout désélectionner"), crate::i18n::t("Échap")) {
+                if item(ui, true, ic::X, t("Tout désélectionner"), t("Échap")) {
                     self.set_selection(vec![]);
                     ui.close_menu();
                 }
             });
-            ui.menu_button(crate::i18n::t("Outils"), |ui| {
-                for (t, n, k) in [(Tool::Select, crate::i18n::t("Sélection"), "1"), (Tool::Place, crate::i18n::t("Poser"), "2"), (Tool::Erase, crate::i18n::t("Gomme"), "3"), (Tool::Rect, crate::i18n::t("Rectangle"), "4"), (Tool::Terrain, crate::i18n::t("Terrain"), "5")] {
-                    if ui.add(egui::Button::new(n).selected(self.tool == t).shortcut_text(k)).clicked() {
-                        self.tool = t;
-                        if t == Tool::Terrain {
+            ui.menu_button(t("Outils"), |ui| {
+                for (tl, icon, n, k) in [(Tool::Select, ic::CURSOR, t("Sélection"), "1"), (Tool::Place, ic::PLUS_CIRCLE, t("Poser"), "2"), (Tool::Erase, ic::ERASER, t("Gomme"), "3"), (Tool::Rect, ic::SELECTION, t("Rectangle"), "4"), (Tool::Terrain, ic::MOUNTAINS, t("Terrain"), "5")] {
+                    if ui.add(egui::Button::new(crate::look::label(icon, n)).selected(self.tool == tl).shortcut_text(k)).clicked() {
+                        self.tool = tl;
+                        if tl == Tool::Terrain {
                             self.tab = Tab::Terrain;
                         }
                         ui.close_menu();
                     }
                 }
                 ui.separator();
-                for (m, n, k) in [(crate::gizmo::GizmoMode::Move, crate::i18n::t("Poignées : déplacer"), crate::i18n::t("G")), (crate::gizmo::GizmoMode::Rotate, crate::i18n::t("Poignées : tourner"), crate::i18n::t("R / E")), (crate::gizmo::GizmoMode::Scale, crate::i18n::t("Poignées : agrandir"), crate::i18n::t("T"))] {
-                    if ui.add(egui::Button::new(n).selected(self.gizmo_mode == m).shortcut_text(k)).clicked() {
+                for (m, icon, n, k) in [(crate::gizmo::GizmoMode::Move, ic::ARROWS_OUT_CARDINAL, t("Poignées : déplacer"), t("G")), (crate::gizmo::GizmoMode::Rotate, ic::ARROW_CLOCKWISE, t("Poignées : tourner"), t("R / E")), (crate::gizmo::GizmoMode::Scale, ic::RESIZE, t("Poignées : agrandir"), t("T"))] {
+                    if ui.add(egui::Button::new(crate::look::label(icon, n)).selected(self.gizmo_mode == m).shortcut_text(k)).clicked() {
                         self.gizmo_mode = m;
                         self.tool = Tool::Select;
                         ui.close_menu();
                     }
                 }
                 ui.separator();
-                if item(ui, true, crate::i18n::t("Bibliothèque de props"), crate::i18n::t("B")) {
-                    self.library.open = !self.library.open;
-                    ui.close_menu();
-                }
-                if item(ui, true, crate::i18n::t("Bibliothèque des intérieurs"), crate::i18n::t("I")) {
-                    self.intlib.open = !self.intlib.open;
-                    ui.close_menu();
-                }
-                if item(ui, true, crate::i18n::t("Bibliothèque des bâtiments"), crate::i18n::t("N")) {
-                    self.buildings.open = !self.buildings.open;
-                    ui.close_menu();
-                }
-                if item(ui, true, crate::i18n::t("Couper les bâtiments (vue en coupe)"), crate::i18n::t("C")) {
+                if item(ui, true, ic::KNIFE, t("Couper les bâtiments (vue en coupe)"), t("C")) {
                     self.game.cut_on = !self.game.cut_on;
                     ui.close_menu();
                 }
-                ui.label(RichText::new(crate::i18n::t("H : cacher l'objet du jeu sous la souris")).small().weak());
+                ui.label(RichText::new(t("H : cacher l'objet du jeu sous la souris")).small().weak());
             });
-            ui.menu_button(crate::i18n::t("Terrain"), |ui| {
-                use crate::terrain::Brush;
-                for (s, n) in [(0u8, crate::i18n::t("Créer / modèles de départ"))] {
-                    if item(ui, true, n, "") {
-                        self.terrain_section(s);
+            ui.menu_button(t("Créer"), |ui| {
+                if item(ui, true, ic::CUBE_TRANSPARENT, t("Studio MLO (intérieur de A à Z)…"), "") {
+                    self.studio.choose = true;
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::HAMMER, t("Atelier de bâtiment"), "") {
+                    self.atelier.open = !self.atelier.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::MOUNTAINS, t("Créateur de terrain"), t("5")) {
+                    self.terrain_open = !self.terrain_open;
+                    if self.terrain_open {
                         self.tool = Tool::Terrain;
-                        self.tab = Tab::Terrain;
-                        ui.close_menu();
                     }
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::STACK, t("Groupes d'objets"), "") {
+                    self.groups_open = !self.groups_open;
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::USERS, t("Vie : PNJ, véhicules, circulation"), "") {
+                    self.life.open = !self.life.open;
+                    if self.life.open {
+                        self.tool = Tool::Life;
+                    }
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::ROBOT, t("Assistant IA"), "") {
+                    self.ai_open = !self.ai_open;
+                    ui.close_menu();
                 }
                 ui.separator();
-                for (b, n, k) in [
-                    (Brush::Raise, crate::i18n::t("Monter"), crate::i18n::t("F2")),
-                    (Brush::Lower, crate::i18n::t("Creuser"), crate::i18n::t("F3")),
-                    (Brush::Flatten, crate::i18n::t("Pelleteuse"), crate::i18n::t("F4")),
-                    (Brush::Smooth, crate::i18n::t("Lisser"), crate::i18n::t("F5")),
-                    (Brush::Noise, crate::i18n::t("Relief naturel"), crate::i18n::t("F6")),
-                    (Brush::Paint, crate::i18n::t("Peindre"), crate::i18n::t("F7")),
-                    (Brush::Road, crate::i18n::t("Route"), crate::i18n::t("F8")),
-                    (Brush::Vegetation, crate::i18n::t("Végétation"), crate::i18n::t("F9")),
-                    (Brush::Water, crate::i18n::t("Eau"), crate::i18n::t("F10")),
-                    (Brush::Particles, crate::i18n::t("Effets (particules)"), crate::i18n::t("F11")),
+                if item(ui, true, ic::PACKAGE, t("Bibliothèque de props"), t("B")) {
+                    self.library.open = !self.library.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::BUILDINGS, t("Bibliothèque des bâtiments"), t("N")) {
+                    self.buildings.open = !self.buildings.open;
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::DOOR_OPEN, t("Bibliothèque des intérieurs"), t("I")) {
+                    self.intlib.open = !self.intlib.open;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button(t("Terrain"), |ui| {
+                use crate::terrain::Brush;
+                if item(ui, true, ic::FILE_PLUS, t("Créer / modèles de départ"), "") {
+                    self.terrain_section(0);
+                    self.tool = Tool::Terrain;
+                    self.tab = Tab::Terrain;
+                    ui.close_menu();
+                }
+                ui.separator();
+                for (b, icon, n, k) in [
+                    (Brush::Raise, ic::ARROW_FAT_UP, t("Monter"), t("F2")),
+                    (Brush::Lower, ic::ARROW_FAT_DOWN, t("Creuser"), t("F3")),
+                    (Brush::Flatten, ic::BULLDOZER, t("Pelleteuse"), t("F4")),
+                    (Brush::Smooth, ic::WAVES, t("Lisser"), t("F5")),
+                    (Brush::Noise, ic::WAVE_SINE, t("Relief naturel"), t("F6")),
+                    (Brush::Paint, ic::PAINT_BRUSH, t("Peindre"), t("F7")),
+                    (Brush::Road, ic::ROAD_HORIZON, t("Route"), t("F8")),
+                    (Brush::Vegetation, ic::TREE_EVERGREEN, t("Végétation"), t("F9")),
+                    (Brush::Water, ic::DROP, t("Eau"), t("F10")),
+                    (Brush::Particles, ic::SPARKLE, t("Effets (particules)"), t("F11")),
                 ] {
                     let on = self.tool == Tool::Terrain && self.terrain.brush == b;
-                    if ui.add_enabled(self.proj.terrain.is_some(), egui::Button::new(n).selected(on).shortcut_text(k)).clicked() {
+                    if ui.add_enabled(self.proj.terrain.is_some(), egui::Button::new(crate::look::label(icon, n)).selected(on).shortcut_text(k)).clicked() {
                         self.set_terrain_brush(b);
                         ui.close_menu();
                     }
                 }
                 ui.separator();
-                if item(ui, self.terrain.road_pts.len() >= 2, crate::i18n::t("Construire la route en cours"), crate::i18n::t("Entrée")) {
+                if item(ui, self.terrain.road_pts.len() >= 2, ic::CHECK, t("Construire la route en cours"), t("Entrée")) {
                     self.finish_road();
                     ui.close_menu();
                 }
-                if item(ui, !self.terrain.road_pts.is_empty(), crate::i18n::t("Enlever le dernier point"), crate::i18n::t("Retour arrière")) {
+                if item(ui, !self.terrain.road_pts.is_empty(), ic::ARROW_BEND_UP_LEFT, t("Enlever le dernier point"), t("Retour arrière")) {
                     self.terrain.road_pts.pop();
                     ui.close_menu();
                 }
-                ui.label(RichText::new(crate::i18n::t("Rayon du pinceau : + / -  ·  Végétation : Ctrl + pinceau pour retirer")).small().weak());
+                ui.label(RichText::new(t("Rayon du pinceau : + / -  ·  Végétation : Ctrl + pinceau pour retirer")).small().weak());
             });
-            ui.menu_button(crate::i18n::t("Affichage"), |ui| {
-                if ui.add(egui::Button::new(crate::i18n::t("Vue 3D")).selected(!self.cam.map_view).shortcut_text(crate::i18n::t("M"))).clicked() {
+            ui.menu_button(t("Affichage"), |ui| {
+                if ui.add(egui::Button::new(crate::look::label(ic::CUBE, t("Vue 3D"))).selected(!self.cam.map_view).shortcut_text(t("M"))).clicked() {
                     self.cam.map_view = false;
                 }
-                if ui.add(egui::Button::new(crate::i18n::t("Vue carte (de dessus)")).selected(self.cam.map_view).shortcut_text(crate::i18n::t("M"))).clicked() {
+                if ui.add(egui::Button::new(crate::look::label(ic::MAP_TRIFOLD, t("Vue carte (de dessus)"))).selected(self.cam.map_view).shortcut_text(t("M"))).clicked() {
                     self.cam.map_view = true;
                 }
-                if item(ui, true, if self.panels_hidden { crate::i18n::t("Afficher les panneaux") } else { crate::i18n::t("Cacher les panneaux") }, crate::i18n::t("Ctrl+U")) {
+                ui.separator();
+                if item(ui, true, ic::SIDEBAR, if self.panels_hidden { t("Afficher les panneaux") } else { t("Cacher les panneaux") }, t("Ctrl+U")) {
                     self.panels_hidden = !self.panels_hidden;
                     ui.close_menu();
                 }
-                ui.checkbox(&mut self.project_open, crate::i18n::t("Panneau Projet"));
-                ui.checkbox(&mut self.toolbox_open, crate::i18n::t("Boîte à outils"));
-                ui.label(RichText::new(crate::i18n::t("Pour déplacer un panneau : attrape son titre et lâche-le contre un bord (rangé) ou ailleurs (fenêtre flottante)")).small().weak());
+                ui.checkbox(&mut self.project_open, t("Panneau Projet"));
+                ui.checkbox(&mut self.toolbox_open, t("Boîte à outils"));
+                ui.label(RichText::new(t("Pour déplacer un panneau : attrape son titre et lâche-le contre un bord (rangé) ou ailleurs (fenêtre flottante)")).small().weak());
                 ui.separator();
-                ui.checkbox(&mut self.opts.show_grid, crate::i18n::t("Grille"));
-                ui.checkbox(&mut self.opts.show_rooms, crate::i18n::t("Pièces et portails des intérieurs"));
-                ui.checkbox(&mut self.opts.show_sample, crate::i18n::t("Carte d'exemple"));
+                ui.checkbox(&mut self.opts.show_grid, t("Grille"));
+                ui.checkbox(&mut self.opts.show_rooms, t("Pièces et portails des intérieurs"));
+                ui.checkbox(&mut self.opts.show_sample, t("Carte d'exemple"));
+                ui.checkbox(&mut self.opts.show_perf, t("Compteur de performance")).on_hover_text(t("Images par seconde, objets et triangles dessinés, mémoire graphique, historique d'annulation"));
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Langue / Language");
+                    ui.label(format!("{}  Langue / Language", ic::TRANSLATE));
                     let en = crate::i18n::is_english();
                     for (is_en, label) in [(false, "Français"), (true, "English")] {
                         if ui.selectable_label(en == is_en, label).clicked() && en != is_en {
@@ -227,47 +266,32 @@ impl DwApp {
                         }
                     }
                 });
-                ui.checkbox(&mut self.opts.show_perf, crate::i18n::t("Compteur de performance")).on_hover_text(crate::i18n::t("Images par seconde, objets et triangles dessinés, mémoire graphique, historique d'annulation"));
             });
-            ui.menu_button(crate::i18n::t("Aide"), |ui| {
-                ui.label(crate::i18n::t("Clic droit + glisser : tourner la vue (vue carte : déplacer)"));
-                ui.label(crate::i18n::t("Clic molette + glisser : déplacer la vue"));
-                ui.label(crate::i18n::t("ZQSD / WASD : avancer · Maj : ×5 · Ctrl : ×0.2"));
-                ui.label(crate::i18n::t("Page haut / bas : monter / descendre"));
-                ui.label(crate::i18n::t("1 Sélection · 2 Poser · 3 Gomme · 4 Rectangle · 5 Terrain · M vue carte"));
-                ui.label(crate::i18n::t("G / R / T : poignées · Flèches : bouger la sélection · [ ] : tourner de 15°"));
-                ui.label(crate::i18n::t("Ctrl+C / Ctrl+V / Ctrl+X : copier, coller (devant la caméra, comme CodeWalker), couper"));
-                ui.label(crate::i18n::t("Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+Z / Ctrl+Y · Ctrl+U : panneaux"));
-                ui.label(crate::i18n::t("Terrain : F2–F11 pinceaux · + / - rayon · Entrée : construire la route"));
+            ui.menu_button(t("Aide"), |ui| {
+                ui.label(RichText::new(crate::look::label(ic::KEYBOARD, t("Raccourcis"))).strong());
+                ui.label(t("Clic droit + glisser : tourner la vue (vue carte : déplacer)"));
+                ui.label(t("Clic molette + glisser : déplacer la vue"));
+                ui.label(t("ZQSD / WASD : avancer · Maj : ×5 · Ctrl : ×0.2"));
+                ui.label(t("Page haut / bas : monter / descendre"));
+                ui.label(t("1 Sélection · 2 Poser · 3 Gomme · 4 Rectangle · 5 Terrain · M vue carte"));
+                ui.label(t("G / R / T : poignées · Flèches : bouger la sélection · [ ] : tourner de 15°"));
+                ui.label(t("Ctrl+C / Ctrl+V / Ctrl+X : copier, coller (devant la caméra, comme CodeWalker), couper"));
+                ui.label(t("Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+Z / Ctrl+Y · Ctrl+U : panneaux"));
+                ui.label(t("Terrain : F2–F11 pinceaux · + / - rayon · Entrée : construire la route"));
+                ui.separator();
+                ui.hyperlink_to(crate::look::label(ic::BOOK_OPEN, t("Tutoriels (wiki)")), "https://github.com/xLaugh/DragoWalker/wiki");
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(crate::i18n::t("DragoWalker")).strong().color(Color32::from_rgb(255, 150, 50)));
-                ui.separator();
-                if ui.selectable_label(self.ai_open, RichText::new(crate::i18n::t("Assistant IA")).strong()).on_hover_text(crate::i18n::t("Fenêtre de l'assistant : décris ce que tu veux construire")).clicked() {
-                    self.ai_open = !self.ai_open;
+                if crate::look::accent(ui, ic::PLAY, t("Tester en jeu"), t("Serveur FiveM local géré par DragoWalker : exporter, lancer le serveur et FiveM, recharger sans se déconnecter (F12)")).clicked() {
+                    self.server.open = true;
+                    self.server_test();
                 }
-                if ui.selectable_label(self.server.open, RichText::new(crate::i18n::t("Tester en jeu")).strong()).on_hover_text(crate::i18n::t("Serveur FiveM local géré par DragoWalker : tester la map et les MLO en jeu, recharger sans se déconnecter")).clicked() {
+                if ui.selectable_label(self.server.open, RichText::new(ic::GAME_CONTROLLER).size(16.0)).on_hover_text(t("Fenêtre du serveur de test")).clicked() {
                     self.server.open = !self.server.open;
                 }
-                if ui.selectable_label(self.life.open, RichText::new(crate::i18n::t("Vie (PNJ, véhicules)")).strong()).on_hover_text(crate::i18n::t("Véhicules garés, parkings, PNJ avec activité ou ronde, circulation sur tes routes")).clicked() {
-                    self.life.open = !self.life.open;
-                    if self.life.open {
-                        self.tool = Tool::Life;
-                    }
-                }
-                if ui.selectable_label(self.toolbox_open, RichText::new(crate::i18n::t("Boîte à outils")).strong()).on_hover_text(crate::i18n::t("Ouvrir / fermer la boîte à outils")).clicked() {
-                    self.toolbox_open = !self.toolbox_open;
-                    self.panels_hidden = false;
-                }
-                if ui.selectable_label(self.project_open, RichText::new(crate::i18n::t("Projet")).strong()).on_hover_text(crate::i18n::t("Ouvrir / fermer le panneau Projet")).clicked() {
-                    self.project_open = !self.project_open;
-                    self.panels_hidden = false;
-                }
-                if ui.selectable_label(self.terrain_open, RichText::new(crate::i18n::t("Créateur de terrain")).strong()).on_hover_text(crate::i18n::t("Fenêtre du créateur de terrain : relief, peinture, routes, végétation, eau, effets (5)")).clicked() {
-                    self.terrain_open = !self.terrain_open;
-                    if self.terrain_open {
-                        self.tool = Tool::Terrain;
-                    }
+                ui.separator();
+                if ui.selectable_label(self.ai_open, RichText::new(crate::look::label(ic::ROBOT, t("Assistant IA")))).on_hover_text(t("Fenêtre de l'assistant : décris ce que tu veux construire")).clicked() {
+                    self.ai_open = !self.ai_open;
                 }
             });
         });
@@ -322,6 +346,9 @@ impl DwApp {
 
     /// Bandeau quand une sélection est vue seule.
     pub fn isolate_banner(&mut self, ctx: &egui::Context) {
+        if self.studio.on {
+            return;
+        }
         let Some(n) = self.isolate_sel.as_ref().map(|s| s.len()) else { return };
         egui::Area::new(egui::Id::new("iso_sel_banner")).fixed_pos(self.cam.rect.center_top() + egui::vec2(-150.0, 8.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -391,7 +418,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![] };
+        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -458,91 +485,145 @@ impl DwApp {
         self.status = format!("{k} objet(s) collé(s).");
     }
 
+    /// Barre d'outils, en groupes : outils de la vue, poignées, édition, créer, bibliothèques, vue ; à droite les
+    /// panneaux et la carte de destination.
     pub fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let tools = [
-                (Tool::Select, crate::i18n::t("🖱 Sélection"), crate::i18n::t("Clic : choisir · glisser dans le vide : rectangle · glisser un objet : le déplacer (1)")),
-                (Tool::Place, crate::i18n::t("➕ Poser"), crate::i18n::t("Clic : poser le prop choisi · glisser : en poser le long du trait (2)")),
-                (Tool::Erase, crate::i18n::t("⭕ Gomme"), crate::i18n::t("Glisser : supprimer tout ce qui passe sous le cercle (3)")),
-                (Tool::Terrain, crate::i18n::t("Terrain"), crate::i18n::t("Pinceaux de terrain : monter, creuser, pelleteuse, lisser, peindre, routes (5)")),
-                (Tool::Rect, crate::i18n::t("Rectangle"), crate::i18n::t("Glisser n'importe où : sélectionner tout ce qui est dans le rectangle, objets du jeu compris · Ctrl ou Maj : ajouter à la sélection (4) · avec l'outil Sélection : Alt + glisser")),
-            ];
-            for (t, label, tip) in tools {
-                if ui.selectable_label(self.tool == t, RichText::new(label).size(15.0)).on_hover_text(tip).clicked() {
-                    self.tool = t;
-                    if t == Tool::Terrain {
-                        self.terrain_open = true;
+        use crate::look::{action, group, ic, tool};
+        let t = crate::i18n::t;
+        ui.horizontal_wrapped(|ui| {
+            group(ui, |ui| {
+                for (tl, icon, label, tip) in [
+                    (Tool::Select, ic::CURSOR, t("Sélection"), t("Clic : choisir · glisser dans le vide : rectangle · glisser un objet : le déplacer (1)")),
+                    (Tool::Rect, ic::SELECTION, "", t("Rectangle : glisser n'importe où pour sélectionner tout ce qui est dedans, objets du jeu compris · Ctrl ou Maj : ajouter à la sélection (4) · avec l'outil Sélection : Alt + glisser")),
+                    (Tool::Place, ic::PLUS_CIRCLE, t("Poser"), t("Clic : poser le prop choisi · glisser : en poser le long du trait (2)")),
+                    (Tool::Erase, ic::ERASER, "", t("Gomme : glisser pour supprimer tout ce qui passe sous le cercle (3)")),
+                ] {
+                    if tool(ui, self.tool == tl, icon, label, tip).clicked() {
+                        self.tool = tl;
                     }
                 }
-            }
-            // les bibliothèques ne sont pas des outils : séparées
-            ui.separator();
-            if ui.selectable_label(self.intlib.open, RichText::new(crate::i18n::t("Intérieurs")).size(15.0)).on_hover_text(crate::i18n::t("Bibliothèque des intérieurs du jeu : plan, « Aller voir », « Voir isolé »")).clicked() {
-                self.intlib.open = !self.intlib.open;
-            }
-            if ui.selectable_label(self.buildings.open, RichText::new(crate::i18n::t("Bâtiments")).size(15.0)).on_hover_text(crate::i18n::t("Bâtiments du jeu : les copier pour les poser ailleurs, sur une carte custom (N)")).clicked() {
-                self.buildings.open = !self.buildings.open;
-            }
-            if ui.selectable_label(self.atelier.open, RichText::new(crate::i18n::t("Atelier")).size(15.0)).on_hover_text(crate::i18n::t("Atelier de bâtiment : tracer l'emprise au sol, choisir les étages, le toit et la façade ; modèle, collision, version lointaine et fenêtres éclairées la nuit faits par DragoWalker")).clicked() {
-                self.atelier.open = !self.atelier.open;
-            }
-            if ui.selectable_label(self.groups_open, RichText::new(crate::i18n::t("Groupes")).size(15.0)).on_hover_text(crate::i18n::t("Tes groupes d'objets : les poser à la souris (molette = tourner, Maj + molette = quart de tour)")).clicked() {
-                self.groups_open = !self.groups_open;
-            }
-            if ui.selectable_label(self.library.open, RichText::new(crate::i18n::t("Bibliothèque")).size(15.0)).on_hover_text(crate::i18n::t("Tous les props du jeu en images, avec aperçu 3D ; clic pour choisir, double-clic pour poser, glisser sur la carte pour poser à cet endroit (B)")).clicked() {
-                self.library.open = !self.library.open;
-            }
-            ui.separator();
-            if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("⟲")).on_hover_text(crate::i18n::t("Annuler (Ctrl+Z)")).clicked() {
-                self.do_undo();
-            }
-            if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("⟳")).on_hover_text(crate::i18n::t("Rétablir (Ctrl+Y)")).clicked() {
-                self.do_redo();
-            }
-            if ui.add_enabled(!self.selected.is_empty(), egui::Button::new(crate::i18n::t("🗑 Supprimer"))).on_hover_text(crate::i18n::t("Supprimer toute la sélection d'un coup")).clicked() {
-                self.delete_selected();
-            }
-            if ui.add_enabled(!self.selected.is_empty(), egui::Button::new(crate::i18n::t("📋 Dupliquer"))).clicked() {
-                { let off = self.copy_offset(); self.duplicate_selected(off); }
-            }
-            ui.separator();
-            // poignées dans la vue, comme le widget de CodeWalker
-            for (mode, label, tip) in [
-                (crate::gizmo::GizmoMode::Move, crate::i18n::t("Déplacer"), crate::i18n::t("Flèches pour déplacer la sélection le long d'un axe (G)")),
-                (crate::gizmo::GizmoMode::Rotate, crate::i18n::t("Tourner"), crate::i18n::t("Anneaux pour tourner la sélection, par pas de 5° avec « Aimanter » (R ou E)")),
-                (crate::gizmo::GizmoMode::Scale, crate::i18n::t("Agrandir"), crate::i18n::t("Carrés pour changer la taille ; carré du centre = partout (T)")),
-            ] {
-                if ui.selectable_label(self.gizmo_mode == mode, label).on_hover_text(tip).clicked() {
-                    self.gizmo_mode = mode;
-                    self.tool = Tool::Select;
+            });
+            group(ui, |ui| {
+                for (mode, icon, tip) in [
+                    (crate::gizmo::GizmoMode::Move, ic::ARROWS_OUT_CARDINAL, t("Déplacer : flèches pour déplacer la sélection le long d'un axe (G)")),
+                    (crate::gizmo::GizmoMode::Rotate, ic::ARROW_CLOCKWISE, t("Tourner : anneaux, par pas de 5° avec « Aimanter » (R ou E)")),
+                    (crate::gizmo::GizmoMode::Scale, ic::RESIZE, t("Agrandir : carrés pour changer la taille ; carré du centre = partout (T)")),
+                ] {
+                    if tool(ui, self.gizmo_mode == mode, icon, "", tip).clicked() {
+                        self.gizmo_mode = mode;
+                        self.tool = Tool::Select;
+                    }
                 }
-            }
-            ui.checkbox(&mut self.gizmo_object_space, crate::i18n::t("Axes de l'objet")).on_hover_text(crate::i18n::t("Poignées alignées sur l'objet choisi au lieu du nord / de l'est (comme « Object space » dans CodeWalker)"));
-            ui.separator();
-            let vlabel = if self.cam.map_view { crate::i18n::t("🗺 Vue carte") } else { crate::i18n::t("🎥 Vue 3D") };
-            if ui.button(vlabel).on_hover_text(crate::i18n::t("Changer de vue (M)")).clicked() {
-                self.cam.map_view = !self.cam.map_view;
-            }
-            ui.checkbox(&mut self.snap, crate::i18n::t("Aimanter")).on_hover_text(crate::i18n::t("Aligner les positions sur un pas fixe (sans rapport avec Affichage → Grille, qui ne fait que dessiner)"));
-            if self.snap {
-                ui.add(egui::DragValue::new(&mut self.snap_size).range(0.1..=50.0).speed(0.1).suffix(crate::i18n::t(" m")));
-            }
-            ui.separator();
-            let names: Vec<(usize, String)> = self.proj.ymaps.iter().enumerate().filter(|(_, y)| !y.sample).map(|(i, y)| (i, y.name.clone())).collect();
-            let cur = self.proj.ymaps.get(self.target_ymap).map(|y| y.name.clone()).unwrap_or_default();
-            egui::ComboBox::from_id_salt("target_ymap").selected_text(format!("» {cur}.ymap")).show_ui(ui, |ui| {
-                for (i, n) in names {
-                    ui.selectable_value(&mut self.target_ymap, i, format!("{n}.ymap"));
+                if tool(ui, self.gizmo_object_space, ic::CUBE_FOCUS, "", t("Axes de l'objet : poignées alignées sur l'objet choisi au lieu du nord / de l'est (comme « Object space » dans CodeWalker)")).clicked() {
+                    self.gizmo_object_space = !self.gizmo_object_space;
                 }
-            })
-            .response
-            .on_hover_text(crate::i18n::t("Carte de destination des nouveaux objets"));
+                if tool(ui, self.snap, ic::MAGNET, "", t("Aimanter : aligner les positions sur un pas fixe (sans rapport avec Affichage → Grille, qui ne fait que dessiner)")).clicked() {
+                    self.snap = !self.snap;
+                }
+                if self.snap {
+                    ui.add(egui::DragValue::new(&mut self.snap_size).range(0.1..=50.0).speed(0.1).suffix(t(" m")));
+                }
+            });
+            group(ui, |ui| {
+                if action(ui, !self.undo.is_empty(), ic::ARROW_COUNTER_CLOCKWISE, "", t("Annuler (Ctrl+Z)")).clicked() {
+                    self.do_undo();
+                }
+                if action(ui, !self.redo.is_empty(), ic::ARROW_CLOCKWISE, "", t("Rétablir (Ctrl+Y)")).clicked() {
+                    self.do_redo();
+                }
+                if action(ui, !self.selected.is_empty(), ic::COPY_SIMPLE, "", t("Dupliquer la sélection (Ctrl+D)")).clicked() {
+                    let off = self.copy_offset();
+                    self.duplicate_selected(off);
+                }
+                if action(ui, !self.selected.is_empty(), ic::TRASH, "", t("Supprimer toute la sélection d'un coup (Suppr)")).clicked() {
+                    self.delete_selected();
+                }
+            });
+            group(ui, |ui| {
+                if tool(ui, self.terrain_open, ic::MOUNTAINS, t("Terrain"), t("Créateur de terrain : relief, peinture, routes, végétation, eau, effets (5)")).clicked() {
+                    self.terrain_open = !self.terrain_open;
+                    if self.terrain_open {
+                        self.tool = Tool::Terrain;
+                    }
+                }
+                if tool(ui, self.atelier.open, ic::HAMMER, t("Atelier"), t("Atelier de bâtiment : tracer l'emprise au sol, choisir les étages, le toit et la façade ; modèle, collision, version lointaine et fenêtres éclairées la nuit faits par DragoWalker")).clicked() {
+                    self.atelier.open = !self.atelier.open;
+                }
+                if tool(ui, self.studio.choose, ic::CUBE_TRANSPARENT, t("Studio MLO"), t("Espace à part pour construire un intérieur de A à Z : rien d'autre à l'écran, outils du plan, meubles, variantes, ambiance, test en jeu")).clicked() {
+                    self.studio.choose = !self.studio.choose;
+                }
+                if tool(ui, self.groups_open, ic::STACK, t("Groupes"), t("Tes groupes d'objets : les poser à la souris (molette = tourner, Maj + molette = quart de tour)")).clicked() {
+                    self.groups_open = !self.groups_open;
+                }
+                if tool(ui, self.life.open, ic::USERS, t("Vie"), t("Véhicules garés, parkings, PNJ avec activité ou ronde, circulation sur tes routes")).clicked() {
+                    self.life.open = !self.life.open;
+                    if self.life.open {
+                        self.tool = Tool::Life;
+                    }
+                }
+            });
+            group(ui, |ui| {
+                if tool(ui, self.library.open, ic::PACKAGE, t("Props"), t("Tous les props du jeu en images, avec aperçu 3D ; clic pour choisir, double-clic pour poser, glisser sur la carte pour poser à cet endroit (B)")).clicked() {
+                    self.library.open = !self.library.open;
+                }
+                if tool(ui, self.buildings.open, ic::BUILDINGS, t("Bâtiments"), t("Bâtiments du jeu : les copier pour les poser ailleurs, sur une carte custom (N)")).clicked() {
+                    self.buildings.open = !self.buildings.open;
+                }
+                if tool(ui, self.intlib.open, ic::DOOR_OPEN, t("Intérieurs"), t("Bibliothèque des intérieurs du jeu : plan, « Aller voir », « Voir isolé » (I)")).clicked() {
+                    self.intlib.open = !self.intlib.open;
+                }
+            });
+            group(ui, |ui| {
+                if tool(ui, !self.cam.map_view, ic::CUBE, "", t("Vue 3D (M)")).clicked() {
+                    self.cam.map_view = false;
+                }
+                if tool(ui, self.cam.map_view, ic::MAP_TRIFOLD, "", t("Vue carte, de dessus (M)")).clicked() {
+                    self.cam.map_view = true;
+                }
+                if tool(ui, self.game.cut_on, ic::KNIFE, "", t("Couper les bâtiments : vue en coupe (C)")).clicked() {
+                    self.game.cut_on = !self.game.cut_on;
+                }
+            });
+            group(ui, |ui| {
+                if tool(ui, self.project_open && !self.panels_hidden, ic::TREE_STRUCTURE, "", t("Panneau Projet : cartes, types, intérieurs")).clicked() {
+                    self.project_open = !self.project_open || self.panels_hidden;
+                    self.panels_hidden = false;
+                }
+                if tool(ui, self.toolbox_open && !self.panels_hidden, ic::TOOLBOX, "", t("Boîte à outils : sélection, props, intérieur, listes, options")).clicked() {
+                    self.toolbox_open = !self.toolbox_open || self.panels_hidden;
+                    self.panels_hidden = false;
+                }
+                let names: Vec<(usize, String)> = self.proj.ymaps.iter().enumerate().filter(|(_, y)| !y.sample).map(|(i, y)| (i, y.name.clone())).collect();
+                let cur = self.proj.ymaps.get(self.target_ymap).map(|y| y.name.clone()).unwrap_or_default();
+                egui::ComboBox::from_id_salt("target_ymap").selected_text(format!("{}  {cur}.ymap", ic::MAP_PIN)).show_ui(ui, |ui| {
+                    for (i, n) in names {
+                        ui.selectable_value(&mut self.target_ymap, i, format!("{n}.ymap"));
+                    }
+                })
+                .response
+                .on_hover_text(t("Carte de destination des nouveaux objets"));
+            });
         });
     }
 
     pub fn project_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Projet");
-        ui.add(egui::TextEdit::singleline(&mut self.proj.name).hint_text("Nom du projet"));
+        let mut name = self.proj.name.clone();
+        let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Nom du projet"));
+        // un seul pas d'annulation pour toute la saisie du nom, pas un par lettre
+        let editing = ui.data(|d| d.get_temp::<bool>(r.id)).unwrap_or(false);
+        if r.changed() {
+            if editing {
+                self.safe.touch();
+            } else {
+                self.push_undo();
+                ui.data_mut(|d| d.insert_temp(r.id, true));
+            }
+            self.proj.name = name;
+        }
+        if editing && !r.has_focus() {
+            ui.data_mut(|d| d.remove::<bool>(r.id));
+        }
         ui.horizontal(|ui| {
             if ui.button("+ ymap").on_hover_text("Nouveau fichier de placements").clicked() {
                 self.push_undo();
@@ -683,12 +764,10 @@ impl DwApp {
             self.tab = Tab::Selection;
         }
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Game, "🗺 Jeu");
-            ui.selectable_value(&mut self.tab, Tab::Selection, "Sélection");
-            ui.selectable_value(&mut self.tab, Tab::Props, "Props");
-            ui.selectable_value(&mut self.tab, Tab::Interior, "Intérieur");
-            ui.selectable_value(&mut self.tab, Tab::Lists, "Listes");
-            ui.selectable_value(&mut self.tab, Tab::Options, "Options");
+            use crate::look::ic;
+            for (tb, icon, n) in [(Tab::Selection, ic::CURSOR, "Sélection"), (Tab::Game, ic::GLOBE, "Jeu"), (Tab::Props, ic::PACKAGE, "Props"), (Tab::Interior, ic::HOUSE, "Intérieur"), (Tab::Lists, ic::LIST_BULLETS, "Listes"), (Tab::Options, ic::GEAR, "Options")] {
+                ui.selectable_value(&mut self.tab, tb, crate::look::label(icon, crate::i18n::t(n)));
+            }
         });
         ui.separator();
         match self.tab {
@@ -715,7 +794,7 @@ impl DwApp {
         }
     }
 
-    fn selection_tab(&mut self, ui: &mut egui::Ui) {
+    pub fn selection_tab(&mut self, ui: &mut egui::Ui) {
         if !self.selected.is_empty() && ui.button(RichText::new("Sélection intelligente : tout ce qui va avec (J)").strong()).on_hover_text("Prend tout ce qui est dans ou sur l'objet choisi : props, décalques, intérieurs, versions lointaines… (ex. tout un yacht)").clicked() {
             self.smart_select();
         }
@@ -896,7 +975,8 @@ impl DwApp {
             || e.flags != before.flags
             || e.room != before.room;
         if changed {
-            self.push_undo();
+            // un glisser (position, cap, échelle…) ne prend qu'un pas d'annulation, au début du geste
+            self.undo_once(ui.ctx());
             // un intérieur renommé garde le lien avec son archétype
             if e.mlo.is_some() && e.archetype != before.archetype {
                 for t in &mut self.proj.ytyps {
@@ -1251,12 +1331,24 @@ impl DwApp {
             });
             ui.end_row();
         });
-        if ui.button(RichText::new("🏠 Créer l'intérieur au centre de la vue").strong()).clicked() {
+        if ui.button(RichText::new(crate::look::label(crate::look::ic::HOUSE, "Créer l'intérieur au centre de la vue")).strong()).clicked() {
             let n = self.mlo_name.clone();
             self.create_mlo(&n, self.mlo_cols, self.mlo_rows, self.mlo_w, self.mlo_d, self.mlo_h);
         }
         ui.label(RichText::new("La pièce « limbo » (extérieur), les portails entre pièces voisines et la porte d'entrée sont créés automatiquement.").weak().small());
         ui.separator();
+        if let Some((t, m)) = self.cur_mlo {
+            if let Some(n) = self.proj.ytyps.get(t).and_then(|y| y.mlos.get(m)).map(|m| m.name.clone()) {
+                if crate::look::accent(ui, crate::look::ic::CUBE_TRANSPARENT, "Ouvrir dans le Studio MLO", "Construire cet intérieur dans un espace à part : rien d'autre à l'écran, outils du plan en haut, meubles et propriétés sur les côtés").clicked() {
+                    self.studio_enter(&n);
+                }
+            }
+        }
+        self.mlo_editor(ui);
+    }
+
+    /// Éditeur de l'intérieur ouvert (cur_mlo) : pièces, portails, variantes, plan, meubles, ambiance.
+    pub fn mlo_editor(&mut self, ui: &mut egui::Ui) {
         let Some((t, m)) = self.cur_mlo else {
             ui.label("Aucun intérieur ouvert. Choisis-en un dans le panneau Projet ou crée-en un.");
             return;
@@ -1274,6 +1366,7 @@ impl DwApp {
         let mut del_room = None;
         let mut sel_room = None;
         let mut furnish_room: Option<(usize, &str)> = None;
+        let mut pick_room: Option<usize> = None;
         egui::ScrollArea::vertical().max_height(220.0).id_salt("rooms").show(ui, |ui| {
             for (ri, r) in mlo.rooms.iter_mut().enumerate() {
                 if ri == 0 {
@@ -1298,12 +1391,18 @@ impl DwApp {
                         ui.add(egui::DragValue::new(&mut r.bb_max.z).speed(0.1));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Timecycle");
+                        ui.label("Ambiance");
                         ui.add(egui::TextEdit::singleline(&mut r.timecycle).hint_text("ex. int_GasStation").desired_width(140.0));
+                        if !r.timecycle.is_empty() {
+                            ui.label(RichText::new(crate::meubler::amb_family(&r.timecycle).0).small().weak());
+                        }
                     });
                     ui.horizontal(|ui| {
                         if ui.small_button("Sélectionner ses objets").clicked() {
                             sel_room = Some(ri);
+                        }
+                        if ui.small_button("Choisir : ambiance, meubles").on_hover_text("Pièce choisie plus bas : liste des ambiances du jeu avec aperçu, et catalogue des meubles à poser à la souris").clicked() {
+                            pick_room = Some(ri);
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -1342,10 +1441,6 @@ impl DwApp {
                 mlo.portals.push(model::Portal::new(mech::PORTAL_ROOM_FROM, mech::PORTAL_ROOM_TO, [v3(0.0, 0.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.0, 1.0, 1.0), v3(0.0, 1.0, 0.0)]));
                 changed = true;
             }
-            if ui.button("+ Groupe d'objets").clicked() {
-                mlo.entity_sets.push(model::EntitySet { name: mech::ENTITY_SET_DEFAULT_NAME.into(), entities: vec![] });
-                changed = true;
-            }
         });
         if let Some(ri) = del_room {
             mlo.rooms.remove(ri);
@@ -1362,6 +1457,15 @@ impl DwApp {
             for e in &mut mlo.entities {
                 if e.room > ri {
                     e.room -= 1;
+                }
+            }
+            // objets des ensembles (entity sets) : même renumérotation que ceux de l'intérieur
+            for s in &mut mlo.entity_sets {
+                s.entities.retain(|e| e.room != ri);
+                for e in &mut s.entities {
+                    if e.room > ri {
+                        e.room -= 1;
+                    }
                 }
             }
             changed = true;
@@ -1399,9 +1503,10 @@ impl DwApp {
                 changed = true;
             }
         }
+        changed |= self.entity_sets_ui(ui, &mut mlo);
         self.plan_ui(ui);
         ui.separator();
-        ui.label(RichText::new("Meubler automatiquement").strong());
+        crate::look::heading(ui, crate::look::ic::MAGIC_WAND, "Meubler automatiquement");
         let mut furnish = None;
         ui.horizontal_wrapped(|ui| {
             for st in ["salon", "bureau", "bar", "magasin", "cuisine"] {
@@ -1434,6 +1539,16 @@ impl DwApp {
         if let Some((ri, st)) = furnish_room {
             self.status = self.furnish_rooms(st, Some(ri));
         }
+        if pick_room.is_some() {
+            self.furn.room = pick_room;
+            self.furn.scroll_to = true;
+        }
+        // pièce choisie : ambiance (avec aperçu), meubles à la main, réduction des portails (meubler.rs)
+        // dans le studio, la pièce choisie est dans le panneau de droite
+        if !self.studio.on {
+            self.interior_room_tools(ui);
+        }
+        ui.separator();
         let name = self.proj.ytyps[t].mlos[m].name.clone();
         if ui.button("Centrer la vue sur l'intérieur").clicked() {
             if let Some((p, _)) = self.proj.mlo_placement(&name) {
@@ -1441,6 +1556,110 @@ impl DwApp {
                 self.cam.dist = 30.0;
             }
         }
+    }
+
+    /// Variantes de l'intérieur (entity sets, CMloEntitySet) : groupes d'objets montrés ou cachés en jeu par un
+    /// script (ActivateInteriorEntitySet). Un objet déplacé dans une variante quitte la liste des objets de
+    /// l'intérieur (il n'est plus dessiné ni choisi dans la vue, sauf avec « Aperçu »). Rend vrai si `mlo` a changé.
+    fn entity_sets_ui(&mut self, ui: &mut egui::Ui, mlo: &mut model::MloArchetype) -> bool {
+        let mut changed = false;
+        ui.separator();
+        crate::look::heading(ui, crate::look::ic::STACK, "Variantes (groupes d'objets)");
+        ui.label(RichText::new("Décors activables en jeu par un script (fête, travaux, autre mobilier…). Choisis des objets de l'intérieur dans la vue, puis déplace-les dans une variante. L'export écrit dw_entity_sets.lua, un exemple pour les activer.").weak().small());
+        // objets choisis dans la vue qui appartiennent à cet intérieur
+        let sel_in: Vec<u64> = mlo.entities.iter().filter(|e| self.sel_set.contains(&e.id)).map(|e| e.id).collect();
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.mlo_state.set_new_name).hint_text(mech::ENTITY_SET_DEFAULT_NAME).desired_width(150.0));
+            if ui.button("+ Créer la variante").clicked() {
+                let name = crate::mlo::unique_set_name(mlo, &self.mlo_state.set_new_name);
+                mlo.entity_sets.push(model::EntitySet { name, entities: Vec::new(), default_on: false });
+                self.mlo_state.set_new_name.clear();
+                changed = true;
+            }
+        });
+        if mlo.entity_sets.is_empty() {
+            ui.label(RichText::new("Aucune variante.").weak().small());
+            return changed;
+        }
+        let room_names: Vec<String> = mlo.rooms.iter().map(|r| r.name.clone()).collect();
+        let mlo_key = mlo.name.to_lowercase();
+        let mut del: Option<usize> = None;
+        let mut move_in: Option<usize> = None;
+        // (variante, objet ; None = tous)
+        let mut take_out: Option<(usize, Option<usize>)> = None;
+        let mut renamed: Vec<(String, String)> = Vec::new();
+        for (si, s) in mlo.entity_sets.iter_mut().enumerate() {
+            egui::CollapsingHeader::new(format!("{} · {} objet(s){}", s.name, s.entities.len(), if s.default_on { " · actif par défaut" } else { "" })).id_salt(("eset", si)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Nom");
+                    let old = s.name.clone();
+                    if ui.add(egui::TextEdit::singleline(&mut s.name).desired_width(150.0)).changed() {
+                        renamed.push((old, s.name.clone()));
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut s.default_on, "Actif par défaut").on_hover_text("Le script de l'export (dw_entity_sets.lua) l'active dès que l'intérieur est chargé en jeu").changed() {
+                        changed = true;
+                    }
+                    let key = (mlo_key.clone(), s.name.to_lowercase());
+                    let mut on = self.mlo_state.set_preview.contains(&key);
+                    if ui.toggle_value(&mut on, "👁 Aperçu").on_hover_text("Montre ou cache les objets de la variante dans la vue (jeu chargé)").changed() {
+                        if on {
+                            self.mlo_state.set_preview.insert(key);
+                        } else {
+                            self.mlo_state.set_preview.remove(&key);
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!sel_in.is_empty(), egui::Button::new(format!("Y déplacer les objets choisis ({})", sel_in.len()))).on_hover_text("Les objets choisis de l'intérieur passent dans la variante").clicked() {
+                        move_in = Some(si);
+                    }
+                    if ui.add_enabled(!s.entities.is_empty(), egui::Button::new("Tout remettre dans l'intérieur")).clicked() {
+                        take_out = Some((si, None));
+                    }
+                    if ui.small_button("🗑 Supprimer").on_hover_text("Supprime la variante ; ses objets reviennent dans l'intérieur").clicked() {
+                        del = Some(si);
+                    }
+                });
+                for (k, e) in s.entities.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("↩").on_hover_text("Remettre cet objet dans l'intérieur").clicked() {
+                            take_out = Some((si, Some(k)));
+                        }
+                        let room = room_names.get(e.room).cloned().unwrap_or_else(|| "?".into());
+                        ui.label(RichText::new(format!("{} · {room}", e.archetype)).small());
+                    });
+                }
+            });
+        }
+        for (old, new) in renamed {
+            if self.mlo_state.set_preview.remove(&(mlo_key.clone(), old.to_lowercase())) {
+                self.mlo_state.set_preview.insert((mlo_key.clone(), new.to_lowercase()));
+            }
+        }
+        if let Some(si) = move_in {
+            let n = crate::mlo::move_into_set(mlo, si, &sel_in);
+            self.selected.retain(|id| !sel_in.contains(id));
+            self.sel_set.retain(|id| !sel_in.contains(id));
+            self.status = format!("{n} objet(s) déplacé(s) dans la variante « {} ».", mlo.entity_sets[si].name);
+            changed = true;
+        }
+        if let Some((si, k)) = take_out {
+            let ids = crate::mlo::take_out_of_set(mlo, si, k);
+            self.status = format!("{} objet(s) remis dans l'intérieur.", ids.len());
+            self.set_selection(ids);
+            changed = true;
+        }
+        if let Some(si) = del {
+            crate::mlo::take_out_of_set(mlo, si, None);
+            let s = mlo.entity_sets.remove(si);
+            self.mlo_state.set_preview.remove(&(mlo_key.clone(), s.name.to_lowercase()));
+            self.status = format!("Variante « {} » supprimée.", s.name);
+            changed = true;
+        }
+        changed
     }
 
     fn ai_tab(&mut self, ui: &mut egui::Ui) {
@@ -1608,7 +1827,8 @@ impl DwApp {
         ui.separator();
         ui.label(RichText::new("Mémoire graphique").strong());
         let (vram, budget) = self.game.gpu.as_ref().and_then(|g| g.lock().ok().map(|g| (g.vram_mb, g.budget))).unwrap_or((None, None));
-        let mut mb = crate::app::load_settings()["gpu_budget_mb"].as_u64().unwrap_or(0) as u32;
+        // réglage lu une fois (pas à chaque image), écrit quand le curseur est relâché
+        let mut mb = *self.gpu_budget_mb.get_or_insert_with(|| crate::app::load_settings()["gpu_budget_mb"].as_u64().unwrap_or(0) as u32);
         let mut auto = mb == 0;
         let mut changed = false;
         if ui
@@ -1622,7 +1842,8 @@ impl DwApp {
         if !auto {
             ui.horizontal(|ui| {
                 ui.label("Limite");
-                changed |= ui.add(egui::Slider::new(&mut mb, 384..=2100).step_by(64.0).suffix(" Mo")).changed();
+                let r = ui.add(egui::Slider::new(&mut mb, 384..=2100).step_by(64.0).suffix(" Mo"));
+                changed |= r.drag_stopped() || (r.changed() && !r.dragged());
             });
         }
         ui.label(
@@ -1634,6 +1855,7 @@ impl DwApp {
             .weak()
             .small(),
         );
+        self.gpu_budget_mb = Some(mb);
         if changed {
             crate::app::save_setting("gpu_budget_mb", serde_json::json!(mb));
             if let Some(g) = &self.game.gpu {

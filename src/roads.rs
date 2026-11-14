@@ -195,6 +195,8 @@ pub const BRIDGE_COLL: u8 = 3;
 /// Glissières : collision en métal ; îlot de rond-point : collision d'herbe.
 pub const RAIL_COLL: u8 = 4;
 pub const GRASS_COLL: u8 = 5;
+/// Collision des marches des passerelles : béton marqué « escalier » (MAT_STAIRS).
+pub const STAIRS_COLL: u8 = 6;
 
 // Tunnels — mesures **estimées** d'après l'aspect des tunnels du jeu.
 /// Hauteur libre du tube au-dessus de la chaussée (m).
@@ -800,6 +802,11 @@ impl Road {
         };
         r.gaps = self.gaps.iter().map(|g| [map(g[0].max(0.0)), map(g[1].min(self.length())), g[2]]).collect();
         r.traffic = self.traffic.clone();
+        // réglages de la route gardés ; ses lampadaires sont repris pour être retirés puis reposés le long de la
+        // nouvelle courbe (refresh_furniture), sinon ils resteraient orphelins
+        r.furniture = self.furniture;
+        r.oneway = self.oneway;
+        r.props = self.props.clone();
         Some((r, cut))
     }
 
@@ -1412,6 +1419,7 @@ impl Road {
             let wt = self.half_total();
             let depth = if k.foot { FOOT_DEPTH } else { DECK_DEPTH };
             let mut bidx: Vec<u32> = Vec::new();
+            let mut sidx: Vec<u32> = Vec::new();
             let o2 = v3(origin.x, origin.y, 0.0);
             // piles : un voile de béton sous le tablier, du sol (enterré de 1 m) au dessous du tablier
             for pr in &self.piers {
@@ -1442,27 +1450,27 @@ impl Road {
                     let steps = (rise / STEP_RISE).ceil() as usize;
                     let h = rise / steps as f32;
                     let p0 = p - o2;
+                    let at = |x: f32, s: f32, z: f32| v3(p0.x + out.x * x + r.x * s, p0.y + out.y * x + r.y * s, z);
                     for i in 0..steps {
                         let (x0, x1) = (i as f32 * STEP_RUN, (i + 1) as f32 * STEP_RUN);
                         let (z_hi, z_lo) = (top - i as f32 * h, top - (i + 1) as f32 * h);
-                        let at = |x: f32, s: f32, z: f32| v3(p0.x + out.x * x + r.x * s, p0.y + out.y * x + r.y * s, z);
-                        // contremarche (face vers l'extérieur) puis marche
-                        push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, -hw, z_hi), at(x0, hw, z_hi), at(x0, hw, z_lo), at(x0, -hw, z_lo)], out);
-                        push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, -hw, z_lo), at(x0, hw, z_lo), at(x1, hw, z_lo), at(x1, -hw, z_lo)], v3(0.0, 0.0, 1.0));
-                        // limons : côtés pleins, de la marche jusque sous le sol, et garde-corps
-                        for s in [-1.0f32, 1.0] {
-                            let e = s * (hw + PARAPET_W);
-                            let ei = s * hw;
-                            let rail = z_hi + FOOT_PARAPET_H;
-                            for (ss, want) in [(e, r * s), (ei, r * -s)] {
-                                push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, ss, g - 0.5), at(x1, ss, g - 0.5), at(x1, ss, rail), at(x0, ss, rail)], want);
-                            }
-                            push_quad(&mut pos, &mut uv, &mut bidx, [at(x0, ei, rail), at(x1, ei, rail), at(x1, e, rail), at(x0, e, rail)], v3(0.0, 0.0, 1.0));
+                        // contremarche (face vers l'extérieur) puis marche : collision « escalier » du jeu
+                        push_quad(&mut pos, &mut uv, &mut sidx, [at(x0, -hw, z_hi), at(x0, hw, z_hi), at(x0, hw, z_lo), at(x0, -hw, z_lo)], out);
+                        push_quad(&mut pos, &mut uv, &mut sidx, [at(x0, -hw, z_lo), at(x0, hw, z_lo), at(x1, hw, z_lo), at(x1, -hw, z_lo)], v3(0.0, 0.0, 1.0));
+                    }
+                    // limons : un seul pan de chaque côté, du sol au garde-corps qui suit la pente (des dalles empilées,
+                    // une par marche, se chevauchaient et scintillaient), et le dessus du garde-corps
+                    let lx = steps as f32 * STEP_RUN;
+                    let (rail_top, rail_end) = (top + FOOT_PARAPET_H, g + h + FOOT_PARAPET_H);
+                    for s in [-1.0f32, 1.0] {
+                        let e = s * (hw + PARAPET_W);
+                        let ei = s * hw;
+                        for (ss, want) in [(e, r * s), (ei, r * -s)] {
+                            push_quad(&mut pos, &mut uv, &mut bidx, [at(0.0, ss, g - 0.5), at(lx, ss, g - 0.5), at(lx, ss, rail_end), at(0.0, ss, rail_top)], want);
                         }
+                        push_quad(&mut pos, &mut uv, &mut bidx, [at(0.0, ei, rail_top), at(lx, ei, rail_end), at(lx, e, rail_end), at(0.0, e, rail_top)], v3(0.0, 0.0, 1.0));
                     }
                     // bout du limon
-                    let lx = steps as f32 * STEP_RUN;
-                    let at = |x: f32, s: f32, z: f32| v3(p0.x + out.x * x + r.x * s, p0.y + out.y * x + r.y * s, z);
                     for s in [-1.0f32, 1.0] {
                         let (e, ei) = (s * (hw + PARAPET_W), s * hw);
                         push_quad(&mut pos, &mut uv, &mut bidx, [at(lx, e, g - 0.5), at(lx, ei, g - 0.5), at(lx, ei, g + h + FOOT_PARAPET_H), at(lx, e, g + h + FOOT_PARAPET_H)], out);
@@ -1471,6 +1479,9 @@ impl Road {
             }
             if !bidx.is_empty() {
                 parts.push((concrete, bidx, BRIDGE_COLL));
+            }
+            if !sidx.is_empty() {
+                parts.push((concrete, sidx, STAIRS_COLL));
             }
         }
         let o2 = v3(origin.x, origin.y, 0.0);
@@ -1616,10 +1627,19 @@ impl Road {
 fn push_quad(pos: &mut Vec<V3>, uv: &mut Vec<[f32; 2]>, idx: &mut Vec<u32>, q: [V3; 4], want: V3) {
     let n = (q[1] - q[0]).cross(q[2] - q[0]);
     let q = if n.dot(want) < 0.0 { [q[3], q[2], q[1], q[0]] } else { q };
-    let (lu, lv) = ((q[1] - q[0]).len() / 4.0, (q[3] - q[0]).len() / 4.0);
+    // texture projetée sur le plan de la face, en coordonnées du monde (4 m par répétition) : continue d'un morceau à
+    // l'autre (chaque morceau repartait de zéro : raccords visibles sur les escaliers et les piles des passerelles)
+    let nn = n.norm();
     let b = pos.len() as u32;
     pos.extend_from_slice(&q);
-    uv.extend_from_slice(&[[0.0, 0.0], [lu, 0.0], [lu, lv], [0.0, lv]]);
+    for p in q {
+        uv.push(if nn.z.abs() > 0.7 {
+            [p.x / 4.0, p.y / 4.0]
+        } else {
+            let h = v3(-nn.y, nn.x, 0.0).norm();
+            [(p.x * h.x + p.y * h.y) / 4.0, -p.z / 4.0]
+        });
+    }
     idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
 }
 
@@ -2111,6 +2131,15 @@ pub fn preview_image(kind: usize) -> eframe::egui::ColorImage {
 
 /// Toutes les textures des routes (gardées en mémoire).
 pub fn road_textures() -> Vec<(u64, TexData)> {
+    road_textures_cached().clone()
+}
+
+/// Clés des textures des routes (sans copier les images).
+pub fn road_texture_keys() -> Vec<u64> {
+    road_textures_cached().iter().map(|t| t.0).collect()
+}
+
+fn road_textures_cached() -> &'static Vec<(u64, TexData)> {
     static CACHE: std::sync::OnceLock<Vec<(u64, TexData)>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -2128,7 +2157,6 @@ pub fn road_textures() -> Vec<(u64, TexData)> {
             }
             v
         })
-        .clone()
 }
 
 /// Sommets d'un .ybn : un triangle désigne ses sommets sur 15 bits (le 16e est un drapeau), donc au plus
@@ -2197,6 +2225,11 @@ fn collision_chunks(tris: &[(u32, u32, u32, u8)]) -> Vec<&[(u32, u32, u32, u8)]>
 /// Collisions d'un modèle quelconque (triangles dans le monde) au format XML de CodeWalker : une pièce
 /// GeometryBVH par paquet d'au plus 20 000 triangles et 32 000 sommets, sommets relatifs au centre de la pièce (GetVertexPos
 /// 0x0600410f), marge 0,04, une liste de types de surface `types` (index `m` de chaque triangle).
+/// Type de surface marqué « escalier » (bit à ajouter au type) : à l'écriture, le matériau reçoit FLAG_STAIRS
+/// (drapeau des matériaux de collision du jeu, nom relevé dans CodeWalker.Core.dll) ; le personnage y monte et
+/// descend comme sur un escalier du jeu.
+pub const MAT_STAIRS: u32 = 1 << 31;
+
 pub fn mesh_collision_xml(verts: &[V3], tris: &[(u32, u32, u32, u8)], types: &[u32]) -> String {
     let mats: Vec<(u32, u32)> = types.iter().map(|t| (*t, 0)).collect();
     mesh_collision_xml_rooms(verts, tris, &mats)
@@ -2242,7 +2275,8 @@ pub fn mesh_collision_xml_rooms(verts: &[V3], tris: &[(u32, u32, u32, u8)], mats
         head(&mut s, "    ", bmn, bmx, 0.04);
         let _ = writeln!(s, "    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n    {}\n    <UnkFloat1 value=\"0\" />\n    <UnkFloat2 value=\"0.0025\" />\n    <Materials>", xyz("GeometryCenter", gc));
         for (t, room) in mats {
-            let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"{room}\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
+            let (t, flags) = (t & !MAT_STAIRS, if t & MAT_STAIRS != 0 { "FLAG_STAIRS" } else { "NONE" });
+            let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"{room}\" />\n      <PedDensity value=\"0\" />\n      <Flags>{flags}</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
         }
         s.push_str("    </Materials>\n    <Vertices>\n");
         for i in &order {

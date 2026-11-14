@@ -579,7 +579,10 @@ impl DwApp {
     }
 
     /// Export : manifeste des dépendances (_manifest.ymf) du projet et collisions des bâtiments du jeu copiés.
-    pub fn export_buildings(&self, stream: &std::path::Path, lod_ymaps: &[crate::model::Ymap]) -> Result<Option<String>, String> {
+    /// `interior_bounds` : intérieurs du projet dont la collision « <nom>.ybn » est écrite par cet export (seuls
+    /// listés dans <Interiors>, avec ceux des MLO importés qui ont la leur) ; un intérieur du jeu ou sans collision
+    /// écrite y déclarerait un fichier absent.
+    pub fn export_buildings(&self, stream: &std::path::Path, maps: &[crate::model::Ymap], lod_ymaps: &[crate::model::Ymap], interior_bounds: &[String]) -> Result<Option<String>, String> {
         // fichiers d'un export précédent
         if let Ok(rd) = std::fs::read_dir(stream) {
             for f in rd.flatten() {
@@ -612,7 +615,9 @@ impl DwApp {
         // les intérieurs sont listés dans <Interiors> (Name, Bounds = leur nom)
         let mut imaps: Vec<(String, bool, Vec<String>)> = Vec::new();
         let mut ncol = 0;
-        for y in self.proj.ymaps.iter().filter(|y| !y.sample).chain(lod_ymaps.iter()) {
+        // les cartes telles qu'exportées (un intérieur posé a sa propre carte « _milo_ ») ; le manifeste ne
+        // marque INTERIOR_DATA que celles qui placent un intérieur
+        for y in maps.iter().filter(|y| !y.sample).chain(lod_ymaps.iter()) {
             let mut itypes: Vec<String> = Vec::new();
             let mut interior = false;
             for e in &y.entities {
@@ -654,10 +659,18 @@ impl DwApp {
         }
         let mut ityps: Vec<(String, Vec<String>)> = Vec::new();
         let mut interiors: Vec<String> = Vec::new();
+        // intérieurs des MLO importés : listés s'ils ont leur collision du même nom (recopiée par export_mlos)
+        let imported_cols: std::collections::HashSet<String> = self.proj.mlo_res.iter().flat_map(|r| r.ybns.iter()).filter_map(|b| std::path::Path::new(b).file_stem().map(|s| s.to_string_lossy().to_lowercase())).collect();
+        let external = self.mlo_external_ytyps();
         for t in &self.proj.ytyps {
             let mut list: Vec<String> = Vec::new();
+            let ext = external.contains(&t.name.to_lowercase());
             for m in &t.mlos {
-                interiors.push(m.name.clone());
+                let low = m.name.to_lowercase();
+                let has_col = if ext { imported_cols.contains(&low) } else { interior_bounds.iter().any(|b| b.eq_ignore_ascii_case(&low)) };
+                if has_col && !interiors.iter().any(|x: &String| x.eq_ignore_ascii_case(&low)) {
+                    interiors.push(m.name.clone());
+                }
                 for e in m.entities.iter().chain(m.entity_sets.iter().flat_map(|s| s.entities.iter())) {
                     if let Some(yt) = ytyp_of(&e.archetype) {
                         if yt != t.name && !list.contains(&yt) {
@@ -670,7 +683,7 @@ impl DwApp {
                 ityps.push((t.name.clone(), list));
             }
         }
-        if imaps.is_empty() && ityps.is_empty() {
+        if imaps.is_empty() && ityps.is_empty() && interiors.is_empty() {
             return Ok(None);
         }
         let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<CPackFileMetaData>\n  <MapDataGroups/>\n  <HDTxdBindingArray/>\n  <imapDependencies/>\n");

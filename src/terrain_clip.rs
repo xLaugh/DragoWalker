@@ -243,9 +243,15 @@ impl DwApp {
         }
         let yi = self.ensure_target_ymap();
         let mut ne = 0;
+        // comme une duplication (edit_ops) : plus un objet du jeu remplacé, et chaque groupe collé forme son propre bloc
+        let mut inst_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for e in &c.ents {
             let mut n = e.clone();
             n.id = crate::model::new_id();
+            n.game_index = -1;
+            if n.group_inst != 0 {
+                n.group_inst = *inst_map.entry(n.group_inst).or_insert_with(crate::model::new_id);
+            }
             n.pos = v3(e.pos.x + corner.x, e.pos.y + corner.y, e.pos.z + base);
             self.proj.ymaps[yi].entities.push(n);
             ne += 1;
@@ -283,8 +289,11 @@ impl DwApp {
             } else {
                 painter.circle_stroke(self.cam.project(c).map(|q| q.0).unwrap_or_default(), 8.0, egui::Stroke::new(2.0_f32, col));
             }
-        } else if let Some(cl) = self.clip_turned() {
+        } else if let Some(cl) = &self.terrain.clip {
+            // dimensions seulement (pas de copie tournée à chaque image) : un quart de tour échange largeur et
+            // profondeur
             let (w, d) = cl.size();
+            let (w, d) = if self.terrain.clip_rot % 2 == 1 { (d, w) } else { (w, d) };
             painter.add(egui::Shape::line(rect(c - v3(w * 0.5, d * 0.5, 0.0), c + v3(w * 0.5, d * 0.5, 0.0)), egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 190, 90))));
         }
     }

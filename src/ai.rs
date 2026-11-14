@@ -653,14 +653,22 @@ fn run_cmd(mut cmd: std::process::Command, input: &str, timeout_s: u64) -> Resul
 /// Claude Code en mode non interactif : aucun outil, réponse structurée selon le schéma.
 fn call_claude_code(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiReply, String> {
     let exe = cfg.claude_code.clone().or_else(find_claude_code).ok_or("Claude Code est introuvable sur ce PC (commande « claude »).")?;
-    let mut cmd = std::process::Command::new(exe);
+    // claude.cmd (installé par npm) : Windows refuse un argument de fichier .cmd qui contient un retour à la ligne ;
+    // les consignes passent alors avec la demande, sur l'entrée standard
+    let batch = is_batch(&exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.args(["-p", "--output-format", "json", "--tools", "", "--no-session-persistence", "--strict-mcp-config"]);
-    cmd.arg("--system-prompt").arg(system_prompt(scene));
-    cmd.arg("--json-schema").arg(reply_schema().to_string());
-    if !cfg.cc_model.trim().is_empty() {
-        cmd.arg("--model").arg(cfg.cc_model.trim());
+    if !batch {
+        cmd.arg("--system-prompt").arg(system_prompt(scene));
     }
-    let input = format!("{}\nRéponds à la dernière demande de l'utilisateur.", transcript(history));
+    cmd.arg("--json-schema").arg(one_line(&reply_schema().to_string()));
+    if !cfg.cc_model.trim().is_empty() {
+        cmd.arg("--model").arg(one_line(cfg.cc_model.trim()));
+    }
+    let mut input = format!("{}\nRéponds à la dernière demande de l'utilisateur.", transcript(history));
+    if batch {
+        input = format!("Consignes :\n{}\n\nConversation :\n{input}", system_prompt(scene));
+    }
     let (out, err, _ok) = run_cmd(cmd, &input, 240)?;
     let v: Value = serde_json::from_str(out.trim()).map_err(|_| {
         let msg = if err.trim().is_empty() { out.trim().to_string() } else { err.trim().to_string() };
@@ -700,8 +708,13 @@ fn call_openai(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiRe
 
 /// Autre outil en ligne de commande : la demande complète sur l'entrée standard, la réponse sur la sortie.
 fn call_cli(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiReply, String> {
-    let parts: Vec<&str> = cfg.cli_cmd.split_whitespace().collect();
+    let parts = split_command(&cfg.cli_cmd);
     let (exe, args) = parts.split_first().ok_or("Indique la commande de l'IA dans les réglages (ex. « gemini -p »).")?;
+    // « gemini » est souvent gemini.cmd (npm) : Command::new ne cherche que les .exe
+    let exe = resolve_exe(exe);
+    if is_batch(&exe) && args.iter().any(|a| a.contains(['\r', '\n'])) {
+        return Err("La commande de l'IA ne doit pas contenir de retour à la ligne.".into());
+    }
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     let input = format!(
@@ -715,6 +728,63 @@ fn call_cli(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiReply
         return Err(format!("La commande a échoué : {}", err.trim().chars().take(300).collect::<String>()));
     }
     Ok(reply_from_text(&out))
+}
+
+/// Découpe une commande comme l'invite de commandes : espaces hors guillemets ; « "C:\Program Files\x.exe" -p »
+/// garde le chemin entier.
+pub fn split_command(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Fichier de commandes (.cmd, .bat) : lancé par cmd.exe, avec des règles d'arguments plus strictes.
+fn is_batch(p: &std::path::Path) -> bool {
+    p.extension().map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")).unwrap_or(false)
+}
+
+/// Retours à la ligne remplacés par des espaces (refusés dans les arguments d'un .cmd).
+fn one_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
+}
+
+/// Programme à lancer : un nom sans chemin ni extension est cherché dans le PATH en .exe, .cmd puis .bat (comme
+/// l'invite de commandes) ; sinon le nom tel quel.
+pub fn resolve_exe(name: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(name);
+    if p.components().count() > 1 || p.extension().is_some() {
+        return p;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for d in std::env::split_paths(&path) {
+            for e in ["exe", "cmd", "bat"] {
+                let c = d.join(format!("{name}.{e}"));
+                if c.is_file() {
+                    return c;
+                }
+            }
+        }
+    }
+    p
 }
 
 /// Envoie la demande au moteur choisi dans un fil séparé ; la réponse arrive sur le canal.
@@ -750,6 +820,17 @@ mod tests {
     fn parse_mlo() {
         let r = local_parse("crée un intérieur de 4 pièces");
         assert!(matches!(r.actions[0], Action::CreateMlo { cols: 2, rows: 2, .. }));
+    }
+    #[test]
+    fn commande_avec_guillemets() {
+        assert_eq!(split_command("gemini -p"), vec!["gemini", "-p"]);
+        assert_eq!(split_command(r#""C:\Program Files\Ollama\ollama.exe" run  llama3.1"#), vec![r"C:\Program Files\Ollama\ollama.exe", "run", "llama3.1"]);
+        assert_eq!(split_command(r#"outil --x "" fin"#), vec!["outil", "--x", "", "fin"]);
+        assert!(split_command("   ").is_empty());
+        assert!(is_batch(std::path::Path::new(r"C:\npm\claude.CMD")) && !is_batch(std::path::Path::new("claude.exe")));
+        assert_eq!(one_line("a\r\nb"), "a  b");
+        // chemin ou extension donnés : gardés tels quels
+        assert_eq!(resolve_exe(r"C:\x\outil.exe"), std::path::PathBuf::from(r"C:\x\outil.exe"));
     }
     #[test]
     fn json_action() {

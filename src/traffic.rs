@@ -16,7 +16,7 @@ use crate::terrain::Terrain;
 
 /// Voitures de PNJ qui roulent sur les routes tracées : un script client les fait apparaître sur les points de
 /// route proches du joueur et rouler au hasard (TaskVehicleDriveWander) ; elles disparaissent quand on s'éloigne.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NpcTraffic {
     pub enabled: bool,
     /// voitures en même temps autour du joueur
@@ -234,7 +234,7 @@ pub fn build_network(t: &Terrain) -> Network {
         per_road.push(ids);
     }
     // jonctions : le bout d'une route relié au point le plus proche d'une autre route
-    let near = |ids: &[usize], p: V3, nodes: &[TNode]| ids.iter().copied().map(|i| (i, (nodes[i].pos - p).len())).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let near = |ids: &[usize], p: V3, nodes: &[TNode]| ids.iter().copied().map(|i| (i, (nodes[i].pos - p).len())).min_by(|a, b| a.1.total_cmp(&b.1));
     for (ri, ids) in per_road.iter().enumerate() {
         // un rond-point n'a pas de bout : ses carrefours le relient
         if t.roads[ri].ring {

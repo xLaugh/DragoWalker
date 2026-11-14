@@ -310,7 +310,8 @@ impl DwApp {
             let n = self.proj.next_ytyp_name();
             self.proj.ytyps.push(Ytyp { name: n, mlos: vec![], visible: true, raw_archetypes: vec![] });
         }
-        let ti = self.cur_mlo.map(|(t, _)| t).unwrap_or(0).min(self.proj.ytyps.len() - 1);
+        // jamais dans le .ytyp d'une ressource MLO importée (recopié tel quel à l'export : l'intérieur n'y serait pas)
+        let ti = self.own_ytyp();
         self.proj.ytyps[ti].mlos.push(mlo);
         let mi = self.proj.ytyps[ti].mlos.len() - 1;
         self.cur_mlo = Some((ti, mi));
@@ -318,6 +319,7 @@ impl DwApp {
         let yi = self.ensure_target_ymap();
         let mut inst = Entity::new(&name, self.snap_pos(v3(self.cam.target.x, self.cam.target.y, self.ground_z)));
         inst.mlo = Some(MloInstData { num_exit_portals: exits, ..Default::default() });
+        inst.flags = crate::mech::MLO_INSTANCE_FLAGS;
         inst.lod_dist = 200.0;
         let id = inst.id;
         self.proj.ymaps[yi].entities.push(inst);
@@ -355,7 +357,8 @@ impl DwApp {
             let n = self.proj.next_ytyp_name();
             self.proj.ytyps.push(Ytyp { name: n, mlos: vec![], visible: true, raw_archetypes: vec![] });
         }
-        let ti = self.cur_mlo.map(|(t, _)| t).unwrap_or(0).min(self.proj.ytyps.len() - 1);
+        // jamais dans le .ytyp d'une ressource MLO importée (recopié tel quel à l'export : l'intérieur n'y serait pas)
+        let ti = self.own_ytyp();
         self.proj.ytyps[ti].mlos.push(mlo);
         let mi = self.proj.ytyps[ti].mlos.len() - 1;
         self.cur_mlo = Some((ti, mi));
@@ -364,6 +367,7 @@ impl DwApp {
         let mut inst = Entity::new(&name, bpos);
         inst.rot = brot;
         inst.mlo = Some(MloInstData { num_exit_portals: exits, ..Default::default() });
+        inst.flags = crate::mech::MLO_INSTANCE_FLAGS;
         inst.lod_dist = 200.0;
         self.proj.ymaps[yi].entities.push(inst);
         self.opts.show_rooms = true;
@@ -377,8 +381,11 @@ impl DwApp {
     /// Meuble toutes les pièces (`only` = None) ou une seule, selon un type de pièce ; les meubles sont posés sur
     /// le sol de la pièce (bas de sa boîte), donc à la bonne hauteur pour les pièces proposées par étage.
     pub fn furnish_rooms(&mut self, style: &str, only: Option<usize>) -> String {
-        if self.cur_mlo.is_none() {
+        let Some((t, _)) = self.cur_mlo else {
             return "Aucun intérieur courant : crée-en un d'abord.".into();
+        };
+        if self.mlo_ytyp_imported(t) {
+            return crate::meubler::IMPORTED_MLO_LOCKED.into();
         }
         self.push_undo();
         self.furnish_rooms_inner(style, only)

@@ -116,7 +116,7 @@ pub fn node_specials(t: &crate::terrain::Terrain, nodes: &[crate::traffic::TNode
                     let lat = (rel.x * side.x + rel.y * side.y).abs();
                     (along > a.len * 0.5 && along < a.len + crate::traffic::NODE_STEP + 3.0 && lat < a.hw + 3.0).then_some((k, along))
                 })
-                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                .min_by(|x, y| x.1.total_cmp(&y.1));
             if let Some((k, _)) = best {
                 out[k] = if ctl[i] == 1 { SPECIAL_LIGHT } else { SPECIAL_STOP };
             }

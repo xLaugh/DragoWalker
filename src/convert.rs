@@ -128,13 +128,58 @@ impl DwApp {
         let concrete = names.iter().position(|n| n == "CONCRETE").unwrap_or(1) as u32;
         for t in self.proj.ytyps.iter().filter(|t| !external.contains(&t.name.to_lowercase())) {
             for m in &t.mlos {
-                let h = crate::gta::crypto::joaat(&m.name.to_lowercase());
-                if w.and_then(|w| w.archetypes.get(&h)).map(|a| a.mlo).unwrap_or(false) {
+                // intérieur du jeu (même sans le jeu chargé : shell::mlo_is_game) : sa collision du jeu reste
+                if self.mlo_is_game(m) {
                     continue;
                 }
                 let (mut verts, mut tris, mut mats) = (Vec::new(), Vec::new(), Vec::new());
                 let mut too_many = 0;
-                for (ri, r) in m.rooms.iter().enumerate().skip(1) {
+                // bâtiment de l'atelier : sol et plafond de chaque pièce dans l'emprise réelle, sans murs (ceux du
+                // bâtiment sont dans sa collision) ; la boîte des pièces fermait le creux d'une maison en L
+                if let Some(h) = self.proj.houses.iter().find(|h| h.interior.as_deref().map(|n| n.eq_ignore_ascii_case(&m.name)).unwrap_or(false)) {
+                    let mut by_room: std::collections::BTreeMap<usize, Vec<[V3; 3]>> = std::collections::BTreeMap::new();
+                    for (ri, t) in h.room_collision(&m.rooms) {
+                        by_room.entry(ri).or_default().push(t);
+                    }
+                    for (ri, ts) in by_room {
+                        if ri as u32 > ROOM_ID_MAX {
+                            too_many += 1;
+                            continue;
+                        }
+                        let mi = mats.len() as u8;
+                        mats.push((concrete, ri as u32));
+                        for t in ts {
+                            let base = verts.len() as u32;
+                            verts.extend(t.iter().copied());
+                            tris.push((base, base + 1, base + 2, mi));
+                        }
+                    }
+                }
+                // coque modelable (design.rs) : murs, sols, plafonds et blocs, avec le numéro de leur pièce
+                let dcol = self.design_collision(m);
+                if !dcol.is_empty() {
+                    let mut by_room: std::collections::BTreeMap<usize, Vec<[V3; 3]>> = std::collections::BTreeMap::new();
+                    for (ri, t) in dcol {
+                        by_room.entry(ri).or_default().push(t);
+                    }
+                    for (ri, ts) in by_room {
+                        if ri as u32 > ROOM_ID_MAX {
+                            continue;
+                        }
+                        let mi = mats.len() as u8;
+                        mats.push((concrete, ri as u32));
+                        for t in ts {
+                            let base = verts.len() as u32;
+                            verts.extend(t.iter().copied());
+                            tris.push((base, base + 1, base + 2, mi));
+                        }
+                    }
+                }
+                // boîtes des pièces (pas pour un bâtiment de l'atelier : sa collision vient de lui ; une pièce de forme libre n'y
+                // garde que son escalier, voir shell::room_quads)
+                let is_house = self.proj.houses.iter().any(|h| h.interior.as_deref().map(|n| n.eq_ignore_ascii_case(&m.name)).unwrap_or(false));
+                let generic = !is_house && too_many == 0;
+                for (ri, r) in m.rooms.iter().enumerate().skip(1).filter(|_| generic) {
                     let (a, b) = (r.bb_min, r.bb_max);
                     if b.x - a.x < 0.1 || b.y - a.y < 0.1 {
                         continue;
@@ -330,6 +375,7 @@ impl DwApp {
         let mut inst = Entity::new(&name, bpos);
         inst.rot = brot;
         inst.mlo = Some(MloInstData { num_exit_portals: exits, ..Default::default() });
+        inst.flags = crate::mech::MLO_INSTANCE_FLAGS;
         inst.lod_dist = 200.0;
         // relié au bâtiment : ils bougent et tournent ensemble (mlo_link_tick)
         self.proj.mlo_links.retain(|l| l.1 != bid);

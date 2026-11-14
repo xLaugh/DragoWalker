@@ -47,10 +47,11 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
         m.portals
             .iter()
             .filter(|p| p.room_from as usize == ri || p.room_to as usize == ri)
-            .filter(|p| p.corners.iter().all(|c| (c.z - zz).abs() < STAIR_PLANE))
-            .map(|p| {
+            .flat_map(|p| p.holes())
+            .filter(|h| h.iter().all(|c| (c.z - zz).abs() < STAIR_PLANE))
+            .map(|h| {
                 let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-                for c in p.corners {
+                for c in h {
                     x0 = x0.min(c.x);
                     x1 = x1.max(c.x);
                     y0 = y0.min(c.y);
@@ -62,8 +63,10 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
             .collect()
     };
     let (floor_holes, ceil_holes) = (flat_holes(a.z), flat_holes(b.z));
+    // pièce de forme libre : sol, plafond et murs viennent de sa coque modelable (design.rs) ; seulement l'escalier
+    let free = r.free;
     // sol (vers le haut) et plafond (vers le bas), percés des trémies
-    for (part, zz, n, holes) in [(0usize, a.z, v3(0.0, 0.0, 1.0), &floor_holes), (2, b.z, v3(0.0, 0.0, -1.0), &ceil_holes)] {
+    for (part, zz, n, holes) in [(0usize, a.z, v3(0.0, 0.0, 1.0), &floor_holes), (2, b.z, v3(0.0, 0.0, -1.0), &ceil_holes)].into_iter().filter(|_| !free) {
         let mut rects = vec![(a.x, b.x, a.y, b.y)];
         for h in holes.iter() {
             let mut next = Vec::new();
@@ -88,7 +91,10 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
     // escalier sous chaque trémie du plafond : le long du grand côté de la trémie, la dernière marche à son bord
     // le plus loin, marches de STAIR_RISE au plus et STAIR_RUN de profondeur (raccourcies si la pièce est trop
     // petite)
-    for &(x0, x1, y0, y1) in &ceil_holes {
+    // pas pour un bâtiment de l'atelier : il a son propre escalier (avec sa rampe) ; celui-ci montait parfois dans
+    // l'autre sens et bloquait le personnage (retour de la personne, 13 nov. 2026)
+    let own_stairs = !m.name.to_lowercase().starts_with("dw_bat_");
+    for &(x0, x1, y0, y1) in ceil_holes.iter().filter(|_| own_stairs) {
         let along_x = x1 - x0 >= y1 - y0;
         let rise_total = b.z - a.z + STAIR_CEIL_GAP;
         let n = (rise_total / STAIR_RISE).ceil().max(2.0) as usize;
@@ -112,18 +118,20 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
     }
     // murs : (axe fixe 0 = x / 1 = y, valeur, début et fin le long du mur, normale vers l'intérieur)
     let walls = [(0usize, a.x, a.y, b.y, v3(1.0, 0.0, 0.0)), (0, b.x, a.y, b.y, v3(-1.0, 0.0, 0.0)), (1, a.y, a.x, b.x, v3(0.0, 1.0, 0.0)), (1, b.y, a.x, b.x, v3(0.0, -1.0, 0.0))];
-    for (axis, val, s0, s1, n) in walls {
+    for (axis, val, s0, s1, n) in walls.into_iter().filter(|_| !free) {
         let fixed = |p: V3| if axis == 0 { p.x } else { p.y };
         let along = |p: V3| if axis == 0 { p.y } else { p.x };
-        // ouvertures : portails de cette pièce posés sur ce mur
-        let mut holes: Vec<(f32, f32, f32, f32)> = m
+        // ouvertures : portails de cette pièce posés sur ce mur (d'un portail réuni, seulement ses ouvertures
+        // d'origine)
+        let holes: Vec<(f32, f32, f32, f32)> = m
             .portals
             .iter()
             .filter(|p| p.room_from as usize == ri || p.room_to as usize == ri)
-            .filter(|p| p.corners.iter().all(|c| (fixed(*c) - val).abs() < ON_WALL))
-            .map(|p| {
+            .flat_map(|p| p.holes())
+            .filter(|h| h.iter().all(|c| (fixed(*c) - val).abs() < ON_WALL))
+            .map(|h| {
                 let (mut lo, mut hi, mut zl, mut zh) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-                for c in p.corners {
+                for c in h {
                     lo = lo.min(along(c));
                     hi = hi.max(along(c));
                     zl = zl.min(c.z);
@@ -131,26 +139,61 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
                 }
                 (lo.max(s0), hi.min(s1), zl.max(a.z), zh.min(b.z))
             })
-            .filter(|h| h.1 - h.0 > 0.05)
+            .filter(|h| h.1 - h.0 > 0.05 && h.3 > h.2)
             .collect();
-        holes.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
         let pt = |s: f32, z: f32| if axis == 0 { v3(val, s, z) } else { v3(s, val, z) };
-        let mut rect = |s0: f32, s1: f32, z0: f32, z1: f32| {
-            if s1 - s0 > 0.01 && z1 - z0 > 0.01 {
-                out.push((1, [pt(s0, z0), pt(s1, z0), pt(s1, z1), pt(s0, z1)], n));
-            }
-        };
-        let mut cur = s0;
-        for (lo, hi, zl, zh) in holes {
-            if lo > cur {
-                rect(cur, lo, a.z, b.z);
-            }
-            let (l, h) = (lo.max(cur), hi);
-            rect(l, h, zh, b.z);
-            rect(l, h, a.z, zl);
-            cur = cur.max(hi);
+        for (s0, s1, z0, z1) in wall_pieces(s0, s1, a.z, b.z, &holes) {
+            out.push((1, [pt(s0, z0), pt(s1, z0), pt(s1, z1), pt(s0, z1)], n));
         }
-        rect(cur, s1, a.z, b.z);
+    }
+    out
+}
+
+/// Morceaux pleins d'un mur (début, fin le long du mur, bas, haut) une fois percé des ouvertures `holes` (même
+/// forme), qui peuvent se chevaucher : le mur est coupé à chaque bord d'ouverture ; sur chaque tranche, les hauteurs
+/// des ouvertures qui la couvrent sont réunies et le reste de la hauteur est plein (tranches voisines identiques
+/// réunies).
+pub fn wall_pieces(s0: f32, s1: f32, z0: f32, z1: f32, holes: &[(f32, f32, f32, f32)]) -> Vec<(f32, f32, f32, f32)> {
+    let mut cuts: Vec<f32> = vec![s0, s1];
+    for h in holes {
+        cuts.push(h.0.clamp(s0, s1));
+        cuts.push(h.1.clamp(s0, s1));
+    }
+    cuts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|x, y| (*x - *y).abs() < 1e-4);
+    // (début, fin, morceaux pleins en hauteur)
+    let mut slices: Vec<(f32, f32, Vec<(f32, f32)>)> = Vec::new();
+    for w in cuts.windows(2) {
+        let (l, r) = (w[0], w[1]);
+        if r - l < 1e-4 {
+            continue;
+        }
+        let mid = (l + r) * 0.5;
+        let mut spans: Vec<(f32, f32)> = holes.iter().filter(|h| h.0 <= mid && h.1 >= mid).map(|h| (h.2.max(z0), h.3.min(z1))).filter(|s| s.1 > s.0).collect();
+        spans.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut solid = Vec::new();
+        let mut cur = z0;
+        for (a, b) in spans {
+            if a > cur {
+                solid.push((cur, a));
+            }
+            cur = cur.max(b);
+        }
+        if z1 > cur {
+            solid.push((cur, z1));
+        }
+        match slices.last_mut() {
+            Some(last) if (last.1 - l).abs() < 1e-4 && last.2 == solid => last.1 = r,
+            _ => slices.push((l, r, solid)),
+        }
+    }
+    let mut out = Vec::new();
+    for (l, r, solid) in slices {
+        for (a, b) in solid {
+            if r - l > 0.01 && b - a > 0.01 {
+                out.push((l, r, a, b));
+            }
+        }
     }
     out
 }
@@ -231,17 +274,27 @@ impl DwApp {
     /// Intérieurs créés ou modifiés dans DragoWalker (pas ceux du jeu, ni ceux recopiés d'une ressource MLO).
     pub fn created_mlos(&self) -> Vec<(usize, usize)> {
         let external = self.mlo_external_ytyps();
-        let w = self.game.world.as_deref();
         let mut out = Vec::new();
         for (ti, t) in self.proj.ytyps.iter().enumerate().filter(|(_, t)| !external.contains(&t.name.to_lowercase())) {
             for (mi, m) in t.mlos.iter().enumerate() {
-                let game = w.and_then(|w| w.archetypes.get(&crate::gta::crypto::joaat(&m.name.to_lowercase()))).map(|a| a.mlo).unwrap_or(false);
-                if !game {
+                if !self.mlo_is_game(m) {
                     out.push((ti, mi));
                 }
             }
         }
         out
+    }
+
+    /// Vrai si l'intérieur est un intérieur du jeu (relu en XML) : il garde sa collision et sa coque du jeu. Jeu
+    /// chargé : il est dans les types du jeu. Sinon on ne peut pas le savoir — **estimé** : un intérieur créé dans
+    /// DragoWalker est vide à sa création, a reçu ses objets « coque » (dw_shell_…) dès que le jeu était chargé ou au
+    /// premier export, ou porte un nom de DragoWalker (dw_…) ; un intérieur du jeu relu a toujours ses objets et
+    /// jamais de coque.
+    pub fn mlo_is_game(&self, m: &MloArchetype) -> bool {
+        match self.game.world.as_deref() {
+            Some(w) => w.archetypes.get(&crate::gta::crypto::joaat(&m.name.to_lowercase())).map(|a| a.mlo).unwrap_or(false),
+            None => !(m.entities.is_empty() || m.name.to_lowercase().starts_with("dw_") || m.entities.iter().any(|e| e.archetype.starts_with(SHELL_PREFIX))),
+        }
     }
 
     /// Chaque pièce d'un intérieur créé a son objet « coque » (et rien pour les pièces disparues).
@@ -250,8 +303,14 @@ impl DwApp {
             let m = &mut self.proj.ytyps[ti].mlos[mi];
             let name = m.name.clone();
             let nr = m.rooms.len();
-            m.entities.retain(|e| !e.archetype.starts_with(SHELL_PREFIX) || (e.room > 0 && e.room < nr && e.archetype == shell_name(&name, e.room)));
+            // pas d'objet pour une pièce sans coque en boîte (pièce de forme libre sans escalier : sa coque modelable
+            // la remplace)
+            let has: Vec<bool> = (0..nr).map(|ri| ri > 0 && !room_quads(m, ri).is_empty()).collect();
+            m.entities.retain(|e| !e.archetype.starts_with(SHELL_PREFIX) || (e.room > 0 && e.room < nr && has[e.room] && e.archetype == shell_name(&name, e.room)));
             for ri in 1..nr {
+                if !has[ri] {
+                    continue;
+                }
                 let sn = shell_name(&name, ri);
                 if !m.entities.iter().any(|e| e.archetype == sn) {
                     let mut e = Entity::new(&sn, V3::ZERO);
@@ -294,12 +353,19 @@ impl DwApp {
                 }
             }
         }
+        serde_json::to_string(&self.proj.designs).unwrap_or_default().hash(&mut h);
+        for c in &self.proj.custom_textures {
+            (c.name.as_str(), c.size.to_bits(), c.png.len()).hash(&mut h);
+        }
         let sig = h.finish();
         if sig == self.shell_sig {
             return;
         }
         self.shell_sig = sig;
+        crate::design::set_custom_textures(&self.proj.custom_textures);
         self.ensure_shell_entities();
+        self.design_ensure_entities();
+        let designs = self.design_models();
         let texs = shell_textures();
         let mut boxes = std::collections::HashMap::new();
         if let Ok(mut g) = gpu.lock() {
@@ -311,6 +377,12 @@ impl DwApp {
                     boxes.insert(sn.clone(), bx);
                     g.add_custom(crate::gta::loader::Loaded { arch: crate::gta::crypto::joaat(&sn), model: Some(model), part_keys: SHELL_KEYS.to_vec(), layer_keys: Vec::new(), textures: texs.clone() });
                 }
+            }
+            // coques modelables (design.rs)
+            for ((ti, mi), _, name, mm) in &designs {
+                let (model, keys, dt, bx) = self.design_rmodel(*ti, *mi, mm);
+                boxes.insert(name.clone(), bx);
+                g.add_custom(crate::gta::loader::Loaded { arch: crate::gta::crypto::joaat(name), model: Some(model), part_keys: keys, layer_keys: Vec::new(), textures: dt });
             }
         }
         crate::catalog::set_shell_boxes(boxes);
@@ -346,7 +418,8 @@ impl DwApp {
                     let h = crate::gta::crypto::joaat(&e.archetype);
                     *lit_cache.entry(h).or_insert_with(|| src.as_ref().map(|s| !s.lights(h).is_empty()).unwrap_or(false))
                 });
-                let lights = if lit { Vec::new() } else { crate::lights::room_lights(r.bb_min, r.bb_max) };
+                let placed: Vec<crate::lights::Light> = self.proj.designs.iter().find(|d| d.mlo.eq_ignore_ascii_case(&m.name)).map(|d| crate::design::room_design_lights(d, m, ri)).unwrap_or_default();
+                let lights = if !placed.is_empty() { placed } else if lit { Vec::new() } else { crate::lights::room_lights(r.bb_min, r.bb_max) };
                 if lit {
                     lit_rooms += 1;
                 }
@@ -361,13 +434,85 @@ impl DwApp {
                 n += 1;
             }
         }
+        crate::design::set_custom_textures(&self.proj.custom_textures);
+        // coques modelables (design.rs) : un modèle par pièce, textures dans « dw_design_txd », lumières au plafond
+        // si la pièce n'a pas d'objet éclairant
+        let mut dtex: Vec<(u64, TexData)> = Vec::new();
+        let mut nd = 0;
+        for f in std::fs::read_dir(stream).into_iter().flatten().flatten() {
+            let n = f.file_name().to_string_lossy().to_lowercase();
+            if n.starts_with(crate::design::DESIGN_PREFIX) && n.ends_with(".xml") && f.path().is_file() {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut nmir = 0;
+        for ((ti, mi), ri, name, mm) in self.design_models() {
+            let (model, keys, t, (mn, mx)) = self.design_rmodel(ti, mi, &mm);
+            let Ok(path) = crate::sollumz::write_ydr_xml_ex(stream, &name, &model, &keys, &t, Some(crate::design::DESIGN_TXD)) else { continue };
+            if crate::design::mirror_shader(&path).unwrap_or(false) {
+                nmir += 1;
+            }
+            for x in t {
+                if !dtex.iter().any(|y| y.0 == x.0) {
+                    dtex.push(x);
+                }
+            }
+            let m = &self.proj.ytyps[ti].mlos[mi];
+            // lumières posées dans cette pièce (pièce libre ou pas) : dans son modèle de coque modelable
+            let placed: Vec<crate::lights::Light> = self.proj.designs.iter().find(|d| d.mlo.eq_ignore_ascii_case(&m.name)).map(|d| crate::design::room_design_lights(d, m, ri)).unwrap_or_default();
+            let box_shell = m.rooms.get(ri).map(|r| !r.free).unwrap_or(false);
+            if !placed.is_empty() && !box_shell {
+                if crate::lights::add_lights_to_ydr_xml(&path, &placed).is_ok() {
+                    nl += placed.len();
+                }
+            } else if let Some(r) = m.rooms.get(ri).filter(|r| r.free) {
+                let lit = m.entities.iter().filter(|e| e.room == ri).any(|e| {
+                    let h = crate::gta::crypto::joaat(&e.archetype);
+                    *lit_cache.entry(h).or_insert_with(|| src.as_ref().map(|s| !s.lights(h).is_empty()).unwrap_or(false))
+                });
+                if !lit {
+                    let lights = crate::lights::room_lights(r.bb_min, r.bb_max);
+                    if crate::lights::add_lights_to_ydr_xml(&path, &lights).is_ok() {
+                        nl += lights.len();
+                    }
+                }
+            }
+            let (c, r) = ((mn + mx) * 0.5, (mx - mn).len() * 0.5);
+            archs.push(format!(
+                "  <Item type=\"CBaseArchetypeDef\">
+   <lodDist value=\"{SHELL_ARCH_LOD}\" />
+   <flags value=\"0\" />
+   <specialAttribute value=\"0\" />
+   <bbMin x=\"{}\" y=\"{}\" z=\"{}\" />
+   <bbMax x=\"{}\" y=\"{}\" z=\"{}\" />
+   <bsCentre x=\"{}\" y=\"{}\" z=\"{}\" />
+   <bsRadius value=\"{r}\" />
+   <hdTextureDist value=\"15\" />
+   <name>{name}</name>
+   <textureDictionary>{}</textureDictionary>
+   <clipDictionary />
+   <drawableDictionary />
+   <physicsDictionary />
+   <assetType>ASSET_TYPE_DRAWABLE</assetType>
+   <assetName>{name}</assetName>
+   <extensions />
+  </Item>",
+                mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, c.x, c.y, c.z, crate::design::DESIGN_TXD
+            ));
+            nd += 1;
+        }
+        if !dtex.is_empty() {
+            let _ = crate::sollumz::write_ytd_xml(stream, crate::design::DESIGN_TXD, &dtex);
+        }
         if archs.is_empty() {
             return (Vec::new(), String::new());
         }
         let _ = crate::sollumz::write_ytd_xml(stream, SHELL_TXD, &texs);
         let ytyp = crate::model::Ytyp { name: "dw_shell_types".into(), mlos: Vec::new(), visible: true, raw_archetypes: archs };
         let _ = std::fs::write(stream.join("dw_shell_types.ytyp.xml"), crate::xmlio::write_ytyp(&ytyp));
-        (vec![format!("Coques des intérieurs : {n} pièce(s) avec sol, murs (ouverts aux passages) et plafond ; collision complète avec le numéro de chaque pièce ; {nl} spot(s) au plafond ajouté(s) ; {lit_rooms} pièce(s) déjà éclairée(s) par les lumières de leurs objets du jeu.")], "data_file 'DLC_ITYP_REQUEST' 'stream/dw_shell_types.ytyp'\n".into())
+        let n = n + 0 * nd;
+        let design_txt = if nd > 0 { format!(" Coques modelables : {nd} modèle(s) (murs, sols, plafonds, blocs, ombre cuite dans les sommets){}.", if nmir > 0 { format!(", miroirs dans {nmir} modèle(s)") } else { String::new() }) } else { String::new() };
+        (vec![design_txt + &format!("Coques des intérieurs : {n} pièce(s) avec sol, murs (ouverts aux passages) et plafond ; collision complète avec le numéro de chaque pièce ; {nl} spot(s) au plafond ajouté(s) ; {lit_rooms} pièce(s) déjà éclairée(s) par les lumières de leurs objets du jeu.")], "data_file 'DLC_ITYP_REQUEST' 'stream/dw_shell_types.ytyp'\n".into())
     }
 }
 
@@ -391,5 +536,22 @@ mod stair_tests {
         // le plafond du bas est percé (plusieurs morceaux), le sol du haut aussi
         assert!(low.iter().filter(|q| q.0 == 2).count() >= 3);
         assert!(room_quads(&m, 2).iter().filter(|q| q.0 == 0).count() >= 3);
+    }
+
+    #[test]
+    fn ouvertures_qui_se_chevauchent() {
+        // porte (1 à 2 m, du sol à 2 m) et fenêtre haute qui la chevauche (1,5 à 3 m, de 1 à 2,5 m), mur de 5 × 3 m
+        let holes = [(1.0, 2.0, 0.0, 2.0), (1.5, 3.0, 1.0, 2.5)];
+        let pieces = wall_pieces(0.0, 5.0, 0.0, 3.0, &holes);
+        let area: f32 = pieces.iter().map(|p| (p.1 - p.0) * (p.3 - p.2)).sum();
+        // surface pleine = 15 − (porte 2 + fenêtre 2,25 − chevauchement 0,5)
+        assert!((area - (15.0 - 3.75)).abs() < 1e-4, "{area} {pieces:?}");
+        // aucun morceau plein dans une ouverture
+        for p in &pieces {
+            for h in &holes {
+                let (u0, u1, z0, z1) = (p.0.max(h.0), p.1.min(h.1), p.2.max(h.2), p.3.min(h.3));
+                assert!(u1 - u0 < 1e-4 || z1 - z0 < 1e-4, "{p:?} dans {h:?}");
+            }
+        }
     }
 }

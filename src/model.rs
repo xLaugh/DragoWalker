@@ -251,6 +251,9 @@ pub struct Room {
     pub flags: u32,
     pub floor_id: u32,
     pub ext_vis_depth: i32,
+    /// pièce de forme libre (design.rs) : sol, plafond et murs viennent de la coque modelable, pas de sa boîte
+    #[serde(default)]
+    pub free: bool,
 }
 
 impl Room {
@@ -265,6 +268,7 @@ impl Room {
             flags: mech::ROOM_FLAGS,
             floor_id: 0,
             ext_vis_depth: mech::ROOM_EXT_VIS_DEPTH,
+            free: false,
         }
     }
 }
@@ -278,18 +282,57 @@ pub struct Portal {
     pub opacity: u32,
     pub audio_occlusion: u32,
     pub corners: [V3; 4],
+    /// portail réuni (« Réduire les portails », meubler.rs) : les ouvertures d'origine, seules percées dans la coque
+    /// et la collision (le rectangle réuni n'est qu'une zone de visibilité) ; vide = l'ouverture est `corners`.
+    /// Gardé dans le projet seulement (pas écrit dans le XML du jeu).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openings: Vec<[V3; 4]>,
 }
 
 impl Portal {
     pub fn new(from: u32, to: u32, corners: [V3; 4]) -> Portal {
-        Portal { room_from: from, room_to: to, flags: 0, mirror_priority: 0, opacity: 0, audio_occlusion: 0, corners }
+        Portal { room_from: from, room_to: to, flags: 0, mirror_priority: 0, opacity: 0, audio_occlusion: 0, corners, openings: Vec::new() }
     }
+
+    /// Ouvertures réelles du portail (murs percés) : celles d'origine d'un portail réuni, sinon ses coins.
+    pub fn holes(&self) -> Vec<[V3; 4]> {
+        if self.openings.is_empty() {
+            vec![self.corners]
+        } else {
+            self.openings.clone()
+        }
+    }
+}
+
+/// Modèle d'une vraie porte : un mot « door » dans le nom (« …_door », « door_… », « …_frontdoor », « door1 »…),
+/// sans compter « outdoor » / « indoor », et pas une porte de meuble (armoire, placard, frigo, four, casier…) —
+/// **estimé** d'après les noms des portes du jeu (v_ilev_fh_door, prop_com_ls_door_01, v_ilev_fib_door1).
+pub fn is_door_model(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // portes proposées par DragoWalker (plan, atelier)
+    if crate::atelier::DOOR_MODELS.iter().any(|d| d.0 == n) {
+        return true;
+    }
+    if crate::meubler::FURN_DOOR_EXCLUDE.iter().any(|x| n.contains(x)) {
+        return false;
+    }
+    n.split(|c: char| c == '_' || c == '-' || c == ' ').any(|t| {
+        let t = t.trim_end_matches(|c: char| c.is_ascii_digit());
+        if t == "outdoor" || t == "indoor" || t.is_empty() {
+            return false;
+        }
+        // « door », « doors », « doorl » / « doorr » (battants), « frontdoor », « frntdoor »…
+        t.ends_with("door") || (t.starts_with("door") && t.len() <= 6)
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntitySet {
     pub name: String,
     pub entities: Vec<Entity>,
+    /// activé par le script client de l'export (dw_entity_sets.lua) dès que l'intérieur est chargé
+    #[serde(default)]
+    pub default_on: bool,
 }
 
 /// Un intérieur (CMloArchetypeDef).
@@ -332,10 +375,11 @@ impl MloArchetype {
     /// Portail dans lequel est posée une porte de l'intérieur : comme dans les intérieurs du jeu et des ressources
     /// FiveM (ma_diner, burgershot relus avec CodeWalker), une porte est rattachée au passage qu'elle ferme
     /// (attachedObjects du portail) et à aucune pièce — rattachée à une pièce, elle n'apparaissait pas en jeu
-    /// (retour de la personne, 13 nov. 2026). Critère : modèle « door », origine à moins de 0,8 m du cadre du portail.
+    /// (retour de la personne, 13 nov. 2026). Critère : vraie porte (is_door_model : pas un meuble à porte, pas
+    /// « outdoor »), origine à moins de 0,8 m du cadre du portail.
     pub fn door_portal(&self, ei: usize) -> Option<usize> {
         let e = self.entities.get(ei)?;
-        if !e.archetype.to_lowercase().contains("door") {
+        if !is_door_model(&e.archetype) {
             return None;
         }
         let mut best: Option<(f32, usize)> = None;
@@ -406,6 +450,15 @@ pub struct Project {
     /// bâtiments de l'atelier (atelier.rs) : modèles « dw_bat_N »
     #[serde(default)]
     pub houses: Vec<crate::atelier::House>,
+    /// coques modelables des intérieurs (design.rs) : murs, pièces de forme libre, blocs maçonnés
+    #[serde(default)]
+    pub designs: Vec<crate::design::Design>,
+    /// textures importées par la personne (images PNG), pour les coques modelables
+    #[serde(default)]
+    pub custom_textures: Vec<crate::design::CustomTex>,
+    /// ambiances du projet (timecycle modifiers personnalisés, ambiance.rs) : écrites dans dw_timecycmod.xml
+    #[serde(default)]
+    pub ambiances: Vec<crate::ambiance::ProjAmbiance>,
 }
 
 impl Project {
@@ -710,5 +763,20 @@ pub fn room_at(mlo: &MloArchetype, local: V3) -> usize {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::is_door_model;
+
+    #[test]
+    fn vraies_portes() {
+        for n in ["prop_magenta_door", "v_ilev_ra_door4l", "v_ilev_fib_door1", "prop_com_ls_door_01", "v_ilev_fh_frontdoor", "v_ilev_mm_doorm_l", "prop_damdoor_01"] {
+            assert!(is_door_model(n), "{n}");
+        }
+        for n in ["prop_wardrobe_door_01", "prop_fridge_door", "v_res_cabinet_door", "prop_outdoor_fan_01", "prop_indoor_plant", "prop_doorframe_01", "prop_table_03"] {
+            assert!(!is_door_model(n), "{n}");
+        }
     }
 }

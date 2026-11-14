@@ -33,7 +33,8 @@ pub const GROUP_GROUND_PROBE_UP: f32 = 50.0;
 /// Pendant la pose : hauteur cherchée au-dessus et au-dessous du relief du jeu pour trouver la vraie surface de la
 /// rue (m) — **estimé** (assez pour un trottoir ou une rue au-dessus du relief grossier, pas pour un toit).
 pub const GROUP_STREET_PROBE: f32 = 3.0;
-/// Nombre maximal de cadres verts dessinés pendant la pose — **estimé** (au-delà, seuls les modèles).
+/// Nombre maximal de cadres verts dessinés pendant la pose (modèles pas encore chargés) — **estimé** (au-delà,
+/// seuls les modèles).
 pub const GROUP_MAX_GHOST_BOXES: usize = 400;
 
 /// Un objet du groupe, dans le repère du groupe (origine = point d'ancrage au sol, orientation 0).
@@ -236,8 +237,8 @@ impl DwApp {
         true
     }
 
-    /// Le groupe en cours, là où il serait posé : (type, position, orientation, échelles) pour la vue.
-    pub fn group_ghost(&self) -> Vec<(u32, V3, Quat, f32, f32)> {
+    /// Le groupe en cours, là où il serait posé : (nom du type, position, orientation, échelles) pour l'aperçu.
+    pub fn group_ghost(&self) -> Vec<(String, V3, Quat, f32, f32)> {
         let (Some(gp), Some(at)) = (self.group_place.as_ref(), self.mouse_ground) else { return Vec::new() };
         let Some(g) = self.proj.groups.get(gp.gi) else { return Vec::new() };
         let yaw = gp.yaw_deg.to_radians();
@@ -245,25 +246,15 @@ impl DwApp {
             .iter()
             .map(|it| {
                 let (p, q) = item_world(it, at, yaw);
-                (crate::render::arch_hash(&it.archetype), p, q, it.scale_xy, it.scale_z)
+                (it.archetype.clone(), p, q, it.scale_xy, it.scale_z)
             })
             .collect()
     }
 
-    /// Cadres verts du groupe en cours et point d'ancrage.
+    /// Point d'ancrage et nom du groupe en cours (ses modèles et cadres : aperçu de la pose, view.rs).
     pub fn draw_group_ghost(&self, painter: &egui::Painter) {
         let (Some(gp), Some(at)) = (self.group_place.as_ref(), self.mouse_ground) else { return };
         let Some(g) = self.proj.groups.get(gp.gi) else { return };
-        let yaw = gp.yaw_deg.to_radians();
-        for it in g.items.iter().take(GROUP_MAX_GHOST_BOXES) {
-            let (p, q) = item_world(it, at, yaw);
-            let mut e = Entity::new(&it.archetype, p);
-            e.id = 0;
-            e.rot = q;
-            e.scale_xy = it.scale_xy;
-            e.scale_z = it.scale_z;
-            crate::render::draw_ghost(painter, &self.cam, &self.proj, &e);
-        }
         if let Some((sp, _)) = self.cam.project(at) {
             let col = Color32::from_rgb(120, 255, 140);
             painter.circle_stroke(sp, 8.0, egui::Stroke::new(2.0_f32, col));

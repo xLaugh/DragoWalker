@@ -405,8 +405,9 @@ impl DwApp {
             ui.label(RichText::new("Voitures de PNJ qui roulent").strong());
             let models_ok: Vec<&str> = CAR_MODELS.iter().copied().filter(|m| !m.is_empty() && self.life_models_ok(m)).collect();
             let peds_ok: Vec<&str> = PED_MODELS.iter().copied().filter(|m| self.life_models_ok(m)).collect();
-            if let Some(t) = self.proj.terrain.as_mut() {
-                let c = &mut t.npc_traffic;
+            if let Some(before) = self.proj.terrain.as_ref().map(|t| t.npc_traffic.clone()) {
+                let mut cfg = before.clone();
+                let c = &mut cfg;
                 ui.checkbox(&mut c.enabled, "Activer (script de la ressource)");
                 ui.add_enabled_ui(c.enabled, |ui| {
                     ui.add(egui::Slider::new(&mut c.count, 1..=40).text("voitures en même temps"));
@@ -447,6 +448,13 @@ impl DwApp {
                         ui.label(RichText::new("Choisis au moins une voiture et un conducteur.").color(Color32::from_rgb(255, 160, 80)));
                     }
                 });
+                // modification annulable et projet marqué modifié (un seul pas par glisser de curseur)
+                if cfg != before {
+                    self.undo_once(ui.ctx());
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        t.npc_traffic = cfg;
+                    }
+                }
             }
             ui.label(RichText::new("Les voitures apparaissent sur tes routes autour du joueur (pas à moins de 60 m), roulent au hasard sur le réseau, et disparaissent quand on s'éloigne. Réglages par route (densité, vitesse, gros véhicules) : créateur de terrain, partie Routes.").small().weak());
         }

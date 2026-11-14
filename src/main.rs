@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod ambiance;
 mod analyse;
 mod app;
 mod atelier;
@@ -17,6 +18,7 @@ mod edit_ops;
 mod export;
 mod files;
 mod frame;
+mod frame_tests;
 mod i18n;
 mod game_ui;
 mod gizmo;
@@ -29,16 +31,21 @@ mod bedit;
 mod grass;
 mod check;
 mod shell;
+mod studio;
 mod lights;
 mod groups;
 mod occlusion;
 mod openings;
+mod meshedit;
 mod plan;
+mod design;
 mod intlib;
 mod library;
+mod meubler;
 mod life;
 mod lists;
 mod lods;
+mod look;
 mod roads;
 mod terrain;
 mod terrain_clip;
@@ -100,6 +107,11 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.len() >= 9 && args[1] == "--edit-ydr-xml" {
+        // dragowalker --edit-ydr-xml <entrée.ydr.xml> <sortie.ydr.xml> extrude x y z distance | move x y z dx dy dz
+        meshedit::cli_edit_xml(&args[2..]);
+        return Ok(());
+    }
     if args.len() >= 6 && args[1] == "--ground-probe" {
         let f = |i: usize| args[i].parse::<f32>().unwrap_or(0.0);
         gta::ground_probe(&args[2], f(3), f(4), f(5));
@@ -137,7 +149,8 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("DragoWalker — éditeur de cartes GTA V")
             .with_inner_size([1600.0, 900.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_min_inner_size([900.0, 560.0])
+            .with_icon(app_icon()),
         // profondeur pour les vrais modèles 3D
         depth_buffer: 24,
         ..Default::default()
@@ -147,4 +160,16 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::DwApp::new(cc, screenshot, open_files)))),
     )
+}
+
+/// Logo DW de la fenêtre et de la barre des tâches (assets/logo_256.png).
+fn app_icon() -> eframe::egui::IconData {
+    match image::load_from_memory(include_bytes!("../assets/logo_256.png")) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (width, height) = img.dimensions();
+            eframe::egui::IconData { rgba: img.into_raw(), width, height }
+        }
+        Err(_) => eframe::egui::IconData::default(),
+    }
 }

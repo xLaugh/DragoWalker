@@ -32,7 +32,7 @@ fn room_key(ihash: u32, m: &MloArchetype, r: usize) -> u32 {
     if r == 0 {
         joaat("outside")
     } else {
-        ihash ^ joaat(&m.rooms[r].name.to_lowercase())
+        ihash ^ joaat(&m.rooms.get(r).map(|x| x.name.to_lowercase()).unwrap_or_default())
     }
 }
 
@@ -42,7 +42,12 @@ pub fn occlusion_xml(m: &MloArchetype, ihash: u32) -> String {
     // rang de chaque portail parmi ceux qui touchent une pièce
     let local = |room: u32, pi: usize| m.portals.iter().take(pi).filter(|p| p.room_from == room || p.room_to == room).count();
     let mut infos: Vec<(u32, usize, u32, usize)> = Vec::new(); // (pièce, rang local, pièce d'arrivée, portail)
+    let nr = m.rooms.len() as u32;
     for (pi, p) in m.portals.iter().enumerate() {
+        // portail vers une pièce qui n'existe pas (pièce supprimée, fichier abîmé) : ignoré
+        if p.room_from >= nr || p.room_to >= nr {
+            continue;
+        }
         infos.push((p.room_to, local(p.room_to, pi), p.room_from, pi));
         infos.push((p.room_from, local(p.room_from, pi), p.room_to, pi));
     }
@@ -108,10 +113,20 @@ pub fn rel_xml(mlos: &[&MloArchetype]) -> String {
     s
 }
 
+/// Lignes du fxmanifest qui déclarent les réglages audio (retirées si leur binaire manque, export::convert_and_tidy).
+pub fn audio_manifest_lines() -> String {
+    format!("files {{ 'audio/{AUDIO_REL}' }}\ndata_file 'AUDIO_GAMEDATA' 'audio/dw_audio_game.dat'\n")
+}
+
 impl DwApp {
     /// Son des intérieurs créés dans DragoWalker : un fichier d'occlusion par placement et les réglages audio de leurs
-    /// pièces, dans stream. Rend (compte rendu, lignes du fxmanifest).
-    pub fn export_audio(&self, stream: &std::path::Path) -> (Vec<String>, String) {
+    /// pièces, dans stream ; `out` : dossier de la ressource. `convert` : CodeWalker fera le binaire des réglages (sans
+    /// lui, ils ne sont pas déclarés : le jeu ne lit pas le XML). Rend (compte rendu, lignes du fxmanifest) ; les
+    /// lignes sont retirées du fxmanifest si la conversion ne donne pas le fichier (export::convert_and_tidy).
+    pub fn export_audio(&self, stream: &std::path::Path, out: &std::path::Path, convert: bool) -> (Vec<String>, String) {
+        // le binaire est rangé dans « audio » du dossier de la ressource, hors de stream, après la conversion
+        // (export.rs)
+        let _ = std::fs::remove_file(out.join("audio").join(AUDIO_REL));
         for f in std::fs::read_dir(stream).into_iter().flatten().flatten() {
             let n = f.file_name().to_string_lossy().to_lowercase();
             let numeric_ymt = n.strip_suffix(".ymt.xml").map(|b| b.chars().all(|c| c.is_ascii_digit())).unwrap_or(false);
@@ -143,9 +158,12 @@ impl DwApp {
             return (vec!["Son des intérieurs : écriture impossible.".into()], String::new());
         }
         let rooms: usize = mlos.iter().map(|m| m.rooms.len()).sum();
+        if !convert {
+            return (vec![format!("Son des intérieurs : {n} fichier(s) d'occlusion et réglages audio de {rooms} pièce(s) laissés en XML (CodeWalker introuvable) ; les réglages ne sont pas déclarés dans le fxmanifest (le jeu ne lit que le binaire).")], String::new());
+        }
         (
             vec![format!("Son des intérieurs : {n} fichier(s) d'occlusion (un par placement) et réglages audio de {rooms} pièce(s) ({AUDIO_REL}) — à vérifier en jeu : la rue ne doit plus s'entendre à l'intérieur.")],
-            format!("files {{ 'stream/{AUDIO_REL}' }}\ndata_file 'AUDIO_GAMEDATA' 'stream/dw_audio_game.dat'\n"),
+            audio_manifest_lines(),
         )
     }
 }

@@ -11,6 +11,10 @@ const ENC_NONE: u32 = 0;
 const ENC_OPEN: u32 = 0x4E45_504F; // 1313165391
 const ENC_AES: u32 = 0x0FFF_FFF9; // 268435449
 const DIR_MARKER: u32 = 0x7FFF_FF00; // 2147483392
+/// bornes contre un en-tête abîmé ou piégé : nombre d'entrées, taille de la table des noms, archives imbriquées
+const MAX_ENTRIES: usize = 1 << 22;
+const MAX_NAMES: usize = 64 << 20;
+const MAX_DEPTH: u32 = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
@@ -105,10 +109,16 @@ impl Vfs {
         self.disk_paths.push(path.to_path_buf());
         let disk = self.disks.len() - 1;
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        self.open_archive(disk, 0, &name, size as u32, &logical.to_lowercase(), keys);
+        self.open_archive(disk, 0, &name, size, &logical.to_lowercase(), keys, 0);
     }
 
-    fn open_archive(&mut self, disk: usize, start: u64, name: &str, size: u32, logical: &str, keys: &Keys) {
+    /// `size` : taille de l'archive (0 = inconnue) ; `depth` : niveau d'imbrication (archive dans une archive).
+    #[allow(clippy::too_many_arguments)]
+    fn open_archive(&mut self, disk: usize, start: u64, name: &str, size: u64, logical: &str, keys: &Keys, depth: u32) {
+        if depth > MAX_DEPTH {
+            self.errors.push(format!("{logical} : trop d'archives imbriquées"));
+            return;
+        }
         let Some(h) = self.read_at(disk, start, 16) else {
             self.errors.push(format!("{logical} : en-tête illisible"));
             return;
@@ -120,6 +130,12 @@ impl Vfs {
         let count = u32le(&h, 4) as usize;
         let names_len = u32le(&h, 8) as usize;
         let enc = u32le(&h, 12);
+        // en-tête non vérifié : pas d'allocation démesurée, tables dans l'archive
+        let tables = 16 + count as u64 * 16 + names_len as u64;
+        if count > MAX_ENTRIES || names_len > MAX_NAMES || (size > 0 && tables > size) {
+            self.errors.push(format!("{logical} : en-tête invalide ({count} entrées, {names_len} octets de noms)"));
+            return;
+        }
         let Some(mut entries) = self.read_at(disk, start + 16, count * 16) else { return };
         let Some(mut names) = self.read_at(disk, start + 16 + count as u64 * 16, names_len) else { return };
         let aes = enc == ENC_AES;
@@ -130,8 +146,8 @@ impl Vfs {
                 keys.decrypt_aes(&mut names);
             }
             _ => {
-                keys.decrypt_ng(&mut entries, name, size);
-                keys.decrypt_ng(&mut names, name, size);
+                keys.decrypt_ng(&mut entries, name, size as u32);
+                keys.decrypt_ng(&mut names, name, size as u32);
             }
         }
         let arch_idx = self.archives.len() as u32;
@@ -151,12 +167,19 @@ impl Vfs {
             return;
         }
         let mut stack: Vec<(usize, std::sync::Arc<str>)> = vec![(0, std::sync::Arc::from(logical))];
-        let mut nested: Vec<(u64, String, u32, String)> = Vec::new();
+        let mut nested: Vec<(u64, String, u64, String)> = Vec::new();
+        // chaque entrée n'est lue qu'une fois : un dossier qui se contient lui-même (ou un parent) ne fait pas
+        // tourner la lecture en rond
+        let mut seen = vec![false; count];
+        seen[0] = true;
         while let Some((di, dpath)) = stack.pop() {
             let e = &entries[di * 16..di * 16 + 16];
             let first = u32le(e, 8) as usize;
             let n = u32le(e, 12) as usize;
-            for i in first..(first + n).min(count) {
+            for i in first.min(count)..first.saturating_add(n).min(count) {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
                 let e = &entries[i * 16..i * 16 + 16];
                 let h2 = u32le(e, 4);
                 if h2 == DIR_MARKER {
@@ -172,9 +195,12 @@ impl Vfs {
                     let usize_ = u32le(e, 8);
                     let encrypted = u32le(e, 12) == 1;
                     let nm = read_name(name_off);
-                    if nm.ends_with(".rpf") {
-                        let inner_size = if fsize > 0 { fsize } else { usize_ };
-                        nested.push((start + offset as u64 * 512, nm.clone(), inner_size, format!("{dpath}\\{nm}")));
+                    let inner_size = if fsize > 0 { fsize } else { usize_ } as u64;
+                    let pos = start + offset as u64 * 512;
+                    // archive imbriquée : forcément après l'en-tête de celle-ci et dedans (sinon elle pourrait se
+                    // rouvrir elle-même)
+                    if nm.ends_with(".rpf") && pos > start && (size == 0 || pos - start + inner_size <= size) {
+                        nested.push((pos, nm.clone(), inner_size, format!("{dpath}\\{nm}")));
                     }
                     self.files.push(FileEntry { archive: arch_idx, name: nm, dir: dpath.clone(), offset, kind: Kind::Binary { size: fsize, usize: usize_, encrypted } });
                 } else {
@@ -194,7 +220,7 @@ impl Vfs {
             }
         }
         for (pos, nm, sz, path) in nested {
-            self.open_archive(disk, pos, &nm, sz, &path, keys);
+            self.open_archive(disk, pos, &nm, sz, &path, keys, depth + 1);
         }
     }
 
@@ -304,5 +330,78 @@ impl Resource {
     }
     pub fn v3(&self, p: usize) -> [f32; 3] {
         [self.f32(p), self.f32(p + 4), self.f32(p + 8)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> Keys {
+        Keys { aes: [0; 32], ng_keys: Vec::new(), ng_tables: Vec::new(), lut: [0; 256] }
+    }
+
+    fn dir(name_off: u32, first: u32, n: u32) -> Vec<u8> {
+        [name_off, DIR_MARKER, first, n].iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn file(name_off: u16, size: u32, offset: u32) -> Vec<u8> {
+        let raw = name_off as u64 | (size as u64 & 0xFF_FFFF) << 16 | (offset as u64 & 0xFF_FFFF) << 40;
+        let mut v = raw.to_le_bytes().to_vec();
+        v.extend_from_slice(&size.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    fn archive(entries: &[Vec<u8>], names: &[u8], count_override: Option<u32>) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&RPF7_MAGIC.to_le_bytes());
+        d.extend_from_slice(&count_override.unwrap_or(entries.len() as u32).to_le_bytes());
+        d.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        d.extend_from_slice(&ENC_OPEN.to_le_bytes());
+        for e in entries {
+            d.extend_from_slice(e);
+        }
+        d.extend_from_slice(names);
+        d.resize(4096, 0);
+        d
+    }
+
+    fn open(data: &[u8], tag: &str) -> Vfs {
+        let path = std::env::temp_dir().join(format!("dw_rpf_{tag}_{}.rpf", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        let mut v = Vfs::new();
+        v.open_disk_archive(&path, "x.rpf", &keys());
+        drop(v.disks.drain(..));
+        let _ = std::fs::remove_file(&path);
+        v
+    }
+
+    #[test]
+    fn dossiers_en_boucle_et_archive_qui_se_contient() {
+        // noms : "" (racine), "a", "f.txt", "moi.rpf"
+        let names = b"\0a\0f.txt\0moi.rpf\0";
+        let entries = vec![
+            dir(0, 1, 3),       // racine : a, f.txt, moi.rpf
+            dir(1, 0, 3),       // « a » se contient lui-même et contient la racine
+            file(3, 10, 2),     // f.txt
+            file(9, 4096, 0),   // moi.rpf : pointe sur l'archive elle-même
+        ];
+        let v = open(&archive(&entries, names, None), "boucle");
+        let n: Vec<String> = v.files.iter().map(|f| f.path()).collect();
+        assert_eq!(n.iter().filter(|p| p.ends_with("f.txt")).count(), 1, "{n:?}");
+        assert_eq!(v.archives.len(), 1, "l'archive ne se rouvre pas elle-même");
+    }
+
+    #[test]
+    fn en_tete_demesure_refuse() {
+        let entries = vec![dir(0, 1, 0)];
+        // 200 millions d'entrées annoncées dans un fichier de 4 Ko : refusé sans rien allouer
+        let v = open(&archive(&entries, b"\0", Some(200_000_000)), "enorme");
+        assert!(v.files.is_empty() && v.archives.is_empty());
+        assert!(v.errors.iter().any(|e| e.contains("en-tête invalide")), "{:?}", v.errors);
+        // plus d'entrées que la taille du fichier n'en permet
+        let v = open(&archive(&entries, b"\0", Some(1000)), "trop");
+        assert!(v.archives.is_empty());
     }
 }

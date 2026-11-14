@@ -38,6 +38,10 @@ pub struct FrameDraw {
     pub time: f32,
     /// tout ce qui dépasse cette hauteur n'est pas dessiné (coupe pour voir dans les bâtiments)
     pub clip_z: f32,
+    /// aperçu de la pose (objet ou groupe qui suit la souris) : dessiné en dernier, en semi-transparence teintée
+    pub ghosts: Vec<Inst>,
+    /// teinte (rgb) et opacité (a) de cet aperçu
+    pub ghost_tint: [f32; 4],
 }
 
 struct GpuMesh {
@@ -89,6 +93,7 @@ struct Prog {
     u_terrain: Option<glow::UniformLocation>,
     u_has_l: Option<glow::UniformLocation>,
     u_has_mask: Option<glow::UniformLocation>,
+    u_ghost: Option<glow::UniformLocation>,
     u_layers: [Option<glow::UniformLocation>; 5],
 }
 
@@ -125,6 +130,9 @@ pub struct Gpu {
     pub vram_mb: Option<usize>,
     pub budget: Option<(usize, usize)>,
 }
+
+/// Part de l'opacité de l'aperçu de pose gardée pour ses parties cachées derrière le décor — **estimé**.
+const GHOST_HIDDEN_SHARE: f32 = 0.3;
 
 /// Côté de la carte des ombres (pixels) — choix de DragoWalker.
 pub const SHADOW_SIZE: i32 = 2048;
@@ -238,11 +246,51 @@ impl Gpu {
     }
 
     /// Modèle personnel (Blender / Sollumz) : remplace celui du jeu du même nom.
-    pub fn add_custom(&mut self, l: Loaded) {
+    pub fn add_custom(&mut self, mut l: Loaded) {
+        // un envoi encore en attente du même modèle est remplacé (sinon, envoyé après, il écraserait celui-ci) ;
+        // ses textures pas encore envoyées partent avec le nouveau
+        for t in self.take_pending(l.arch) {
+            if !l.textures.iter().any(|x| x.0 == t.0) {
+                l.textures.push(t);
+            }
+        }
         self.pinned_tex.extend(l.textures.iter().map(|(k, _)| *k));
         self.custom_src.insert(l.arch, Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), layer_keys: l.layer_keys.clone(), textures: l.textures.clone() });
         self.slots.insert(l.arch, Slot::Loading);
         self.pending.push(l);
+    }
+
+    /// Modèle personnel déjà envoyé dont seule la forme change (mêmes parties, mêmes textures : bâtiment édité,
+    /// glisser d'une extrusion…) : ses textures ne sont ni recopiées ni renvoyées à la carte graphique, l'ancienne
+    /// forme reste dessinée jusqu'à l'envoi de la nouvelle. `l.textures` est ignoré s'il est vide.
+    pub fn update_custom_shape(&mut self, mut l: Loaded) {
+        let Some(old) = self.custom_src.remove(&l.arch) else {
+            self.add_custom(l);
+            return;
+        };
+        let textures = if l.textures.is_empty() { old.textures } else { std::mem::take(&mut l.textures) };
+        self.pinned_tex.extend(textures.iter().map(|(k, _)| *k));
+        // textures d'un envoi encore en attente : pas encore sur la carte graphique, elles partent avec celui-ci
+        l.textures = self.take_pending(l.arch);
+        self.custom_src.insert(l.arch, Loaded { arch: l.arch, model: l.model.clone(), part_keys: l.part_keys.clone(), layer_keys: l.layer_keys.clone(), textures });
+        if !matches!(self.slots.get(&l.arch), Some(Slot::Ready(_))) {
+            self.slots.insert(l.arch, Slot::Loading);
+        }
+        self.pending.push(l);
+    }
+
+    /// Retire les envois en attente d'un modèle ; rend leurs textures.
+    fn take_pending(&mut self, arch: u32) -> Vec<(u64, crate::gta::drawable::TexData)> {
+        let mut tex = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].arch == arch {
+                tex.append(&mut self.pending.remove(i).textures);
+            } else {
+                i += 1;
+            }
+        }
+        tex
     }
 
     pub fn busy(&self) -> bool {
@@ -254,7 +302,6 @@ impl Gpu {
         matches!(self.slots.get(&arch), Some(Slot::Ready(_)) | Some(Slot::Loading)) || self.pending.iter().any(|l| l.arch == arch)
     }
 
-    #[allow(dead_code)]
     pub fn has_model(&self, arch: u32) -> bool {
         matches!(self.slots.get(&arch), Some(Slot::Ready(_)))
     }
@@ -283,6 +330,7 @@ uniform sampler2D uL0; uniform sampler2D uL1; uniform sampler2D uL2; uniform sam
 uniform vec4 uHasL; uniform float uHasMask; uniform float uTerrain;
 uniform sampler2D uTex; uniform float uHasTex; uniform float uCutout; uniform float uBlend; uniform vec3 uColor; uniform vec3 uEye; uniform vec4 uFog; uniform float uAlpha;
 uniform mat4 uLightVP; uniform sampler2D uShadow; uniform float uShadowOn; uniform float uWater; uniform float uTime; uniform float uClipZ;
+uniform vec4 uGhost;
 out vec4 oCol;
 float shadowAt(vec3 w, vec3 n, vec3 sun) {{
   vec4 lp = uLightVP * vec4(w + n * 0.08, 1.0);
@@ -349,7 +397,13 @@ void main() {{
   float sh = uShadowOn > 0.5 ? shadowAt(vW, n, sun) : 1.0;
   float l = 0.5 + 0.62 * max(dot(n, sun), 0.0) * sh - 0.08 * (1.0 - sh);
   vec3 c = base * l;
-  oCol = vec4(mix(c, uFog.rgb, f), uBlend > 0.5 ? ta : uAlpha);
+  vec3 o = mix(c, uFog.rgb, f);
+  if (uGhost.a > 0.0) {{
+    // aperçu de la pose : le modèle texturé, teinté et à moitié transparent
+    oCol = vec4(mix(o, uGhost.rgb, 0.3), uGhost.a * (uBlend > 0.5 ? ta : 1.0));
+    return;
+  }}
+  oCol = vec4(o, uBlend > 0.5 ? ta : uAlpha);
 }}"
         );
         let p = gl.create_program()?;
@@ -398,6 +452,7 @@ void main() {{
             u_time: u("uTime"),
             u_clip: u("uClipZ"),
             u_terrain: u("uTerrain"),
+            u_ghost: u("uGhost"),
             u_has_l: u("uHasL"),
             u_has_mask: u("uHasMask"),
             u_layers: [u("uL0"), u("uL1"), u("uL2"), u("uL3"), u("uMask")],
@@ -681,6 +736,60 @@ void main() {{
         gl.uniform_1_f32(u_blend.as_ref(), 0.0);
     }
 
+    /// Aperçu de la pose (objet, groupe, prop glissé de la bibliothèque) : les vrais modèles texturés, teintés et
+    /// semi-transparents, dessinés après toute la scène. Les modèles pas encore chargés ne sont pas dessinés ici
+    /// (la vue trace leur cadre vert à la place).
+    /// - les parties cachées derrière le décor sont à peine visibles (test de profondeur inversé) ;
+    /// - puis une passe de profondeur seule garde la face la plus proche de l'aperçu, pour qu'il ne montre pas ses
+    ///   propres faces intérieures empilées ; la couleur est ensuite mélangée sans écrire la profondeur.
+    /// La profondeur du décor n'est touchée qu'après sa lecture sous la souris et après tout le décor : l'aperçu
+    /// ne cache rien et n'est jamais visé.
+    unsafe fn ghost_pass(&mut self, gl: &glow::Context, fd: &FrameDraw) {
+        let ready: Vec<Inst> = fd.ghosts.iter().filter(|i| matches!(self.slots.get(&i.arch), Some(Slot::Ready(_)))).copied().collect();
+        if ready.is_empty() {
+            return;
+        }
+        let (u_ghost, u_blend, u_shadow_on, u_clip) = {
+            let p = self.prog.as_ref().unwrap();
+            (p.u_ghost.clone(), p.u_blend.clone(), p.u_shadow_on.clone(), p.u_clip.clone())
+        };
+        let [r, g, b, a] = fd.ghost_tint;
+        gl.use_program(self.prog.as_ref().map(|p| p.p));
+        gl.uniform_1_f32(u_shadow_on.as_ref(), 0.0);
+        // l'aperçu n'est pas coupé par la coupe de la vue (au-dessus, il disparaissait sans cadre)
+        gl.uniform_1_f32(u_clip.as_ref(), 1.0e9);
+        gl.enable(glow::BLEND);
+        gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::ZERO, glow::ONE);
+        gl.depth_mask(false);
+        // parties derrière le décor : à peine visibles
+        gl.depth_func(glow::GREATER);
+        gl.uniform_4_f32(u_ghost.as_ref(), r, g, b, a * GHOST_HIDDEN_SHARE);
+        self.draw_insts(gl, &ready, false, 0);
+        // profondeur de l'aperçu seule (pas de couleur)
+        gl.depth_func(glow::LEQUAL);
+        gl.depth_mask(true);
+        gl.color_mask(false, false, false, false);
+        self.draw_insts(gl, &ready, false, 0);
+        gl.color_mask(true, true, true, true);
+        gl.depth_mask(false);
+        // couleur : la face la plus proche, devant le décor
+        gl.uniform_4_f32(u_ghost.as_ref(), r, g, b, a);
+        self.draw_insts(gl, &ready, false, 0);
+        // décalques de l'aperçu (passe 1, comme blend_pass) : légèrement avancés sur la surface qu'ils couvrent
+        gl.uniform_1_f32(u_blend.as_ref(), 1.0);
+        gl.enable(glow::POLYGON_OFFSET_FILL);
+        gl.polygon_offset(-1.0, -2.0);
+        self.draw_insts(gl, &ready, false, 1);
+        gl.disable(glow::POLYGON_OFFSET_FILL);
+        // verre et transparences de l'aperçu
+        self.draw_insts(gl, &ready, false, 2);
+        gl.uniform_1_f32(u_blend.as_ref(), 0.0);
+        gl.uniform_4_f32(u_ghost.as_ref(), 0.0, 0.0, 0.0, 0.0);
+        gl.uniform_1_f32(u_clip.as_ref(), fd.clip_z);
+        gl.depth_mask(true);
+        gl.disable(glow::BLEND);
+    }
+
     /// Dessin (appelé par egui pendant l'affichage de la vue).
     pub unsafe fn paint(&mut self, gl: &glow::Context, info: &egui::PaintCallbackInfo, fd: &FrameDraw) {
         self.frame += 1;
@@ -709,6 +818,10 @@ void main() {{
             gl.uniform_1_f32(p.u_terrain.as_ref(), 0.0);
         }
         gl.uniform_1_f32(u_alpha.as_ref(), 1.0);
+        {
+            let p = self.prog.as_ref().unwrap();
+            gl.uniform_4_f32(p.u_ghost.as_ref(), 0.0, 0.0, 0.0, 0.0);
+        }
         gl.uniform_1_f32(u_water.as_ref(), 0.0);
         gl.uniform_1_f32(u_shadow_on.as_ref(), 0.0);
         gl.uniform_4_f32(u_fog.as_ref(), fd.fog[0], fd.fog[1], fd.fog[2], fd.fog[3]);
@@ -810,6 +923,9 @@ void main() {{
             gl.read_pixels(x, y, 1, 1, glow::DEPTH_COMPONENT, glow::FLOAT, glow::PixelPackData::Slice(Some(&mut buf)));
             self.probe = Some((p, f32::from_le_bytes(buf)));
         }
+        // 5. aperçu de la pose, par-dessus tout le reste (après la lecture de la profondeur : la souris vise le
+        // décor, jamais l'aperçu lui-même)
+        self.ghost_pass(gl, fd);
         gl.bind_vertex_array(None);
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, None);

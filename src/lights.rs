@@ -40,6 +40,17 @@ pub const LIGHT_REACH_MARGIN: f32 = 1.0;
 pub struct Light {
     pub pos: V3,
     pub falloff: f32,
+    /// couleur et intensité (sinon celles par défaut), lumière ronde (Point) au lieu d'un spot vers le bas
+    pub colour: Option<[u8; 3]>,
+    pub intensity: Option<f32>,
+    pub point: bool,
+}
+
+impl Light {
+    /// Spot vers le bas, couleur et intensité par défaut.
+    pub fn spot(pos: V3, falloff: f32) -> Light {
+        Light { pos, falloff, colour: None, intensity: None, point: false }
+    }
 }
 
 /// Spots du plafond d'une pièce (boîte `a`–`b`) : grille régulière, un spot par case d'au plus LIGHT_SPACING
@@ -58,7 +69,7 @@ pub fn room_lights(a: V3, b: V3) -> Vec<Light> {
     let mut out = Vec::new();
     for j in 0..ny {
         for i in 0..nx {
-            out.push(Light { pos: v3(a.x + cw * (i as f32 + 0.5), a.y + cd * (j as f32 + 0.5), z), falloff: reach });
+            out.push(Light::spot(v3(a.x + cw * (i as f32 + 0.5), a.y + cd * (j as f32 + 0.5), z), reach));
         }
     }
     out
@@ -76,12 +87,14 @@ pub fn lights_xml(lights: &[Light]) -> String {
     if lights.is_empty() {
         return String::new();
     }
-    let [r, g, b] = LIGHT_COLOR;
     let mut s = String::from(" <Lights>\n");
     for l in lights {
+        let [r, g, b] = l.colour.unwrap_or(LIGHT_COLOR);
+        let intensity = l.intensity.unwrap_or(LIGHT_INTENSITY);
+        let kind = if l.point { "Point" } else { LIGHT_TYPE };
         let _ = write!(
             s,
-            "  <Item>\n   <Position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <Colour r=\"{r}\" g=\"{g}\" b=\"{b}\" />\n   <Flashiness value=\"0\" />\n   <Intensity value=\"{LIGHT_INTENSITY}\" />\n   <Flags value=\"{LIGHT_FLAGS}\" />\n   <BoneId value=\"0\" />\n   <Type>{LIGHT_TYPE}</Type>\n   <GroupId value=\"0\" />\n   <TimeFlags value=\"{LIGHT_HOURS}\" />\n   <Falloff value=\"{}\" />\n   <FalloffExponent value=\"{LIGHT_FALLOFF_EXP}\" />\n   <CullingPlaneNormal x=\"0\" y=\"0\" z=\"-1\" />\n   <CullingPlaneOffset value=\"0\" />\n   <Unknown45 value=\"0\" />\n   <Unknown46 value=\"0\" />\n   <VolumeIntensity value=\"{LIGHT_VOLUME_INTENSITY}\" />\n   <VolumeSizeScale value=\"1\" />\n   <VolumeOuterColour r=\"255\" g=\"255\" b=\"255\" />\n   <LightHash value=\"0\" />\n   <VolumeOuterIntensity value=\"1\" />\n   <CoronaSize value=\"{LIGHT_CORONA_SIZE}\" />\n   <VolumeOuterExponent value=\"1\" />\n   <LightFadeDistance value=\"0\" />\n   <ShadowBlur value=\"0\" />\n   <ShadowFadeDistance value=\"0\" />\n   <SpecularFadeDistance value=\"0\" />\n   <VolumetricFadeDistance value=\"0\" />\n   <ShadowNearClip value=\"{LIGHT_SHADOW_NEAR}\" />\n   <CoronaIntensity value=\"{LIGHT_CORONA_INTENSITY}\" />\n   <CoronaZBias value=\"0.1\" />\n   <Direction x=\"0\" y=\"0\" z=\"-1\" />\n   <Tangent x=\"{LIGHT_TANGENT_X}\" y=\"0\" z=\"0\" />\n   <ConeInnerAngle value=\"{LIGHT_CONE_INNER}\" />\n   <ConeOuterAngle value=\"{LIGHT_CONE_OUTER}\" />\n   <Extent x=\"1\" y=\"1\" z=\"1\" />\n   <ProjectedTextureHash />\n  </Item>\n",
+            "  <Item>\n   <Position x=\"{}\" y=\"{}\" z=\"{}\" />\n   <Colour r=\"{r}\" g=\"{g}\" b=\"{b}\" />\n   <Flashiness value=\"0\" />\n   <Intensity value=\"{intensity}\" />\n   <Flags value=\"{LIGHT_FLAGS}\" />\n   <BoneId value=\"0\" />\n   <Type>{kind}</Type>\n   <GroupId value=\"0\" />\n   <TimeFlags value=\"{LIGHT_HOURS}\" />\n   <Falloff value=\"{}\" />\n   <FalloffExponent value=\"{LIGHT_FALLOFF_EXP}\" />\n   <CullingPlaneNormal x=\"0\" y=\"0\" z=\"-1\" />\n   <CullingPlaneOffset value=\"0\" />\n   <Unknown45 value=\"0\" />\n   <Unknown46 value=\"0\" />\n   <VolumeIntensity value=\"{LIGHT_VOLUME_INTENSITY}\" />\n   <VolumeSizeScale value=\"1\" />\n   <VolumeOuterColour r=\"255\" g=\"255\" b=\"255\" />\n   <LightHash value=\"0\" />\n   <VolumeOuterIntensity value=\"1\" />\n   <CoronaSize value=\"{LIGHT_CORONA_SIZE}\" />\n   <VolumeOuterExponent value=\"1\" />\n   <LightFadeDistance value=\"0\" />\n   <ShadowBlur value=\"0\" />\n   <ShadowFadeDistance value=\"0\" />\n   <SpecularFadeDistance value=\"0\" />\n   <VolumetricFadeDistance value=\"0\" />\n   <ShadowNearClip value=\"{LIGHT_SHADOW_NEAR}\" />\n   <CoronaIntensity value=\"{LIGHT_CORONA_INTENSITY}\" />\n   <CoronaZBias value=\"0.1\" />\n   <Direction x=\"0\" y=\"0\" z=\"-1\" />\n   <Tangent x=\"{LIGHT_TANGENT_X}\" y=\"0\" z=\"0\" />\n   <ConeInnerAngle value=\"{LIGHT_CONE_INNER}\" />\n   <ConeOuterAngle value=\"{LIGHT_CONE_OUTER}\" />\n   <Extent x=\"1\" y=\"1\" z=\"1\" />\n   <ProjectedTextureHash />\n  </Item>\n",
             l.pos.x,
             l.pos.y,
             l.pos.z,
