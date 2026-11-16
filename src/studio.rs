@@ -36,6 +36,9 @@ pub struct StudioState {
     pub new_name: String,
     /// départ d'un nouvel intérieur : 0 vide, 1 une pièce, 2 deux pièces
     pub new_kind: u8,
+    /// intérieur complet tout prêt choisi (gabarits.rs) à la place d'un départ vide, et son style (0 = au hasard)
+    pub new_tpl: Option<usize>,
+    pub new_theme: usize,
     /// coupe au-dessus de l'étage : on voit dans les pièces, sans plafond
     pub cut: bool,
     saved: Option<Saved>,
@@ -276,11 +279,33 @@ impl DwApp {
                         (1, ic::SQUARE, "Une pièce", "Une pièce de 6 × 5 m avec une porte d'entrée"),
                         (2, ic::COLUMNS, "Deux pièces", "Deux pièces de 6 × 5 m reliées par une porte, avec une porte d'entrée"),
                     ] {
-                        if look::tool(ui, self.studio.new_kind == k, icon, n, tip).clicked() {
+                        if look::tool(ui, self.studio.new_tpl.is_none() && self.studio.new_kind == k, icon, n, tip).clicked() {
                             self.studio.new_kind = k;
+                            self.studio.new_tpl = None;
                         }
                     }
                 });
+                ui.add_space(4.0);
+                ui.label(RichText::new("Ou un intérieur complet tout prêt : pièces, portes, ambiances, meubles et déco (tout se retouche ensuite).").small().weak());
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    for (i, g) in crate::gabarits::GABARITS.iter().enumerate() {
+                        let tip: Vec<&str> = g.rooms.iter().map(|r| crate::decor::KINDS[r.1].0).collect();
+                        if ui.add(egui::Button::new(look::label(g.icon, g.name)).selected(self.studio.new_tpl == Some(i))).on_hover_text(tip.join(", ")).clicked() {
+                            self.studio.new_tpl = if self.studio.new_tpl == Some(i) { None } else { Some(i) };
+                        }
+                    }
+                });
+                if self.studio.new_tpl.is_some() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Style");
+                        for (th, n) in crate::decor::THEMES.iter().enumerate() {
+                            if ui.selectable_label(self.studio.new_theme == th, *n).clicked() {
+                                self.studio.new_theme = th;
+                            }
+                        }
+                    });
+                }
                 ui.label(RichText::new("Créé au centre de la vue actuelle ; « Placer sur la carte » le déplace ensuite où tu veux.").small().weak());
                 if look::accent(ui, ic::CUBE_TRANSPARENT, "Créer et ouvrir dans le studio", "").clicked() {
                     new = true;
@@ -317,7 +342,10 @@ impl DwApp {
         }
         if new {
             self.studio.choose = false;
-            self.studio_new();
+            match self.studio.new_tpl {
+                Some(g) => self.studio_new_gabarit(g, self.studio.new_theme),
+                None => self.studio_new(),
+            }
         } else if let Some(n) = enter {
             self.studio_enter(&n);
         }
@@ -467,6 +495,8 @@ impl DwApp {
                 if (ui.min_rect().height() - before).abs() < 1.0 {
                     ui.label(RichText::new("Dessine d'abord une pièce (outil « Pièce », à gauche de la vue).").weak());
                 }
+                ui.add_space(6.0);
+                self.targets_ui(ui);
                 ui.add_space(10.0);
                 look::heading(ui, ic::CURSOR_CLICK, "Objet choisi");
                 if self.selected.is_empty() {

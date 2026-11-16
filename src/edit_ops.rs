@@ -391,59 +391,16 @@ impl DwApp {
         self.furnish_rooms_inner(style, only)
     }
 
-    /// Même chose, sans point d'annulation (pour l'enchaîner dans « Transformer en intérieur »).
+    /// Même chose, sans point d'annulation (pour l'enchaîner dans « Transformer en intérieur ») : aménagement tout
+    /// prêt (decor.rs) du type de pièce de `style` (ou deviné d'après le nom de la pièce), sans retirer ce qui est là.
     pub fn furnish_rooms_inner(&mut self, style: &str, only: Option<usize>) -> String {
         let Some((t, m)) = self.cur_mlo else { return "Aucun intérieur courant : crée-en un d'abord.".into() };
+        let n = self.proj.ytyps[t].mlos[m].rooms.len();
         let mut added = 0;
-        let rooms: Vec<(usize, V3, V3)> = self.proj.ytyps[t].mlos[m].rooms.iter().enumerate().skip(1).filter(|(i, _)| only.map(|o| o == *i).unwrap_or(true)).map(|(i, r)| (i, r.bb_min, r.bb_max)).collect();
-        for (ri, mn, mx) in rooms {
-            let c = (mn + mx) * 0.5;
-            let w = mx.x - mn.x;
-            let d = mx.y - mn.y;
-            let mut items: Vec<(&str, f32, f32, f32)> = Vec::new(); // (prop, x, y, cap)
-            match style {
-                "bureau" => {
-                    let nx = ((w - 1.0) / 2.4).floor().max(1.0) as i32;
-                    for i in 0..nx {
-                        let x = mn.x + 1.2 + i as f32 * 2.4 + 0.8;
-                        items.push(("prop_off_desk_01", x, c.y, 0.0));
-                        items.push(("prop_chair_01a", x, c.y - 0.9, 180.0));
-                    }
-                    items.push(("prop_plant_01a", mx.x - 0.5, mx.y - 0.5, 0.0));
-                }
-                "bar" => {
-                    items.push(("v_ret_ml_tablea", c.x, mx.y - 1.0, 0.0));
-                    for i in -1..=1 {
-                        items.push(("prop_bar_stool_01", c.x + i as f32 * 0.8, mx.y - 1.9, 0.0));
-                    }
-                    items.push(("prop_table_03", c.x, c.y - d * 0.2, 0.0));
-                }
-                "magasin" => {
-                    items.push(("v_ret_ml_tablea", c.x, mn.y + 1.2, 0.0));
-                    items.push(("prop_atm_01", mx.x - 0.6, c.y, 270.0));
-                    items.push(("prop_vend_soda_01", mn.x + 0.6, c.y, 90.0));
-                }
-                "cuisine" => {
-                    items.push(("v_res_fridgemodsml", mn.x + 0.6, mx.y - 0.6, 180.0));
-                    items.push(("prop_table_03", c.x, c.y, 0.0));
-                    items.push(("prop_chair_01a", c.x - 0.6, c.y - 0.8, 0.0));
-                    items.push(("prop_chair_01a", c.x + 0.6, c.y + 0.8, 180.0));
-                }
-                _ => {
-                    items.push(("prop_couch_01", c.x, mn.y + 0.7, 0.0));
-                    items.push(("prop_table_03", c.x, c.y, 0.0));
-                    items.push(("prop_tv_flat_01", c.x, mx.y - 0.3, 180.0));
-                    items.push(("prop_plant_01a", mx.x - 0.5, mn.y + 0.5, 0.0));
-                }
-            }
-            for (arch, x, y, cap) in items {
-                let mut e = Entity::new(arch, v3(x, y, mn.z));
-                e.flags = mech::MLO_ENTITY_FLAGS;
-                e.room = ri;
-                e.rot = Quat::from_z(cap.to_radians());
-                self.proj.ytyps[t].mlos[m].entities.push(e);
-                added += 1;
-            }
+        for ri in (1..n).filter(|i| only.map(|o| o == *i).unwrap_or(true)) {
+            let kind = crate::decor::kind_from_name(&self.proj.ytyps[t].mlos[m].rooms[ri].name).filter(|_| only.is_none()).unwrap_or_else(|| crate::decor::kind_from_style(style));
+            let seed = self.frame ^ (ri as u64 * 7919);
+            added += self.decorate_room(t, m, ri, kind, 0, seed, true, false).0;
         }
         match only {
             Some(ri) => format!("{added} meuble(s) ajouté(s) dans la pièce {ri} (type {style})."),

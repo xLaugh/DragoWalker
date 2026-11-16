@@ -418,7 +418,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![] };
+        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -1365,7 +1365,6 @@ impl DwApp {
         ui.label(format!("{} pièce(s), {} portail(s), {} objet(s)", mlo.rooms.len().saturating_sub(1), mlo.portals.len(), mlo.entities.len()));
         let mut del_room = None;
         let mut sel_room = None;
-        let mut furnish_room: Option<(usize, &str)> = None;
         let mut pick_room: Option<usize> = None;
         egui::ScrollArea::vertical().max_height(220.0).id_salt("rooms").show(ui, |ui| {
             for (ri, r) in mlo.rooms.iter_mut().enumerate() {
@@ -1401,16 +1400,8 @@ impl DwApp {
                         if ui.small_button("Sélectionner ses objets").clicked() {
                             sel_room = Some(ri);
                         }
-                        if ui.small_button("Choisir : ambiance, meubles").on_hover_text("Pièce choisie plus bas : liste des ambiances du jeu avec aperçu, et catalogue des meubles à poser à la souris").clicked() {
+                        if ui.small_button("Aménager, ambiance, meubles").on_hover_text("Pièce choisie plus bas : aménagement tout prêt (salon, bureau, bar…), ambiances du jeu avec aperçu, catalogue des meubles à poser à la souris").clicked() {
                             pick_room = Some(ri);
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Remplir :");
-                        for st in ["salon", "bureau", "bar", "magasin", "cuisine"] {
-                            if ui.small_button(st).on_hover_text("Poser les meubles de ce type de pièce, sur son sol").clicked() {
-                                furnish_room = Some((ri, st));
-                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1506,15 +1497,6 @@ impl DwApp {
         changed |= self.entity_sets_ui(ui, &mut mlo);
         self.plan_ui(ui);
         ui.separator();
-        crate::look::heading(ui, crate::look::ic::MAGIC_WAND, "Meubler automatiquement");
-        let mut furnish = None;
-        ui.horizontal_wrapped(|ui| {
-            for st in ["salon", "bureau", "bar", "magasin", "cuisine"] {
-                if ui.button(st).clicked() {
-                    furnish = Some(st);
-                }
-            }
-        });
         let old_name = self.proj.ytyps[t].mlos[m].name.clone();
         if changed {
             self.push_undo();
@@ -1533,12 +1515,6 @@ impl DwApp {
             let ids: Vec<u64> = self.proj.ytyps[t].mlos[m].entities.iter().filter(|e| e.room == ri).map(|e| e.id).collect();
             self.set_selection(ids);
         }
-        if let Some(st) = furnish {
-            self.status = self.furnish_mlo(st);
-        }
-        if let Some((ri, st)) = furnish_room {
-            self.status = self.furnish_rooms(st, Some(ri));
-        }
         if pick_room.is_some() {
             self.furn.room = pick_room;
             self.furn.scroll_to = true;
@@ -1547,6 +1523,8 @@ impl DwApp {
         // dans le studio, la pièce choisie est dans le panneau de droite
         if !self.studio.on {
             self.interior_room_tools(ui);
+            ui.separator();
+            self.targets_ui(ui);
         }
         ui.separator();
         let name = self.proj.ytyps[t].mlos[m].name.clone();

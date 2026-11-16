@@ -459,6 +459,9 @@ pub struct Project {
     /// ambiances du projet (timecycle modifiers personnalisés, ambiance.rs) : écrites dans dw_timecycmod.xml
     #[serde(default)]
     pub ambiances: Vec<crate::ambiance::ProjAmbiance>,
+    /// points d'interaction des intérieurs exportés en zones ox_target / qb-target (interactions.rs)
+    #[serde(default)]
+    pub targets: bool,
 }
 
 impl Project {

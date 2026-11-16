@@ -68,6 +68,23 @@ impl DwApp {
                 take(h, &mut best);
             }
         }
+        // sol des pièces des intérieurs du projet : la coque générée n'est pas un modèle du jeu (pas de triangles à
+        // lire), sans ça un meuble traverse le sol de la pièce et tombe sur le relief du jeu en dessous
+        let mut in_room = false;
+        for inst in self.proj.ymaps.iter().filter(|y| !y.sample).flat_map(|y| y.entities.iter()).filter(|e| e.mlo.is_some()) {
+            let Some(m) = self.proj.find_mlo(&inst.archetype) else { continue };
+            let l = inst.rot.inverse().rotate(o - inst.pos);
+            for r in m.rooms.iter().skip(1) {
+                if l.x < r.bb_min.x || l.x > r.bb_max.x || l.y < r.bb_min.y || l.y > r.bb_max.y {
+                    continue;
+                }
+                in_room = true;
+                take((inst.pos + inst.rot.rotate(v3(l.x, l.y, r.bb_min.z))).z, &mut best);
+            }
+        }
+        // dans une pièce d'intérieur, ou dans le studio (le jeu y est caché) : on ne pose que sur l'intérieur (sol des
+        // pièces, objets du projet), pas sur le relief ou les bâtiments du jeu autour
+        let game = !(self.studio.on || in_room);
         // objets : du projet, puis du jeu (ceux affichés), triangle par triangle
         let mut cands: Vec<(u32, V3, crate::math::Quat, V3)> = Vec::new();
         for it in self.proj.all_items() {
@@ -82,7 +99,7 @@ impl DwApp {
             }
             cands.push((crate::render::arch_hash(&e.archetype), e.pos, e.rot, v3(e.scale_xy, e.scale_xy, e.scale_z)));
         }
-        if let Some(w) = self.game.world.as_ref() {
+        if let Some(w) = self.game.world.as_ref().filter(|_| game) {
             for &ei in &self.game.drawn {
                 let e = &w.ents[ei as usize];
                 if w.ymaps[e.ymap as usize].in_project || self.game.hidden.contains(&ei) || e.lod_level != 0 {
@@ -114,7 +131,7 @@ impl DwApp {
                 }
             }
         }
-        if best.is_none() {
+        if best.is_none() && game {
             if let Some(w) = self.game.world.as_ref() {
                 if let Some(g) = w.ray_ground(o, down) {
                     take(g.z, &mut best);

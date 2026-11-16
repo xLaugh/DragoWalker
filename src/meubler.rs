@@ -170,6 +170,19 @@ pub struct FurnState {
     pub pamb_rename: String,
     /// réglage en cours (glissière tenue, sélecteur de couleur ouvert) : une seule annulation pour tout le geste
     pub pamb_editing: bool,
+    /// aménagements tout prêts (decor.rs) : type de pièce, style, graine (« Varier »), garder les meubles déjà là,
+    /// sans ambiance ni lumières assorties, pièce dont le type a été deviné
+    pub decor_kind: usize,
+    pub decor_theme: usize,
+    pub decor_seed: u64,
+    pub decor_keep: bool,
+    pub decor_no_amb: bool,
+    pub decor_guessed: Option<usize>,
+    /// ne pas garder les objets choisis dans la vue (par défaut, ils restent quand on aménage ou varie)
+    pub decor_drop_sel: bool,
+    /// trois idées d'aménagement à choisir : clé (intérieur, pièce, type, style, réglages), graines et plans
+    pub decor_prev_key: u64,
+    pub decor_prev: Vec<(u64, crate::decor::RoomIn, crate::decor::Plan)>,
 }
 
 // ------------------------------------------------------------------ ambiances
@@ -486,6 +499,11 @@ impl DwApp {
         self.furn.items.as_ref().unwrap()
     }
 
+    /// Copie du catalogue (vide tant que le jeu n'est pas chargé).
+    pub fn furn_items_pub(&mut self) -> Vec<FurnItem> {
+        self.furn_items().clone()
+    }
+
     /// Jeu rechargé (ou retiré) depuis la liste des meubles et des ambiances : elles sont refaites.
     fn furn_check_world(&mut self) {
         let key = self.game.world.as_deref().map(|w| w as *const crate::gta::world::GameWorld as usize).unwrap_or(0);
@@ -613,6 +631,7 @@ impl DwApp {
             ui.label(RichText::new(IMPORTED_MLO_LOCKED).small().color(Color32::from_rgb(255, 190, 110)));
             return;
         }
+        self.decor_ui(ui, t, m, ri);
         self.ambiance_ui(ui, t, m, ri);
         self.furniture_ui(ui);
         self.portals_ui(ui, Some((t, m)));

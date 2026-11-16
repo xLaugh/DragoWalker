@@ -677,6 +677,17 @@ client_script 'dw_doors.lua'
                 Ok(_) => {}
                 Err(e) => report.push(format!("Script des variantes impossible : {e}")),
             }
+            // points d'interaction des intérieurs : zones ox_target / qb-target (interactions.rs)
+            match self.export_targets(&out) {
+                Ok(n) if n > 0 => {
+                    man += "
+client_script 'dw_targets.lua'
+";
+                    report.push(format!("Points d'interaction : {n} zone(s) ox_target / qb-target (dw_targets.lua, évènement « dragowalker:interaction »)."));
+                }
+                Ok(_) => {}
+                Err(e) => report.push(format!("Points d'interaction impossibles à écrire : {e}")),
+            }
             if !self.export_skip.is_empty() {
                 report.push(format!("Test en jeu sans : {}.", self.export_skip.join(", ")));
             }

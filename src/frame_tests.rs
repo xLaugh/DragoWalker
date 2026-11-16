@@ -26,6 +26,162 @@ impl DwApp {
         self.test_hooks_gizmo();
         self.test_hooks_clicks();
         self.test_hooks_studio();
+        self.test_hooks_furn_dump();
+        self.test_hooks_lineup();
+        self.test_hooks_decor();
+        self.test_hooks_gabarit();
+    }
+
+    /// Intérieur complet tout prêt (DW_TEST_GABARIT=indice, DW_TEST_GABARIT_THEME), vu en 3D du dessus.
+    fn test_hooks_gabarit(&mut self) {
+        if self.frame != 20 {
+            return;
+        }
+        let Some(g) = std::env::var("DW_TEST_GABARIT").ok().and_then(|v| v.parse::<usize>().ok()) else { return };
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        self.studio_new_gabarit(g, env("DW_TEST_GABARIT_THEME", 0.0) as usize);
+        println!("{}", self.status);
+        let pts = self.interaction_points();
+        println!("points d'interaction : {}", pts.len());
+        for p in pts.iter().take(40) {
+            println!("  {} {} {} ({:.1}, {:.1}, {:.1}) taille ({:.1}, {:.1}, {:.1}) cap {:.0}", p.kind, p.room, p.model, p.coords.x, p.coords.y, p.coords.z, p.size.x, p.size.y, p.size.z, p.heading);
+        }
+        self.cam.map_view = false;
+        self.cam.yaw = env("DW_TEST_DECOR_YAW", 0.0);
+        self.cam.pitch = env("DW_TEST_DECOR_PITCH", 1.25);
+        self.cam.dist = env("DW_TEST_DECOR_DIST", 20.0);
+        if let Some((p, _)) = self.proj.mlo_placement(&self.studio.mlo.clone()) {
+            self.cam.target = p;
+        }
+        self.cam.snap();
+    }
+
+    /// Aménagements (DW_TEST_DECOR="0,1,5,9" : types de pièce, une pièce de 6,5 × 5,5 m chacune côte à côte ;
+    /// DW_TEST_DECOR_THEME, DW_TEST_DECOR_SEED), puis le studio, vue de dessus (DW_TEST_DECOR_3D=1 : vue 3D).
+    fn test_hooks_decor(&mut self) {
+        if self.frame != 20 {
+            return;
+        }
+        let Ok(list) = std::env::var("DW_TEST_DECOR") else { return };
+        let kinds: Vec<usize> = list.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if kinds.is_empty() {
+            return;
+        }
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        self.create_mlo("dw_test_decor", kinds.len() as u32, 1, env("DW_TEST_DECOR_W", 6.5), env("DW_TEST_DECOR_D", 5.5), 3.0);
+        let Some((t, m)) = self.cur_mlo else { return };
+        let theme = std::env::var("DW_TEST_DECOR_THEME").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let seed = std::env::var("DW_TEST_DECOR_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        for (i, k) in kinds.iter().enumerate() {
+            let (_, msg) = self.decorate_room(t, m, i + 1, *k, theme, seed + i as u64, false, true);
+            println!("pièce {} : {msg}", i + 1);
+            for e in self.proj.ytyps[t].mlos[m].entities.iter().filter(|e| e.room == i + 1) {
+                println!("   {} {:.2} {:.2} {:.2} cap {:.0}", e.archetype, e.pos.x, e.pos.y, e.pos.z, e.rot.heading_deg());
+            }
+        }
+        let name = self.proj.ytyps[t].mlos[m].name.clone();
+        self.studio_enter(&name);
+        if std::env::var("DW_TEST_DECOR_IDEAS").is_ok() {
+            self.furn.room = Some(1);
+            self.furn.decor_kind = kinds[0];
+            self.furn.decor_theme = theme;
+            for i in 0..3u64 {
+                let (room, plan) = self.decor_plan(t, m, 1, kinds[0], theme, seed * 31 + i, self.furn.decor_keep);
+                self.furn.decor_prev.push((seed * 31 + i, room, plan));
+            }
+            self.furn.decor_prev_key = self.decor_prev_key(t, m, 1);
+        }
+        if std::env::var("DW_TEST_SNAP").is_ok() {
+            // poser au sol dans le studio : un meuble levé de 1,5 m, puis un enfoncé de 0,8 m
+            let (pos, _) = self.proj.mlo_placement(&name).unwrap_or_default();
+            let ids: Vec<(u64, String)> = self.proj.ytyps[t].mlos[m].entities.iter().filter(|e| e.room == 1 && !e.archetype.starts_with("dw_")).take(2).map(|e| (e.id, e.archetype.clone())).collect();
+            for (k, (id, arch)) in ids.iter().enumerate() {
+                let dz = if k == 0 { 1.5 } else { -0.8 };
+                if let Some(e) = self.proj.ytyps[t].mlos[m].entities.iter_mut().find(|e| e.id == *id) {
+                    e.pos.z += dz;
+                }
+                let before = self.proj.ytyps[t].mlos[m].entities.iter().find(|e| e.id == *id).map(|e| e.pos.z).unwrap_or(0.0);
+                self.snap_ids(&[*id]);
+                let after = self.proj.ytyps[t].mlos[m].entities.iter().find(|e| e.id == *id).map(|e| e.pos.z).unwrap_or(0.0);
+                let floor = self.proj.ytyps[t].mlos[m].rooms[1].bb_min.z;
+                println!("poser au sol {arch} : {before:.2} -> {after:.2} (sol de la pièce {floor:.2}, intérieur à z {:.2})", pos.z);
+            }
+        }
+        let td = std::env::var("DW_TEST_DECOR_3D").is_ok();
+        self.cam.map_view = !td;
+        if !td {
+            self.cam.ortho = 3.4 * kinds.len() as f32;
+            self.cam.snap();
+        }
+        if td {
+            self.cam.yaw = env("DW_TEST_DECOR_YAW", 0.35);
+            self.cam.pitch = env("DW_TEST_DECOR_PITCH", 0.75);
+            self.cam.dist = env("DW_TEST_DECOR_DIST", 9.0 + kinds.len() as f32 * 4.0);
+            self.cam.snap();
+        }
+    }
+
+    /// Rangée d'objets à cap 0 pour voir leur orientation (DW_TEST_LINEUP="a,b,c", 6 par ligne, 3,5 m d'écart),
+    /// vue du sud (caméra tournée vers le nord) ; DW_TEST_LINEUP_YAW pour une autre direction.
+    fn test_hooks_lineup(&mut self) {
+        if self.frame != 20 {
+            return;
+        }
+        let Ok(list) = std::env::var("DW_TEST_LINEUP") else { return };
+        self.studio.new_kind = 0;
+        self.studio_new();
+        let Some((t, m)) = self.cur_mlo else { return };
+        let names: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        for (i, n) in names.iter().enumerate() {
+            let (c, r) = ((i % 6) as f32, (i / 6) as f32);
+            let mut e = crate::model::Entity::new(n, crate::math::v3(c * 3.5, -r * 3.5, 0.0));
+            e.flags = crate::mech::MLO_ENTITY_FLAGS;
+            e.room = 0;
+            self.proj.ytyps[t].mlos[m].entities.push(e);
+            println!("{i} ({c},{r}) {n}");
+        }
+        let rows = ((names.len() + 5) / 6) as f32;
+        if let Some((p, _)) = self.proj.mlo_placement(&self.studio.mlo.clone()) {
+            self.cam.target = p + crate::math::v3(8.75, -(rows - 1.0) * 1.75, 0.5);
+        }
+        self.cam.map_view = false;
+        self.studio.cut = false;
+        self.cam.yaw = std::env::var("DW_TEST_LINEUP_YAW").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        self.cam.pitch = std::env::var("DW_TEST_LINEUP_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0.55);
+        self.cam.dist = std::env::var("DW_TEST_LINEUP_DIST").ok().and_then(|v| v.parse().ok()).unwrap_or(14.0 + rows * 4.0);
+        self.cam.snap();
+        self.plan.mode = 0;
+    }
+
+    /// Catalogue des meubles et ambiances du jeu dans un fichier (DW_TEST_FURN_DUMP=chemin), une fois le jeu chargé.
+    fn test_hooks_furn_dump(&mut self) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Ok(path) = std::env::var("DW_TEST_FURN_DUMP") else { return };
+        if self.game.world.is_none() || self.frame < 30 || DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut out = String::new();
+        for it in self.furn_items_pub() {
+            out.push_str(&format!("F	{}	{:.2}	{:.2}	{:.2}	{}
+", it.name, it.size.x, it.size.y, it.size.z, it.cats));
+        }
+        if let Some(w) = self.game.world.as_ref() {
+            for (h, a) in &w.archetypes {
+                if let Some(n) = w.names.get(h) {
+                    let sz = a.bb_max - a.bb_min;
+                    if !a.mlo && sz.x.max(sz.y).max(sz.z) < 8.0 {
+                        out.push_str(&format!("N	{n}	{:.2}	{:.2}	{:.2}	{:.2}	{:.2}	{:.2}
+", sz.x, sz.y, sz.z, a.bb_min.x, a.bb_min.y, a.bb_min.z));
+                    }
+                }
+            }
+        }
+        for a in self.ambiances().clone() {
+            out.push_str(&format!("A	{}	{}	{}
+", a.name, a.label, a.interior));
+        }
+        let _ = std::fs::write(&path, out);
+        println!("catalogue écrit : {path}");
     }
 
     /// Studio MLO (DW_TEST_STUDIO) : « choose » ouvre la fenêtre, « new » crée un intérieur vide (DW_TEST_STUDIO_KIND=0|1|2)
