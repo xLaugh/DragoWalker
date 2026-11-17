@@ -123,6 +123,8 @@ pub struct ServerState {
     pub watch_at: f64,
     /// export manuel en cours de conversion : (dossier exporté, ressource FiveM, compte rendu de l'export)
     pub export_info: Option<(PathBuf, bool, String)>,
+    /// vitesse du noclip en jeu (m/s, réglage server_noclip_speed ; la molette la change en jeu)
+    pub noclip_speed: f32,
 }
 
 impl ServerState {
@@ -141,6 +143,7 @@ impl ServerState {
             addon_busy: Arc::new(Mutex::new(false)),
             dir,
             license: s["server_license"].as_str().unwrap_or("").to_string(),
+            noclip_speed: s["server_noclip_speed"].as_f64().unwrap_or(10.0) as f32,
             install_msg: Arc::new(Mutex::new(String::new())),
             installing: Arc::new(Mutex::new(false)),
             child: None,
@@ -352,6 +355,7 @@ impl ServerState {
              sv_scriptHookAllowed 0\n\
              sv_licenseKey \"{}\"\n\
              setr dw_spawn \"{} {} {}\"\n\
+             setr dw_noclip_speed \"{}\"\n\
              set dw_map \"{}\"\n\
              # dw_tools relance la map (restart) pendant le rechargement\n\
              add_ace resource.{TOOLS} command.restart allow\n\
@@ -361,6 +365,7 @@ impl ServerState {
             spawn.x,
             spawn.y,
             spawn.z + 1.0,
+            self.noclip_speed,
             self.resource,
             // ressources de la communauté cochées, avant la map
             self.addons_active().iter().map(|k| format!("ensure {k}\n")).collect::<String>(),
@@ -733,7 +738,19 @@ impl DwApp {
                     act = Some("crash");
                 }
             });
-            ui.label(RichText::new(format!("En jeu : F2 noclip (Z Q S D, Espace / Ctrl, Maj plus vite) · /tp x y z · /tpm vers le repère · /dw_home · /dw_coords · /dw_copy · /dw_refresh recharge la zone. État : {}", if running { "serveur en marche" } else { "arrêté" })).small().weak());
+            ui.horizontal(|ui| {
+                ui.label("Vitesse du noclip");
+                let r = ui.add(egui::Slider::new(&mut s.server.noclip_speed, 0.5..=200.0).logarithmic(true).suffix(" m/s").max_decimals(1));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    crate::app::save_setting("server_noclip_speed", serde_json::json!(s.server.noclip_speed));
+                    if running {
+                        let v = s.server.noclip_speed;
+                        s.server.send(&format!("setr dw_noclip_speed \"{v}\""));
+                    }
+                }
+                r.on_hover_text("Vitesse de départ (10 m/s ≈ un jogging rapide). En jeu : molette ou Page préc. / Page suiv. pendant le noclip, Maj ×4, Alt ÷4.");
+            });
+            ui.label(RichText::new(format!("En jeu : F2 noclip (Z Q S D, Espace / Ctrl, molette = vitesse, Maj plus vite, Alt plus lent) · T pour taper une commande : /car nom (ex. /car adder), /dv retire le véhicule, /fix le répare, /tp x y z, /tpm vers le repère, /dw_home, /dw_coords, /dw_copy, /dw_refresh recharge la zone. État : {}", if running { "serveur en marche" } else { "arrêté" })).small().weak());
             ui.separator();
             ui.label(RichText::new("Console du serveur").strong());
             let lines = s.server.console.lock().map(|c| c.clone()).unwrap_or_default();
@@ -840,6 +857,12 @@ const TOOLS_CLIENT: &str = r#"-- DragoWalker : apparition, noclip, téléportati
 local noclip = false
 local showCoords = true
 local saved = nil
+-- vitesses du noclip (m/s) : la molette passe de l'une à l'autre ; départ = réglage de DragoWalker
+local NC_SPEEDS = {0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0}
+local ncSpeed = 10.0
+local ncConvar = nil
+local ncEnt = nil
+local lastCar = nil
 
 local function notify(msg)
   BeginTextCommandThefeedPost('STRING')
@@ -910,18 +933,60 @@ CreateThread(function()
   ShutdownLoadingScreen()
   ShutdownLoadingScreenNui()
   DoScreenFadeIn(500)
-  notify('DragoWalker : F2 noclip, /tp, /tpm, /dw_coords, /dw_refresh')
+  notify('DragoWalker : F2 noclip (molette = vitesse), T = commande : /car nom, /dv, /fix, /tp, /tpm, /dw_refresh')
 end)
 
--- noclip
+-- noclip (à pied, ou avec le véhicule où l'on est assis)
 local function setNoclip(on)
   noclip = on
   local ped = PlayerPedId()
-  SetEntityCollision(ped, not on, not on)
-  FreezeEntityPosition(ped, on)
-  SetEntityVisible(ped, not on, false)
-  notify(on and 'Noclip activé' or 'Noclip désactivé')
+  if on then
+    local veh = GetVehiclePedIsIn(ped, false)
+    ncEnt = (veh ~= 0) and veh or ped
+  end
+  local e = ncEnt or ped
+  if not DoesEntityExist(e) then e = ped end
+  SetEntityCollision(e, not on, not on)
+  FreezeEntityPosition(e, on)
+  if e == ped then SetEntityVisible(ped, not on, false) end
+  if not on then
+    ncEnt = nil
+    if e ~= ped then SetVehicleOnGroundProperly(e) end
+  end
+  notify(on and string.format('Noclip activé (%.1f m/s, molette pour changer)', ncSpeed) or 'Noclip désactivé')
 end
+
+local function setSpeed(v, quiet)
+  ncSpeed = math.max(0.1, math.min(1000.0, v))
+  if not quiet then notify(string.format('Vitesse du noclip : %.1f m/s', ncSpeed)) end
+end
+
+local function stepSpeed(dir)
+  local i = 1
+  for k, v in ipairs(NC_SPEEDS) do if v <= ncSpeed + 0.001 then i = k end end
+  -- entre deux crans : vers le bas, on part du cran au-dessus
+  if dir < 0 and NC_SPEEDS[i] < ncSpeed - 0.001 then i = i + 1 end
+  i = math.max(1, math.min(#NC_SPEEDS, i + dir))
+  setSpeed(NC_SPEEDS[i])
+end
+
+-- vitesse de départ : réglage de DragoWalker (dw_noclip_speed), suivi s'il change pendant le jeu
+CreateThread(function()
+  while true do
+    local c = GetConvar('dw_noclip_speed', '10')
+    if c ~= ncConvar then
+      local first = ncConvar == nil
+      ncConvar = c
+      setSpeed(tonumber(c) or 10.0, first)
+    end
+    Wait(1000)
+  end
+end)
+
+RegisterCommand('dw_speed', function(_, args)
+  local v = tonumber(args[1])
+  if v then setSpeed(v) else notify(string.format('Vitesse du noclip : %.1f m/s (/dw_speed 25 pour la changer)', ncSpeed)) end
+end, false)
 
 -- on ne meurt jamais : invincible, et ramené au dernier endroit sûr si on tombe dans le vide ou si on meurt
 local lastSafe = nil
@@ -952,19 +1017,29 @@ CreateThread(function()
 end)
 
 RegisterCommand('dw_noclip', function() setNoclip(not noclip) end, false)
+RegisterCommand('noclip', function() setNoclip(not noclip) end, false)
 RegisterKeyMapping('dw_noclip', 'DragoWalker : noclip', 'keyboard', 'F2')
 
 CreateThread(function()
   while true do
     if noclip then
       local ped = PlayerPedId()
-      local p = GetEntityCoords(ped)
+      local ent = ncEnt
+      if not ent or not DoesEntityExist(ent) then ent = ped end
+      local p = GetEntityCoords(ent)
       local rot = GetGameplayCamRot(2)
       local h = math.rad(rot.z)
       local pitch = math.rad(rot.x)
       local fx, fy, fz = -math.sin(h) * math.cos(pitch), math.cos(h) * math.cos(pitch), math.sin(pitch)
       local rx, ry = math.cos(h), math.sin(h)
-      local speed = IsControlPressed(0, 21) and 3.0 or 0.6
+      -- molette (sans ouvrir la roue des armes) ou Page préc. / Page suiv. : vitesse
+      for _, c in ipairs({14, 15, 16, 17, 37, 99, 115, 116}) do DisableControlAction(0, c, true) end
+      if IsDisabledControlJustPressed(0, 15) or IsDisabledControlJustPressed(0, 241) or IsControlJustPressed(0, 10) then stepSpeed(1) end
+      if IsDisabledControlJustPressed(0, 14) or IsDisabledControlJustPressed(0, 242) or IsControlJustPressed(0, 11) then stepSpeed(-1) end
+      local mult = 1.0
+      if IsControlPressed(0, 21) then mult = 4.0 end
+      if IsControlPressed(0, 19) then mult = 0.25 end
+      local speed = ncSpeed * mult * GetFrameTime()
       local dx, dy, dz = 0.0, 0.0, 0.0
       if IsControlPressed(0, 32) then dx, dy, dz = dx + fx, dy + fy, dz + fz end
       if IsControlPressed(0, 33) then dx, dy, dz = dx - fx, dy - fy, dz - fz end
@@ -972,8 +1047,8 @@ CreateThread(function()
       if IsControlPressed(0, 35) then dx, dy = dx + rx, dy + ry end
       if IsControlPressed(0, 22) then dz = dz + 1.0 end
       if IsControlPressed(0, 36) then dz = dz - 1.0 end
-      SetEntityCoordsNoOffset(ped, p.x + dx * speed, p.y + dy * speed, p.z + dz * speed, true, true, true)
-      SetEntityHeading(ped, rot.z)
+      SetEntityCoordsNoOffset(ent, p.x + dx * speed, p.y + dy * speed, p.z + dz * speed, true, true, true)
+      SetEntityHeading(ent, rot.z)
       Wait(0)
     else
       Wait(250)
@@ -996,7 +1071,7 @@ CreateThread(function()
       SetTextColour(255, 255, 255, 230)
       SetTextOutline()
       BeginTextCommandDisplayText('STRING')
-      AddTextComponentSubstringPlayerName('x, y, z, cap : ' .. coordsText() .. (noclip and '   (noclip)' or ''))
+      AddTextComponentSubstringPlayerName('x, y, z, cap : ' .. coordsText() .. (noclip and string.format('   (noclip %.1f m/s)', ncSpeed) or ''))
       EndTextCommandDisplayText(0.015, 0.012)
       Wait(0)
     else
@@ -1028,6 +1103,81 @@ RegisterCommand('tpm', function()
 end, false)
 
 RegisterCommand('dw_home', function() teleport(spawnPoint()) end, false)
+
+-- véhicules : /car nom (le précédent sorti par /car est retiré), /dv, /fix
+RegisterCommand('car', function(_, args)
+  local name = args[1]
+  if not name or name == '' then notify('Utilisation : /car nom (ex. /car adder, /car police3, /car sanchez)') return end
+  local model = GetHashKey(name)
+  if not IsModelInCdimage(model) or not IsModelAVehicle(model) then notify('Véhicule inconnu : ' .. name) return end
+  RequestModel(model)
+  local t = GetGameTimer()
+  while not HasModelLoaded(model) and GetGameTimer() - t < 10000 do Wait(10) end
+  if not HasModelLoaded(model) then notify('Le modèle ne se charge pas : ' .. name) return end
+  if noclip then setNoclip(false) end
+  local ped = PlayerPedId()
+  local p = GetEntityCoords(ped)
+  local h = GetEntityHeading(ped)
+  if lastCar and DoesEntityExist(lastCar) then
+    SetEntityAsMissionEntity(lastCar, true, true)
+    DeleteVehicle(lastCar)
+  end
+  local veh = CreateVehicle(model, p.x, p.y, p.z + 0.5, h, true, false)
+  SetModelAsNoLongerNeeded(model)
+  if veh == 0 then notify('Impossible de créer ' .. name) return end
+  SetVehicleOnGroundProperly(veh)
+  SetEntityAsMissionEntity(veh, true, true)
+  SetVehicleNumberPlateText(veh, 'DRAGO')
+  SetVehicleDirtLevel(veh, 0.0)
+  SetVehicleEngineOn(veh, true, true, false)
+  SetVehRadioStation(veh, 'OFF')
+  SetPedIntoVehicle(ped, veh, -1)
+  lastCar = veh
+  notify('Véhicule : ' .. name .. ' (/dv pour le retirer)')
+end, false)
+
+RegisterCommand('dv', function()
+  local ped = PlayerPedId()
+  local veh = GetVehiclePedIsIn(ped, false)
+  if veh == 0 then veh = GetVehiclePedIsIn(ped, true) end
+  if veh == 0 and lastCar and DoesEntityExist(lastCar) then veh = lastCar end
+  if veh == 0 then notify('Pas de véhicule à retirer') return end
+  SetEntityAsMissionEntity(veh, true, true)
+  DeleteVehicle(veh)
+  if veh == lastCar then lastCar = nil end
+  notify('Véhicule retiré')
+end, false)
+
+RegisterCommand('fix', function()
+  local veh = GetVehiclePedIsIn(PlayerPedId(), false)
+  if veh == 0 then notify('Monte dans un véhicule') return end
+  SetVehicleFixed(veh)
+  SetVehicleDeformationFixed(veh)
+  SetVehicleDirtLevel(veh, 0.0)
+  SetVehicleEngineHealth(veh, 1000.0)
+  notify('Véhicule réparé')
+end, false)
+
+-- T : taper une commande (le serveur de test n'a pas de chat) ; « /car adder » ou « car adder »
+AddTextEntry('DW_CMD', 'Commande DragoWalker (ex. /car adder, /tp 0 0 72, /dw_speed 25)')
+local typing = false
+RegisterCommand('dw_cmd', function()
+  if typing then return end
+  typing = true
+  DisplayOnscreenKeyboard(1, 'DW_CMD', '', '/', '', '', '', 80)
+  while UpdateOnscreenKeyboard() == 0 do
+    DisableAllControlActions(0)
+    Wait(0)
+  end
+  local ok = UpdateOnscreenKeyboard() == 1
+  local txt = ok and GetOnscreenKeyboardResult() or nil
+  typing = false
+  if txt then
+    txt = txt:gsub('^%s*/', ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if txt ~= '' then ExecuteCommand(txt) end
+  end
+end, false)
+RegisterKeyMapping('dw_cmd', 'DragoWalker : taper une commande (/car, /tp…)', 'keyboard', 'T')
 RegisterNetEvent('dw:tp', function(x, y, z) teleport(x + 0.0, y + 0.0, z + 0.0) end)
 
 -- rechargement de la zone : le jeu libère collisions et intérieur pendant que la map est relancée
@@ -1051,7 +1201,7 @@ RegisterNetEvent('dw:done', function()
   teleport(p.x, p.y, p.z)
   local int = GetInteriorAtCoords(p.x, p.y, p.z)
   if int ~= 0 then RefreshInterior(int) end
-  FreezeEntityPosition(ped, noclip)
+  FreezeEntityPosition(ncEnt or ped, noclip)
   DoScreenFadeIn(300)
   notify('Map rechargée')
 end)

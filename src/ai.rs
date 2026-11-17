@@ -89,10 +89,40 @@ fn pattern_point() -> String {
     "point".into()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatLine {
     pub from_user: bool,
     pub text: String,
+    /// images jointes (PNG rangés avec la conversation, chats.rs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+}
+
+/// Au plus tant d'images envoyées à l'IA par demande (les plus récentes).
+const MAX_IMAGES: usize = 5;
+
+/// Images à envoyer : celles des 12 derniers messages, les plus récentes d'abord gardées. Rend, pour chaque
+/// message de la fenêtre, ses images à joindre (base64 PNG).
+fn images_for(window: &[&ChatLine]) -> Vec<Vec<String>> {
+    let mut left = MAX_IMAGES;
+    let mut out = vec![Vec::new(); window.len()];
+    for (i, l) in window.iter().enumerate().rev() {
+        for p in l.images.iter().rev() {
+            if left == 0 {
+                break;
+            }
+            if let Some(b) = crate::chats::image_b64(p) {
+                out[i].insert(0, b);
+                left -= 1;
+            }
+        }
+    }
+    out
+}
+
+/// Images du dernier message de la personne (base64 PNG), pour Claude Code.
+fn last_user_images(history: &[ChatLine]) -> Vec<String> {
+    history.iter().rev().find(|l| l.from_user).map(|l| l.images.iter().filter_map(|p| crate::chats::image_b64(p)).take(MAX_IMAGES).collect()).unwrap_or_default()
 }
 
 pub struct AiReply {
@@ -365,19 +395,25 @@ fn call_claude(api_key: &str, history: &[ChatLine], scene: &str) -> Result<AiRep
         scene
     );
     let mut messages: Vec<Value> = Vec::new();
-    for l in history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+    let window: Vec<&ChatLine> = history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+    let imgs = images_for(&window);
+    for (l, im) in window.iter().zip(imgs) {
         let role = if l.from_user { "user" } else { "assistant" };
+        let mut blocks: Vec<Value> = if l.from_user { im.into_iter().map(|b| json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b}})).collect() } else { Vec::new() };
+        let text = if l.text.trim().is_empty() { "(image)".to_string() } else { l.text.clone() };
+        blocks.push(json!({"type": "text", "text": text}));
         if let Some(last) = messages.last_mut() {
             if last["role"] == role {
-                let prev = last["content"].as_str().unwrap_or("").to_string();
-                last["content"] = Value::String(format!("{prev}\n{}", l.text));
+                if let Some(a) = last["content"].as_array_mut() {
+                    a.extend(blocks);
+                }
                 continue;
             }
         }
         if messages.is_empty() && role == "assistant" {
             continue;
         }
-        messages.push(json!({"role": role, "content": l.text}));
+        messages.push(json!({"role": role, "content": blocks}));
     }
     let body = json!({
         "model": MODEL,
@@ -514,6 +550,8 @@ pub struct AiConfig {
     pub oa_model: String,
     /// commande complète, la demande est envoyée sur l'entrée standard (ex. « gemini -p », « ollama run llama3.1 »)
     pub cli_cmd: String,
+    /// Claude Code en mode agent : adresse du serveur MCP de DragoWalker et dossier du plugin (skills)
+    pub agent: Option<(String, std::path::PathBuf)>,
 }
 
 /// Claude Code : dans le PATH ou dans %USERPROFILE%\.local\bin.
@@ -570,13 +608,16 @@ fn transcript(history: &[ChatLine]) -> String {
     for l in history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
         s += if l.from_user { "Utilisateur : " } else { "Assistant : " };
         s += &l.text;
+        if !l.images.is_empty() {
+            s += &format!(" [{} image(s) jointe(s)]", l.images.len());
+        }
         s.push('\n');
     }
     s
 }
 
 /// Lit { message, actions } (objet JSON, ou premier objet trouvé dans un texte).
-fn reply_from_json(v: &Value) -> AiReply {
+pub(crate) fn reply_from_json(v: &Value) -> AiReply {
     let mut message = v["message"].as_str().unwrap_or("").to_string();
     let mut actions = Vec::new();
     if let Some(list) = v["actions"].as_array() {
@@ -650,8 +691,67 @@ fn run_cmd(mut cmd: std::process::Command, input: &str, timeout_s: u64) -> Resul
     }
 }
 
+/// Consignes de l'assistant en mode agent (une ligne : passées en argument, même à un .cmd).
+fn agent_prompt(scene: &str) -> String {
+    one_line(&format!(
+        "Tu es l'assistant intégré de DragoWalker, un éditeur de cartes GTA V et d'intérieurs MLO pour des créateurs de serveurs FiveM. \
+         Tu agis directement dans l'application avec les outils mcp__dragowalker__* (lire la scène, chercher des modèles, créer et aménager des intérieurs, poser, déplacer, regarder avec screenshot, annuler). \
+         Sers-toi des skills dragowalker-* pour la marche à suivre. Ne pose que des modèles trouvés avec search_props. Vérifie ce que tu fais avec screenshot quand c'est visible. \
+         Tu n'as pas d'autres outils : pas de fichiers ni de commandes. À la fin, réponds en français, en quelques phrases simples : ce que tu as fait, et ce que la personne peut retoucher ou tester. \
+         État actuel : {scene}"
+    ))
+}
+
+/// Claude Code en mode agent : outils du serveur MCP de DragoWalker et skills du plugin ; il agit pendant qu'il
+/// réfléchit (les modifications arrivent dans l'application au fil de l'eau), la réponse est son compte rendu.
+fn call_claude_agent(cfg: &AiConfig, url: &str, plugin: &std::path::Path, history: &[ChatLine], scene: &str) -> Result<AiReply, String> {
+    let exe = cfg.claude_code.clone().or_else(find_claude_code).ok_or("Claude Code est introuvable sur ce PC (commande « claude »).")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["-p", "--output-format", "json", "--tools", "Skill", "--no-session-persistence", "--strict-mcp-config"]);
+    cmd.arg("--mcp-config").arg(crate::mcp::mcp_config(url));
+    cmd.arg("--plugin-dir").arg(plugin);
+    cmd.arg("--allowedTools").arg("mcp__dragowalker Skill");
+    cmd.arg("--append-system-prompt").arg(agent_prompt(scene));
+    if !cfg.cc_model.trim().is_empty() {
+        cmd.arg("--model").arg(one_line(cfg.cc_model.trim()));
+    }
+    let input = format!("{}\nFais ce que demande le dernier message de l'utilisateur.", transcript(history));
+    let v = run_claude(cmd, &input, &last_user_images(history), 1800)?;
+    let message = v["result"].as_str().unwrap_or("").trim().to_string();
+    Ok(AiReply { message: if message.is_empty() { "C'est fait.".into() } else { message }, actions: Vec::new() })
+}
+
+/// Lance Claude Code (`-p --output-format json` déjà dans `cmd`) et rend son résultat. Avec des images : la demande
+/// passe en message JSON (`--input-format stream-json`, blocs texte + images), la réponse en flux JSON dont on
+/// garde la ligne « result » (même contenu que `--output-format json`).
+fn run_claude(mut cmd: std::process::Command, input: &str, images: &[String], timeout_s: u64) -> Result<Value, String> {
+    let fail = |out: &str, err: &str| {
+        let msg = if err.trim().is_empty() { out.trim().to_string() } else { err.trim().to_string() };
+        format!("Claude Code : {}", msg.chars().take(400).collect::<String>())
+    };
+    let v: Value = if images.is_empty() {
+        let (out, err, _ok) = run_cmd(cmd, input, timeout_s)?;
+        serde_json::from_str(out.trim()).map_err(|_| fail(&out, &err))?
+    } else {
+        // la dernière « --output-format » l'emporte
+        cmd.args(["--output-format", "stream-json", "--verbose", "--input-format", "stream-json"]);
+        let mut content = vec![json!({"type": "text", "text": input})];
+        content.extend(images.iter().map(|b| json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b}})));
+        let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
+        let (out, err, _ok) = run_cmd(cmd, &format!("{line}\n"), timeout_s)?;
+        out.lines().rev().filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok()).find(|v| v["type"] == "result").ok_or_else(|| fail(&out, &err))?
+    };
+    if v["is_error"] == true {
+        return Err(format!("Claude Code : {}", v["result"].as_str().unwrap_or("erreur")));
+    }
+    Ok(v)
+}
+
 /// Claude Code en mode non interactif : aucun outil, réponse structurée selon le schéma.
 fn call_claude_code(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiReply, String> {
+    if let Some((url, plugin)) = &cfg.agent {
+        return call_claude_agent(cfg, url, plugin, history, scene);
+    }
     let exe = cfg.claude_code.clone().or_else(find_claude_code).ok_or("Claude Code est introuvable sur ce PC (commande « claude »).")?;
     // claude.cmd (installé par npm) : Windows refuse un argument de fichier .cmd qui contient un retour à la ligne ;
     // les consignes passent alors avec la demande, sur l'entrée standard
@@ -669,14 +769,7 @@ fn call_claude_code(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result
     if batch {
         input = format!("Consignes :\n{}\n\nConversation :\n{input}", system_prompt(scene));
     }
-    let (out, err, _ok) = run_cmd(cmd, &input, 240)?;
-    let v: Value = serde_json::from_str(out.trim()).map_err(|_| {
-        let msg = if err.trim().is_empty() { out.trim().to_string() } else { err.trim().to_string() };
-        format!("Claude Code : {}", msg.chars().take(400).collect::<String>())
-    })?;
-    if v["is_error"] == true {
-        return Err(format!("Claude Code : {}", v["result"].as_str().unwrap_or("erreur")));
-    }
+    let v = run_claude(cmd, &input, &last_user_images(history), 240)?;
     if v["structured_output"].is_object() {
         return Ok(reply_from_json(&v["structured_output"]));
     }
@@ -690,8 +783,16 @@ fn call_openai(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiRe
         return Err("Indique l'adresse et le modèle de l'API dans les réglages de l'IA.".into());
     }
     let mut messages = vec![json!({"role": "system", "content": format!("{}\n\nRéponds UNIQUEMENT par un objet JSON de ce schéma : {}", system_prompt(scene), reply_schema())})];
-    for l in history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
-        messages.push(json!({"role": if l.from_user { "user" } else { "assistant" }, "content": l.text}));
+    let window: Vec<&ChatLine> = history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+    let imgs = images_for(&window);
+    for (l, im) in window.iter().zip(imgs) {
+        if l.from_user && !im.is_empty() {
+            let mut parts = vec![json!({"type": "text", "text": l.text})];
+            parts.extend(im.into_iter().map(|b| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b}")}})));
+            messages.push(json!({"role": "user", "content": parts}));
+        } else {
+            messages.push(json!({"role": if l.from_user { "user" } else { "assistant" }, "content": l.text}));
+        }
     }
     let body = json!({"model": cfg.oa_model.trim(), "messages": messages, "response_format": {"type": "json_object"}});
     let mut req = ureq::post(&format!("{base}/chat/completions")).set("content-type", "application/json").timeout(std::time::Duration::from_secs(180));
@@ -717,12 +818,15 @@ fn call_cli(cfg: &AiConfig, history: &[ChatLine], scene: &str) -> Result<AiReply
     }
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
-    let input = format!(
+    let mut input = format!(
         "{}\n\nRéponds UNIQUEMENT par un objet JSON de ce schéma, sans autre texte : {}\n\nConversation :\n{}",
         system_prompt(scene),
         reply_schema(),
         transcript(history)
     );
+    if let Some(l) = history.iter().rev().find(|l| l.from_user && !l.images.is_empty()) {
+        input += &format!("\nImages jointes (fichiers) : {}", l.images.join(" ; "));
+    }
     let (out, err, ok) = run_cmd(cmd, &input, 300)?;
     if !ok && out.trim().is_empty() {
         return Err(format!("La commande a échoué : {}", err.trim().chars().take(300).collect::<String>()));
@@ -836,5 +940,25 @@ mod tests {
     fn json_action() {
         let a: Action = serde_json::from_str(r#"{"action":"delete_radius","radius":12}"#).unwrap();
         assert_eq!(a, Action::DeleteRadius { radius: 12.0, filter: String::new() });
+    }
+}
+
+#[cfg(test)]
+mod tests_images {
+    use super::*;
+
+    /// Image envoyée à Claude Code (installé) : `cargo test -- --ignored image_claude_code`.
+    #[test]
+    #[ignore]
+    fn image_claude_code() {
+        let dir = std::env::temp_dir().join("dw_test_chat_img");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("rouge.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([220, 20, 20, 255])).save(&p).unwrap();
+        let cfg = AiConfig { provider: Provider::ClaudeCode, claude_key: String::new(), claude_code: None, cc_model: "haiku".into(), oa_base: String::new(), oa_key: String::new(), oa_model: String::new(), cli_cmd: String::new(), agent: None };
+        let h = vec![ChatLine { from_user: true, text: "De quelle couleur est l'image jointe ? Un seul mot dans message, aucune action.".into(), images: vec![p.to_string_lossy().to_string()] }];
+        let r = call_claude_code(&cfg, &h, "(test)").unwrap();
+        println!("réponse : {}", r.message);
+        assert!(r.message.to_lowercase().contains("rouge"));
     }
 }

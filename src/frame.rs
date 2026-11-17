@@ -18,6 +18,8 @@ impl DwApp {
         self.test_hooks();
         self.shot_wait_models();
         self.poll_ai_reply();
+        self.mcp_tick(ctx);
+        self.chat_shot_tick(ctx);
         self.screenshot_tick(ctx);
         self.shortcuts(ctx);
         self.top_bars(ctx);
@@ -84,7 +86,7 @@ impl DwApp {
                         }
                         // repli sur l'interpréteur local
                         let last = self.chat.iter().rev().find(|l| l.from_user).map(|l| l.text.clone()).unwrap_or_default();
-                        self.chat.push(ChatLine { from_user: false, text: format!("{e}\nJe passe par l'interpréteur local.") });
+                        self.chat.push(ChatLine { from_user: false, text: format!("{e}\nJe passe par l'interpréteur local."), images: vec![] });
                         let r = ai::local_parse(&last);
                         self.apply_reply(r);
                     }

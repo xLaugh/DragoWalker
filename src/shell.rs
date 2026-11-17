@@ -40,6 +40,9 @@ pub fn shell_name(mlo: &str, ri: usize) -> String {
 /// Chaque triangle : (3 sommets, normale vers l'intérieur de la pièce).
 pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
     let Some(r) = m.rooms.get(ri) else { return Vec::new() };
+    if r.game {
+        return Vec::new();
+    }
     let (a, b) = (r.bb_min, r.bb_max);
     let mut out = Vec::new();
     // trémies : portails horizontaux de cette pièce au niveau de son sol ou de son plafond (passage entre étages)

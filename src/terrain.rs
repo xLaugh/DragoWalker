@@ -10,8 +10,10 @@ use crate::math::{v3, V3};
 use eframe::egui::{self, Color32, PointerButton, Pos2, RichText};
 use serde::{Deserialize, Serialize};
 
-/// Matériaux du terrain : nom et couleur de base.
-pub const MATERIALS: [(&str, [u8; 3]); 7] = [
+/// Matériaux du terrain : nom et couleur de base. Les 7 premiers ont une texture DragoWalker (ou celle du jeu avec
+/// « Vraies textures du jeu ») ; les suivants (à partir de GAME_ONLY) sont toujours des textures du sol de GTA V
+/// (groundtex::MAP) : la couleur ne sert qu'à l'aperçu quand le jeu n'est pas chargé.
+pub const MATERIALS: [(&str, [u8; 3]); 24] = [
     ("Sable", [214, 196, 150]),
     ("Terre", [128, 96, 66]),
     ("Herbe", [92, 128, 64]),
@@ -19,8 +21,62 @@ pub const MATERIALS: [(&str, [u8; 3]); 7] = [
     ("Béton", [170, 170, 165]),
     ("Goudron", [52, 54, 58]),
     ("Route", [64, 66, 70]),
+    ("Gravier", [150, 142, 130]),
+    ("Gravier et terre", [140, 120, 96]),
+    ("Piste du désert", [180, 150, 110]),
+    ("Terre sombre", [72, 68, 64]),
+    ("Béton brut", [150, 150, 146]),
+    ("Herbe de champ", [110, 128, 70]),
+    ("Herbe clairsemée", [140, 130, 86]),
+    ("Gazon", [80, 120, 56]),
+    ("Sol de forêt", [86, 74, 52]),
+    ("Terre de forêt", [110, 96, 74]),
+    ("Berge boueuse", [92, 80, 62]),
+    ("Pierres moussues", [96, 96, 80]),
+    ("Dalle rocheuse", [140, 136, 126]),
+    ("Schiste herbeux", [110, 116, 88]),
+    ("Neige", [232, 236, 240]),
+    ("Dune herbeuse", [200, 190, 140]),
+    ("Roche sombre", [70, 66, 62]),
 ];
 const ROAD: u8 = 6;
+/// Premier matériau qui est toujours une texture du jeu.
+pub const GAME_ONLY: usize = 7;
+/// Numéro de matériau des cases à partir duquel ce sont les textures importées du terrain (100 + rang).
+pub const CUSTOM_MAT: u8 = 100;
+
+/// Texture importée pour le terrain : nom, image PNG (base64, au plus 512 px de côté), surface au toucher
+/// (matériau de MATERIALS dont elle prend la collision : sable, herbe, roche…).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TerrainTex {
+    pub name: String,
+    pub png: String,
+    #[serde(default)]
+    pub surf: u8,
+}
+
+/// Clé de texture d'une texture importée du terrain (d'après son nom : stable d'un export à l'autre).
+pub fn custom_tex_key(name: &str) -> u64 {
+    (crate::design::custom_key(name) & 0xFFFF_FFFF) | 0xD7E3_0000_0000_0000
+}
+
+/// Image d'une texture importée (décodée une fois, gardée par clé).
+fn custom_tex_data(t: &TerrainTex) -> TexData {
+    static CACHE: std::sync::RwLock<Option<std::collections::HashMap<(u64, usize), TexData>>> = std::sync::RwLock::new(None);
+    let k = (custom_tex_key(&t.name), t.png.len());
+    if let Some(d) = CACHE.read().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&k).cloned())) {
+        return d;
+    }
+    let d = crate::design::b64_png_tex(&t.png).unwrap_or_else(|| material_texture(1));
+    if let Ok(mut g) = CACHE.write() {
+        g.get_or_insert_with(Default::default).insert(k, d.clone());
+    }
+    d
+}
+
+/// Bout de route posé à moins de tant de mètres du bord extérieur d'une autre route (trottoir compris) : accroché à
+/// son axe (carrefour en T) — choix de DragoWalker.
+const AXIS_SNAP: f32 = 3.0;
 
 /// Dictionnaire de textures partagé par toutes les tuiles du terrain exporté.
 pub const TERRAIN_TXD: &str = "dw_terrain_txd";
@@ -75,6 +131,9 @@ pub struct Terrain {
     /// cases retirées (ni dessinées ni solides) : entrées des tunnels
     #[serde(default)]
     pub holes: Vec<u32>,
+    /// textures importées (cases de matériau CUSTOM_MAT + rang)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<TerrainTex>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,6 +187,15 @@ pub struct TerrainState {
     /// modèle de départ choisi et graine du hasard
     pub preset: u8,
     pub seed: u32,
+    /// « en île » : les bords du terrain descendent dans la mer
+    pub island: bool,
+    /// composer par zones : un modèle par case d'une grille 3 × 3 (-1 = rien), fond en mer ou en plaine, zones
+    /// reliées par des bandes de terre ; aperçu (réglages, image)
+    pub compose: bool,
+    pub zones: [i8; 9],
+    pub sea_bg: bool,
+    pub link: bool,
+    pub preview: Option<(String, egui::TextureHandle)>,
     /// type de route et points déjà cliqués de la route en cours
     pub road_kind: u8,
     pub road_pts: Vec<V3>,
@@ -188,6 +256,12 @@ impl Default for TerrainState {
             section: 0,
             preset: 1,
             seed: 1,
+            island: false,
+            compose: false,
+            zones: [-1, 1, -1, -1, 4, 2, -1, -1, -1],
+            sea_bg: true,
+            link: true,
+            preview: None,
             road_kind: 0,
             road_pts: Vec::new(),
             road_bridge: false,
@@ -242,69 +316,290 @@ fn wnoise(x: f32, y: f32, scale: f32, octaves: u32, seed: u32) -> f32 {
     s / tot
 }
 
+fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Hauteur d'un modèle de départ au point (x, y), pour une zone de centre `zc` et de côté `zsize` (Île, Canyon,
+/// Vallée se placent par rapport à la zone ; les autres sont des bruits du monde, raccordés d'une zone à l'autre).
+pub fn preset_height(preset: u8, x: f32, y: f32, zc: V3, zsize: f32, s: u32, base: f32) -> f32 {
+    let (lx, ly) = ((x - zc.x) / zsize, (y - zc.y) / zsize);
+    let n = |sc: f32, o: u32| wnoise(x, y, sc, o, s);
+    match preset {
+        0 => base,
+        1 => base + (n(160.0, 4) - 0.35) * 40.0,
+        2 => {
+            let r = 1.0 - (2.0 * n(260.0, 5) - 1.0).abs();
+            base + r * r * 150.0 + (n(60.0, 3) - 0.5) * 12.0
+        }
+        3 => {
+            let a = 0.6f32;
+            let t = (x * a.cos() + y * a.sin()) / 38.0 + n(140.0, 3) * 4.0;
+            let wave = t.fract();
+            // dune : pente douce au vent, raide sous le vent
+            let prof = if wave < 0.75 { wave / 0.75 } else { (1.0 - wave) / 0.25 };
+            base + prof * (8.0 + n(220.0, 2) * 10.0) + (n(30.0, 2) - 0.5) * 2.0
+        }
+        4 => {
+            let d = (lx * lx + ly * ly).sqrt() / 0.42;
+            -10.0 + (1.0 - d * d) * 32.0 + (n(80.0, 4) - 0.5) * 14.0
+        }
+        5 => -7.0 + (n(110.0, 4) - 0.48).max(0.0) * 140.0,
+        6 => {
+            let cx = (ly * 9.0).sin() * 0.14 + (n(300.0, 2) - 0.5) * 0.1;
+            let d = ((lx - cx).abs() * zsize - 18.0).max(0.0);
+            let wall = (d / 40.0).min(1.0);
+            let wall = wall * wall * (3.0 - 2.0 * wall);
+            base + wall * 45.0 + (n(90.0, 3) - 0.5) * 6.0
+        }
+        7 => {
+            let rx = (ly * 6.0).sin() * 0.08;
+            let d = (lx - rx).abs() * zsize;
+            let bed = if d < 14.0 { -3.0 } else { -3.0 + ((d - 14.0) / 10.0).min(1.0) * 5.0 };
+            bed + ((d - 24.0).max(0.0) * 0.18).min(70.0) * (0.6 + n(150.0, 3) * 0.8)
+        }
+        _ => {
+            let v = n(200.0, 4);
+            let step = (v * 5.0).floor() / 5.0;
+            let edge = ((v * 5.0).fract() - 0.85).max(0.0) / 0.15;
+            base + (step + edge * 0.2) * 70.0 + (n(25.0, 2) - 0.5) * 1.5
+        }
+    }
+}
+
+/// Image vue de dessus (nord en haut) du relief que donneraient ces réglages, sur `n` × `n` points.
+pub fn gen_preview(spec: &GenSpec, c: V3, real: f32, n: usize) -> egui::ColorImage {
+    let field = GenField::new(spec, c, real);
+    let mut hs = vec![(0.0f32, 0.0f32); n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let x = c.x - real * 0.5 + (i as f32 + 0.5) / n as f32 * real;
+            // nord en haut de l'image
+            let y = c.y + real * 0.5 - (j as f32 + 0.5) / n as f32 * real;
+            hs[j * n + i] = if spec.compose || spec.island || spec.preset != 0 { field.at(x, y) } else { (spec.base, 0.0) };
+        }
+    }
+    let mut img = egui::ColorImage::new([n, n], Color32::BLACK);
+    for j in 0..n {
+        for i in 0..n {
+            let (h, d) = hs[j * n + i];
+            // ombrage : pente vers le nord-ouest
+            let hl = hs[j * n + i.saturating_sub(1)].0;
+            let hu = hs[j.saturating_sub(1) * n + i].0;
+            let shade = (1.0 + ((hl - h) + (hu - h)) / (real / n as f32) * 0.35).clamp(0.55, 1.35);
+            let col = if h < 0.0 {
+                let k = (-h / 12.0).clamp(0.0, 1.0);
+                [(60.0 - 30.0 * k) as f32, (130.0 - 50.0 * k) as f32, (185.0 - 40.0 * k) as f32]
+            } else if h < 1.6 {
+                [214.0, 196.0, 150.0]
+            } else if h > 90.0 {
+                [140.0, 136.0, 128.0]
+            } else {
+                let g = [92.0, 128.0, 64.0];
+                let sand = [200.0, 176.0, 128.0];
+                let k = (h / 90.0).clamp(0.0, 1.0);
+                let base = [g[0] + (sand[0] - g[0]) * d, g[1] + (sand[1] - g[1]) * d, g[2] + (sand[2] - g[2]) * d];
+                [base[0] + (130.0 - base[0]) * k * 0.6, base[1] + (115.0 - base[1]) * k * 0.6, base[2] + (100.0 - base[2]) * k * 0.6]
+            };
+            let sh = if h < 0.0 { 1.0 } else { shade };
+            img[(i, j)] = Color32::from_rgb((col[0] * sh).clamp(0.0, 255.0) as u8, (col[1] * sh).clamp(0.0, 255.0) as u8, (col[2] * sh).clamp(0.0, 255.0) as u8);
+        }
+    }
+    img
+}
+
+/// Fond de la mer (m) : sous le niveau de l'eau du jeu (0), assez pour que l'eau se voie.
+const SEA_FLOOR: f32 = -10.0;
+
+/// Réglages de la partie Créer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenSpec {
+    pub preset: u8,
+    pub seed: u32,
+    pub base: f32,
+    pub island: bool,
+    /// zones (grille 3 × 3, de gauche à droite puis du nord au sud ; -1 = rien) au lieu d'un seul modèle
+    pub compose: bool,
+    pub zones: [i8; 9],
+    pub sea_bg: bool,
+    pub link: bool,
+}
+
+impl Default for GenSpec {
+    fn default() -> Self {
+        GenSpec { preset: 1, seed: 1, base: 2.0, island: false, compose: false, zones: [-1; 9], sea_bg: true, link: true }
+    }
+}
+
+/// Relief prêt à calculer : zones placées et bandes de terre qui les relient.
+pub struct GenField {
+    spec: GenSpec,
+    c: V3,
+    size: f32,
+    s: u32,
+    zones: Vec<(u8, V3)>,
+    links: Vec<(V3, V3)>,
+}
+
+impl GenField {
+    pub fn new(spec: &GenSpec, c: V3, size: f32) -> GenField {
+        let cell = size / 3.0;
+        let zones: Vec<(u8, V3)> = if spec.compose {
+            spec.zones
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| **p >= 0)
+                .map(|(k, p)| {
+                    let (gx, gy) = ((k % 3) as f32 - 1.0, 1.0 - (k / 3) as f32);
+                    (*p as u8, v3(c.x + gx * cell, c.y + gy * cell, 0.0))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // liaisons : arbre le plus court entre les zones (Prim) ; deux zones voisines sont déjà raccordées
+        let mut links = Vec::new();
+        if spec.compose && spec.link && zones.len() > 1 {
+            let mut inside = vec![false; zones.len()];
+            inside[0] = true;
+            for _ in 1..zones.len() {
+                let mut best: Option<(f32, usize, usize)> = None;
+                for a in (0..zones.len()).filter(|a| inside[*a]) {
+                    for b in (0..zones.len()).filter(|b| !inside[*b]) {
+                        let d = (zones[a].1 - zones[b].1).len();
+                        if best.is_none_or(|x| d < x.0) {
+                            best = Some((d, a, b));
+                        }
+                    }
+                }
+                let Some((_, a, b)) = best else { break };
+                inside[b] = true;
+                links.push((zones[a].1, zones[b].1));
+            }
+        }
+        GenField { spec: spec.clone(), c, size, s: spec.seed.wrapping_mul(7919), zones, links }
+    }
+
+    /// Hauteur et part de désert (0..1) au point (x, y).
+    pub fn at(&self, x: f32, y: f32) -> (f32, f32) {
+        let sp = &self.spec;
+        let n = |sc: f32, o: u32, k: u32| wnoise(x, y, sc, o, self.s ^ k);
+        let desert_of = |p: u8| PRESETS[(p as usize).min(PRESETS.len() - 1)].2 as f32;
+        let (mut h, desert) = if !sp.compose {
+            (preset_height(sp.preset, x, y, self.c, self.size, self.s, sp.base), desert_of(sp.preset))
+        } else {
+            let cell = self.size / 3.0;
+            let (mut sw, mut sh, mut sd, mut wmax) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for (p, zc) in &self.zones {
+                // case arrondie, bord irrégulier ; recouvre un peu ses voisines pour un raccord en douceur
+                let (dx, dy) = ((x - zc.x).abs() / (cell * 0.5), (y - zc.y).abs() / (cell * 0.5));
+                let d = (dx.powi(3) + dy.powi(3)).powf(1.0 / 3.0) + (n(cell * 0.6, 3, 0x51) - 0.5) * 0.7 + (n(cell * 0.2, 2, 0x52) - 0.5) * 0.25;
+                let w = smooth(1.55, 0.55, d);
+                if w <= 0.0 {
+                    continue;
+                }
+                sw += w;
+                sh += w * preset_height(*p, x, y, *zc, cell * 1.15, self.s, sp.base);
+                sd += w * desert_of(*p);
+                wmax = wmax.max(w);
+            }
+            // fond : mer, ou plaine à la hauteur de base
+            let bg = if sp.sea_bg { SEA_FLOOR + (n(90.0, 3, 0x99) - 0.5) * 4.0 } else { sp.base + (n(160.0, 3, 0x99) - 0.5) * 3.0 };
+            let wb = (1.0 - wmax).max(0.0).powi(2) + 1e-4;
+            let mut h = (sh + wb * bg) / (sw + wb);
+            // bandes de terre basses entre les zones : elles ne creusent jamais, elles remontent ce qui est plus bas
+            // (la mer entre deux îles, le lagon d'une île) jusqu'à un peu au-dessus de l'eau
+            let land = sp.base.max(2.5) + 1.5 + (n(120.0, 3, 0x77) - 0.5) * 4.0;
+            let mut wl = 0.0f32;
+            for (a, b) in &self.links {
+                let ab = *b - *a;
+                let t = ((v3(x, y, 0.0) - *a).dot(ab) / ab.dot(ab).max(1e-3)).clamp(0.0, 1.0);
+                let q = *a + ab * t;
+                let dist = ((x - q.x).powi(2) + (y - q.y).powi(2)).sqrt() + (n(60.0, 3, 0x33) - 0.5) * cell * 0.15;
+                wl = wl.max(smooth(cell * 0.26, cell * 0.08, dist));
+            }
+            if wl > 0.0 && h < land {
+                h += (land - h) * wl;
+            }
+            (h, sd / sw.max(1e-4))
+        };
+        // en île : les bords descendent dans la mer (côte irrégulière)
+        if sp.island {
+            let (lx, ly) = (((x - self.c.x) / self.size).abs() * 2.0, ((y - self.c.y) / self.size).abs() * 2.0);
+            let d = (lx.powi(4) + ly.powi(4)).powf(0.25) + (n(150.0, 3, 0x1e) - 0.5) * 0.22;
+            // descente sur un quart du demi-côté environ (plages et pentes douces, pas de falaise)
+            let m = smooth(0.98, 0.5, d);
+            let sea = SEA_FLOOR + (n(90.0, 3, 0x99) - 0.5) * 4.0;
+            h = sea + (h - sea) * m;
+        }
+        (h, desert)
+    }
+}
+
 impl Terrain {
+    /// Nombre d'emplacements de matériau : ceux de MATERIALS puis les textures importées.
+    pub fn slots(&self) -> usize {
+        MATERIALS.len() + self.textures.len()
+    }
+
+    /// Emplacement d'un matériau de case (une texture importée retirée redevient du sable).
+    pub fn slot(&self, m: u8) -> usize {
+        if m >= CUSTOM_MAT {
+            let k = (m - CUSTOM_MAT) as usize;
+            if k < self.textures.len() {
+                return MATERIALS.len() + k;
+            }
+            return 0;
+        }
+        (m as usize).min(MATERIALS.len() - 1)
+    }
+
+    /// Clé de texture d'un emplacement.
+    pub fn slot_key(&self, s: usize) -> u64 {
+        match s.checked_sub(MATERIALS.len()).and_then(|k| self.textures.get(k)) {
+            Some(t) => custom_tex_key(&t.name),
+            None => material_key(s.min(MATERIALS.len() - 1)),
+        }
+    }
+
+    /// Texture d'un emplacement.
+    pub fn slot_texture(&self, s: usize) -> TexData {
+        match s.checked_sub(MATERIALS.len()).and_then(|k| self.textures.get(k)) {
+            Some(t) => custom_tex_data(t),
+            None => material_texture(s.min(MATERIALS.len() - 1)),
+        }
+    }
+
     pub fn new(center: V3, size: f32, base_h: f32, mat: u8) -> Terrain {
         let cell = if size > 600.0 { 4.0 } else { 2.0 };
         let n = ((size / cell).round() as usize + 1).clamp(16, 400);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new() }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: Vec::new() }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
     pub fn generate(&mut self, preset: u8, seed: u32, base: f32) {
+        self.generate_ex(&GenSpec { preset, seed, base, ..GenSpec::default() });
+    }
+
+    /// Relief d'après les réglages de la partie Créer (un modèle, ou des zones composées ; en île ou non), puis
+    /// peinture selon le relief (style désert là où dominent dunes, canyon, plateaux).
+    pub fn generate_ex(&mut self, spec: &GenSpec) {
         let size = (self.nx - 1) as f32 * self.cell;
         let c = v3(self.origin.x + size * 0.5, self.origin.y + size * 0.5, 0.0);
-        let s = seed.wrapping_mul(7919);
+        let field = GenField::new(spec, c, size);
+        let mut desert = vec![0.0f32; self.nx * self.ny];
         for j in 0..self.ny {
             for i in 0..self.nx {
                 let p = self.vpos(i, j);
-                let (x, y) = (p.x, p.y);
-                let (lx, ly) = ((x - c.x) / size, (y - c.y) / size);
-                let n = |sc: f32, o: u32| wnoise(x, y, sc, o, s);
-                let h = match preset {
-                    0 => base,
-                    1 => base + (n(160.0, 4) - 0.35) * 40.0,
-                    2 => {
-                        let r = 1.0 - (2.0 * n(260.0, 5) - 1.0).abs();
-                        base + r * r * 150.0 + (n(60.0, 3) - 0.5) * 12.0
-                    }
-                    3 => {
-                        let a = 0.6f32;
-                        let t = (x * a.cos() + y * a.sin()) / 38.0 + n(140.0, 3) * 4.0;
-                        let wave = t.fract();
-                        // dune : pente douce au vent, raide sous le vent
-                        let prof = if wave < 0.75 { wave / 0.75 } else { (1.0 - wave) / 0.25 };
-                        base + prof * (8.0 + n(220.0, 2) * 10.0) + (n(30.0, 2) - 0.5) * 2.0
-                    }
-                    4 => {
-                        let d = (lx * lx + ly * ly).sqrt() / 0.42;
-                        -10.0 + (1.0 - d * d) * 32.0 + (n(80.0, 4) - 0.5) * 14.0
-                    }
-                    5 => -7.0 + (n(110.0, 4) - 0.48).max(0.0) * 140.0,
-                    6 => {
-                        let cx = (ly * 9.0).sin() * 0.14 + (n(300.0, 2) - 0.5) * 0.1;
-                        let d = ((lx - cx).abs() * size - 18.0).max(0.0);
-                        let wall = (d / 40.0).min(1.0);
-                        let wall = wall * wall * (3.0 - 2.0 * wall);
-                        base + wall * 45.0 + (n(90.0, 3) - 0.5) * 6.0
-                    }
-                    7 => {
-                        let rx = (ly * 6.0).sin() * 0.08;
-                        let d = (lx - rx).abs() * size;
-                        let bed = if d < 14.0 { -3.0 } else { -3.0 + ((d - 14.0) / 10.0).min(1.0) * 5.0 };
-                        bed + ((d - 24.0).max(0.0) * 0.18).min(70.0) * (0.6 + n(150.0, 3) * 0.8)
-                    }
-                    _ => {
-                        let v = n(200.0, 4);
-                        let step = (v * 5.0).floor() / 5.0;
-                        let edge = ((v * 5.0).fract() - 0.85).max(0.0) / 0.15;
-                        base + (step + edge * 0.2) * 70.0 + (n(25.0, 2) - 0.5) * 1.5
-                    }
-                };
+                let (h, d) = field.at(p.x, p.y);
                 std::sync::Arc::make_mut(&mut self.h)[j * self.nx + i] = h;
+                desert[j * self.nx + i] = d;
             }
         }
-        self.auto_paint(PRESETS[(preset as usize).min(PRESETS.len() - 1)].2);
+        let nx = self.nx;
+        self.auto_paint_by(&|i, j| if desert[j * nx + i] > 0.5 { 1 } else { 0 });
     }
 
     /// Peint selon le relief : plage au bord de l'eau, roche sur les pentes raides et en altitude, terre sur
@@ -337,6 +632,11 @@ impl Terrain {
     }
 
     pub fn auto_paint(&mut self, style: u8) {
+        self.auto_paint_by(&|_, _| style);
+    }
+
+    /// Comme auto_paint, avec un style par case (coin bas-gauche i, j).
+    pub fn auto_paint_by(&mut self, style_at: &dyn Fn(usize, usize) -> u8) {
         let (nx, ny) = (self.nx, self.ny);
         for j in 0..ny - 1 {
             for i in 0..nx - 1 {
@@ -349,11 +649,14 @@ impl Terrain {
                 if *m >= 4 {
                     continue; // béton, goudron et routes gardés
                 }
-                *m = if slope > 0.8 || z > 90.0 {
+                let style = style_at(i, j);
+                // roche : pentes très raides, hauts sommets ; en altitude, seulement si la pente s'y prête (versants
+                // encore verts, comme les montagnes du jeu)
+                *m = if slope > 1.25 || z > 180.0 || (z > 120.0 && slope > 0.8) {
                     3
                 } else if z < 1.6 {
                     0
-                } else if slope > 0.4 {
+                } else if slope > 0.55 {
                     if style == 1 { 3 } else { 1 }
                 } else if style == 1 {
                     if slope > 0.2 { 1 } else { 0 }
@@ -527,6 +830,44 @@ impl Terrain {
         self.holes = out.into_iter().collect();
     }
 
+    /// Bouts de route posés sur le trottoir d'une autre route (ou à moins de AXIS_SNAP m de son bord) sans la
+    /// toucher : point cliqué ramené sur l'axe de l'autre route. Rend les routes modifiées.
+    pub fn snap_road_ends(&mut self) -> Vec<usize> {
+        let snapshot: Vec<crate::roads::Road> = self.roads.clone();
+        let mut moved = Vec::new();
+        for (i, o) in self.roads.iter_mut().enumerate() {
+            if o.ring || o.kind().foot || o.kind().ramp || o.pts.len() < 2 || o.samples.len() < 2 {
+                continue;
+            }
+            let ends = [(0usize, o.samples[0]), (o.pts.len() - 1, o.samples[o.samples.len() - 1])];
+            for (pi, sm) in ends {
+                // déjà relié au bout d'une route (prolongement) : rien à faire
+                let at_end = snapshot.iter().enumerate().any(|(j, r)| j != i && [r.samples.first(), r.samples.last()].into_iter().flatten().any(|s| (s[0] - sm[0]).powi(2) + (s[1] - sm[1]).powi(2) < 1.0));
+                if at_end {
+                    continue;
+                }
+                let best = snapshot
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, r)| *j != i && !r.kind().foot)
+                    .filter_map(|(_, r)| {
+                        let (d, q, along, _) = r.nearest_point(sm[0], sm[1])?;
+                        let hw = r.kind().width * 0.5;
+                        let inside = r.ring || (along > 1.0 && along < r.length() - 1.0);
+                        (d > hw + 0.5 && d <= r.half_total() + AXIS_SNAP && inside && (sm[2] - q.z).abs() <= crate::roads::JOIN_DZ).then_some((d, q))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((_, q)) = best {
+                    o.pts[pi] = [q.x, q.y];
+                    if moved.last() != Some(&i) {
+                        moved.push(i);
+                    }
+                }
+            }
+        }
+        moved
+    }
+
     /// Refait tout le réseau de routes, dans l'ordre où elles ont été tracées, depuis leurs points cliqués et leurs
     /// réglages : carrefours, trottoirs ouverts, ponts, tunnels, peinture du sol. Les routes d'indice `flatten`
     /// (modifiées) aplanissent de nouveau le terrain. Le réglage des feux de chaque carrefour est gardé. Rend les
@@ -662,7 +1003,7 @@ impl Terrain {
                 }
             }
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into(), road_paint: Vec::new(), holes }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into(), road_paint: Vec::new(), holes, textures: self.textures.clone() }
     }
 
     /// Version simplifiée pour la vue de loin : un sommet sur `f` dans chaque direction (cases `f` fois plus
@@ -686,7 +1027,7 @@ impl Terrain {
                 mat.push(self.mat[gj(j).min(self.ny - 2) * (self.nx - 1) + gi(i).min(self.nx - 2)]);
             }
         }
-        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new() }
+        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: self.textures.clone() }
     }
 
     /// Herbe du jeu d'une case (0 = aucune).
@@ -918,14 +1259,14 @@ impl Terrain {
                 verts.push(RVert { pos: [x, y, self.h[j * nx + i]], nrm: [n.x, n.y, n.z], uv: [(ox + x) / 6.0, (oy + y) / 6.0], col: [255; 4], uv1: [0.0, 0.0] });
             }
         }
-        let mut per: Vec<Vec<u32>> = vec![Vec::new(); MATERIALS.len()];
+        let mut per: Vec<Vec<u32>> = vec![Vec::new(); self.slots()];
         let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
         for j in 0..ny - 1 {
             for i in 0..nx - 1 {
                 if holes.contains(&((j * (nx - 1) + i) as u32)) {
                     continue; // entrée de tunnel
                 }
-                let m = (self.mat[j * (nx - 1) + i] as usize).min(MATERIALS.len() - 1);
+                let m = self.slot(self.mat[j * (nx - 1) + i]);
                 let a = (j * nx + i) as u32;
                 let (b, c, d) = (a + 1, a + nx as u32, a + nx as u32 + 1);
                 per[m].extend_from_slice(&[a, b, d, a, d, c]);
@@ -936,8 +1277,8 @@ impl Terrain {
         let mut keys = Vec::new();
         let mut texs = Vec::new();
         for (m, list) in per.into_iter().enumerate() {
-            let key = material_key(m);
-            texs.push((key, if with_tex { material_texture(m) } else { none() }));
+            let key = self.slot_key(m);
+            texs.push((key, if with_tex { self.slot_texture(m) } else { none() }));
             // morceaux de 60 000 indices au plus : chaque partie du modèle du jeu compte ses sommets sur 16 bits
             for chunk in list.chunks(60000) {
                 geoms.push(RGeom { first: idx.len() as u32, count: chunk.len() as u32, tex: m as u32, cutout: false, blend: 0, glass: false, ..Default::default() });
@@ -1140,7 +1481,7 @@ impl DwApp {
         // textures envoyées seulement si elles ont pu changer (routes apparues, vraies textures du jeu) ou si le
         // terrain n'est plus dans la carte graphique : elles y restent (gardées), inutile de les recopier toutes les
         // 80 ms pendant qu'on sculpte
-        let sig = (!t.roads.is_empty() as u8) | (crate::groundtex::enabled() as u8) << 1 | (crate::groundtex::loaded() as u8) << 2;
+        let sig = (!t.roads.is_empty() as u8) | (crate::groundtex::enabled() as u8) << 1 | (crate::groundtex::loaded() as u8) << 2 | ((t.textures.len() as u8) << 3);
         let missing = gpu.lock().ok().map(|g| !g.has_or_loading(arch)).unwrap_or(true);
         let with_tex = missing || self.terrain.tex_sig != Some((sig, std::sync::Arc::as_ptr(gpu) as *const () as usize));
         let (model, part_keys, textures) = t.model_ex(with_tex);
@@ -1301,7 +1642,8 @@ impl DwApp {
         if best.is_none() {
             for r in t.roads.iter().filter(|r| !r.kind().foot) {
                 if let Some((d, q, _, _)) = r.nearest_point(p.x, p.y) {
-                    if d <= r.kind().width * 0.5 && best.map(|b| d < b.0).unwrap_or(true) {
+                    // sur la chaussée ou son trottoir (accotement) : le point va sur l'axe de la route
+                    if d <= r.half_total() + AXIS_SNAP && best.map(|b| d < b.0).unwrap_or(true) {
                         best = Some((d, q, false));
                     }
                 }
@@ -1312,6 +1654,26 @@ impl DwApp {
 
     /// Construit la route en cours (au moins 2 points) : courbe, pente douce, terrain aplani dessous.
     pub fn finish_road(&mut self) {
+        let sig = |s: &Self| s.proj.terrain.as_ref().and_then(|t| t.roads.last().map(|r| (t.roads.len(), r.samples.len(), r.samples.first().map(|x| [x[0].to_bits(), x[1].to_bits()]))));
+        let before = sig(self);
+        self.finish_road_inner();
+        // seulement si une route vient d'être construite
+        if sig(self) != before {
+            self.join_old_ends();
+        }
+    }
+
+    /// Bouts de route restés juste à côté d'une autre route (sur son trottoir, ou à peine au-delà) : posés sur son
+    /// axe, puis tout le réseau est refait, pour qu'ils fassent un vrai carrefour en T au lieu de déborder dessus.
+    fn join_old_ends(&mut self) {
+        let moved = self.proj.terrain.as_mut().map(|t| t.snap_road_ends()).unwrap_or_default();
+        if !moved.is_empty() {
+            self.rebuild_road_network(&moved);
+            self.status += &format!(" {} bout(s) de route accroché(s) à une route voisine.", moved.len());
+        }
+    }
+
+    fn finish_road_inner(&mut self) {
         let pts = std::mem::take(&mut self.terrain.road_pts);
         if pts.len() < 2 {
             self.status = "Il faut au moins 2 points pour une route.".into();
@@ -1328,6 +1690,26 @@ impl DwApp {
         // relier au bout d'une route du même type : la nouvelle la prolonge, et les deux n'en font plus qu'une (courbe
         // continue, trottoirs sans coupure) au lieu de deux routes collées en angle
         let mut pts = pts;
+        // bout posé sur le trottoir d'une route (ou juste à côté) : ramené sur son axe, pour faire un vrai carrefour
+        if !foot && !is_ramp {
+            let n = pts.len();
+            for k in [0, n - 1] {
+                let p = pts[k];
+                let at_end = t.roads.iter().any(|o| [o.samples.first(), o.samples.last()].into_iter().flatten().any(|s| (s[0] - p.x).powi(2) + (s[1] - p.y).powi(2) < 1.0));
+                if at_end {
+                    continue;
+                }
+                let best = t
+                    .roads
+                    .iter()
+                    .filter(|o| !o.kind().foot)
+                    .filter_map(|o| o.nearest_point(p.x, p.y).filter(|(d, _, along, _)| *d <= o.half_total() + AXIS_SNAP && (o.ring || (*along > 1.0 && *along < o.length() - 1.0))).map(|(d, q, _, _)| (d, q)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((_, q)) = best {
+                    pts[k] = q;
+                }
+            }
+        }
         let mut merge: Option<(usize, f32)> = None;
         let mut merged: Option<crate::roads::Road> = None;
         // route d'un autre type prolongée : l'ancienne, retouchée au raccord (courbe continue)
@@ -1494,7 +1876,14 @@ impl DwApp {
     /// peinture du sol. `flatten` : routes modifiées, dont le terrain est de nouveau aplani.
     pub fn rebuild_road_network(&mut self, flatten: &[usize]) {
         let Some(t) = self.proj.terrain.as_mut() else { return };
-        let gone = t.rebuild_roads(flatten);
+        // bouts restés à côté d'une route (projets d'avant) : accrochés au passage
+        let mut flatten = flatten.to_vec();
+        for i in t.snap_road_ends() {
+            if !flatten.contains(&i) {
+                flatten.push(i);
+            }
+        }
+        let gone = t.rebuild_roads(&flatten);
         if !gone.is_empty() {
             self.proj.delete_ids(&gone);
         }
@@ -1834,12 +2223,80 @@ impl DwApp {
         }
     }
 
+    /// Réglages de génération choisis dans la partie Créer.
+    pub fn gen_spec(&self) -> GenSpec {
+        GenSpec { preset: self.terrain.preset, seed: self.terrain.seed, base: self.terrain.new_height, island: self.terrain.island, compose: self.terrain.compose, zones: self.terrain.zones, sea_bg: self.terrain.sea_bg, link: self.terrain.link }
+    }
+
+    /// Zones : une grille 3 × 3 (nord en haut), un modèle ou rien par case, le fond et les liaisons.
+    fn terrain_ui_zones(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Une case = un tiers du terrain (nord en haut). Les zones voisines se raccordent en douceur ; les cases vides prennent le fond.").small().weak());
+        egui::Grid::new("zones").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+            for k in 0..9 {
+                let cur = self.terrain.zones[k];
+                let (txt, col) = if cur < 0 {
+                    ("—", Color32::from_gray(150))
+                } else {
+                    let (n, _, st) = PRESETS[cur as usize];
+                    (n, if st == 1 { Color32::from_rgb(214, 190, 140) } else { Color32::from_rgb(120, 170, 100) })
+                };
+                egui::ComboBox::from_id_salt(("zone", k)).width(92.0).selected_text(RichText::new(txt).color(col)).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.terrain.zones[k], -1, "— (fond)");
+                    for (i, (n, tip, _)) in PRESETS.iter().enumerate() {
+                        ui.selectable_value(&mut self.terrain.zones[k], i as i8, *n).on_hover_text(*tip);
+                    }
+                });
+                if k % 3 == 2 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Fond");
+            ui.selectable_value(&mut self.terrain.sea_bg, true, "Mer").on_hover_text("Entre les zones : la mer (les zones deviennent des îles, sauf si elles sont reliées)");
+            ui.selectable_value(&mut self.terrain.sea_bg, false, "Plaine").on_hover_text("Entre les zones : une plaine à la hauteur de base");
+        });
+        ui.checkbox(&mut self.terrain.link, "Relier les zones par des bandes de terre").on_hover_text("Isthmes basses entre les zones (le chemin le plus court qui les relie toutes) : utile avec un fond en mer pour passer d'une île à l'autre à pied ou en voiture");
+    }
+
+    /// Aperçu vu de dessus du relief qui sera créé (au centre de la vue), refait quand un réglage change.
+    fn terrain_ui_preview(&mut self, ui: &mut egui::Ui) {
+        let spec = self.gen_spec();
+        let size = self.terrain.new_size;
+        let cell = if size > 600.0 { 4.0 } else { 2.0 };
+        let real = (((size / cell).round() as usize + 1).clamp(16, 400) - 1) as f32 * cell;
+        let c = self.cam.target;
+        let key = format!("{spec:?}|{:.0}|{:.0}|{real}", (c.x / 20.0).round(), (c.y / 20.0).round());
+        if self.terrain.preview.as_ref().map(|p| p.0 != key).unwrap_or(true) {
+            let img = gen_preview(&spec, v3(c.x, c.y, 0.0), real, 96);
+            let tex = ui.ctx().load_texture("dw_terrain_preview", img, egui::TextureOptions::LINEAR);
+            self.terrain.preview = Some((key, tex));
+        }
+        if let Some((_, t)) = &self.terrain.preview {
+            ui.horizontal(|ui| {
+                ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(150.0, 150.0)).corner_radius(4.0));
+                ui.label(RichText::new(format!("Aperçu vu de dessus, nord en haut ({real:.0} × {real:.0} m). Bleu : la mer.")).small().weak());
+            });
+        }
+    }
+
     fn terrain_ui_create(&mut self, ui: &mut egui::Ui) {
         if ui.checkbox(&mut self.game.empty_map, "Carte vide (cacher toute la carte du jeu)").changed() {
             self.status = if self.game.empty_map { "Carte du jeu cachée : tu pars de zéro (la mer reste).".into() } else { "Carte du jeu réaffichée.".into() };
         }
         ui.add_space(4.0);
-        ui.label(RichText::new("Modèle de départ").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Modèle de départ").strong());
+            if ui.selectable_label(!self.terrain.compose, "Un modèle").on_hover_text("Tout le terrain avec le même modèle").clicked() {
+                self.terrain.compose = false;
+            }
+            if ui.selectable_label(self.terrain.compose, "Par zones").on_hover_text("Un modèle par zone : une île ici, des collines à droite, un archipel en haut… raccordés en douceur").clicked() {
+                self.terrain.compose = true;
+            }
+        });
+        if self.terrain.compose {
+            self.terrain_ui_zones(ui);
+        } else {
         egui::Grid::new("presets").num_columns(3).spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, (n, tip, style)) in PRESETS.iter().enumerate() {
                 let col = if *style == 1 { Color32::from_rgb(214, 190, 140) } else { Color32::from_rgb(120, 170, 100) };
@@ -1854,6 +2311,8 @@ impl DwApp {
             }
         });
         ui.label(RichText::new(PRESETS[self.terrain.preset as usize].1).small().weak());
+        }
+        ui.checkbox(&mut self.terrain.island, "En île : les bords descendent dans la mer").on_hover_text("Montagnes, dunes, canyon… en île : la côte (irrégulière) plonge dans l'eau tout autour au lieu de finir en falaise au-dessus du vide.");
         egui::Grid::new("newterr").num_columns(2).show(ui, |ui| {
             ui.label("Taille");
             ui.add(egui::Slider::new(&mut self.terrain.new_size, 128.0..=1600.0).suffix(" m"));
@@ -1869,7 +2328,7 @@ impl DwApp {
                 }
             });
             ui.end_row();
-            if self.terrain.preset == 0 {
+            if self.terrain.preset == 0 && !self.terrain.compose {
                 ui.label("Sol");
                 egui::ComboBox::from_id_salt("newmat").selected_text(MATERIALS[self.terrain.new_mat as usize].0).show_ui(ui, |ui| {
                     for (i, (n, _)) in MATERIALS.iter().enumerate().take(4) {
@@ -1879,19 +2338,27 @@ impl DwApp {
                 ui.end_row();
             }
         });
+        self.terrain_ui_preview(ui);
         let label = if self.proj.terrain.is_none() { "Créer le terrain au centre de la vue" } else { "Remplacer le terrain par ce modèle" };
         if ui.button(RichText::new(label).strong()).clicked() {
             self.push_undo();
             let c = self.cam.target;
+            let spec = self.gen_spec();
             let mut t = Terrain::new(c, self.terrain.new_size, self.terrain.new_height, self.terrain.new_mat);
-            if self.terrain.preset != 0 {
-                t.generate(self.terrain.preset, self.terrain.seed, self.terrain.new_height);
+            if spec.compose || spec.island || spec.preset != 0 {
+                t.generate_ex(&spec);
             }
             self.proj.terrain = Some(t);
             self.terrain.dirty = true;
             self.game.empty_map = true;
             self.terrain_section(1);
-            self.status = format!("Terrain « {} » créé : sculpte, peins, trace des routes et sème de la végétation.", PRESETS[self.terrain.preset as usize].0);
+            let what = if spec.compose {
+                let names: Vec<&str> = spec.zones.iter().filter(|z| **z >= 0).map(|z| PRESETS[*z as usize].0).collect();
+                format!("par zones ({})", names.join(", "))
+            } else {
+                format!("« {} »", PRESETS[self.terrain.preset as usize].0)
+            };
+            self.status = format!("Terrain {what}{} créé : sculpte, peins, trace des routes et sème de la végétation.", if spec.island { " en île" } else { "" });
         }
         if self.proj.terrain.is_some() {
             ui.separator();
@@ -1978,15 +2445,30 @@ impl DwApp {
     }
 
     fn terrain_ui_paint(&mut self, ui: &mut egui::Ui) {
+        let chip = |n: &str, c: [u8; 3]| RichText::new(n).color(if c[0] as u32 + c[1] as u32 + c[2] as u32 > 380 { Color32::BLACK } else { Color32::WHITE }).background_color(Color32::from_rgb(c[0], c[1], c[2]));
         ui.horizontal_wrapped(|ui| {
-            for (i, (n, c)) in MATERIALS.iter().enumerate() {
-                let txt = RichText::new(*n).color(if c[0] as u32 + c[1] as u32 + c[2] as u32 > 380 { Color32::BLACK } else { Color32::WHITE }).background_color(Color32::from_rgb(c[0], c[1], c[2]));
-                if ui.selectable_label(self.terrain.paint == i as u8, txt).clicked() {
+            for (i, (n, c)) in MATERIALS.iter().enumerate().take(GAME_ONLY) {
+                if ui.selectable_label(self.terrain.paint == i as u8, chip(n, *c)).clicked() {
                     self.terrain.paint = i as u8;
                     self.set_terrain_brush(Brush::Paint);
                 }
             }
         });
+        ui.label(RichText::new("Sols de GTA V").small().strong());
+        ui.horizontal_wrapped(|ui| {
+            for (i, (n, c)) in MATERIALS.iter().enumerate().skip(GAME_ONLY) {
+                let g = crate::groundtex::MAP.iter().find(|g| g.key == material_key(i));
+                let tip = g.map(|g| format!("Texture du jeu « {} » (dictionnaire {}) : vue dans l'éditeur une fois le jeu chargé ; à l'export, rien n'est copié, le jeu la charge lui-même.", g.tex, g.txd)).unwrap_or_default();
+                if ui.selectable_label(self.terrain.paint == i as u8, chip(n, *c)).on_hover_text(tip).clicked() {
+                    self.terrain.paint = i as u8;
+                    self.set_terrain_brush(Brush::Paint);
+                }
+            }
+        });
+        if !crate::groundtex::loaded() {
+            ui.label(RichText::new("Charge le jeu (onglet Jeu) pour voir ces sols ; sans lui, ils ont une couleur unie dans l'éditeur.").small().weak());
+        }
+        self.terrain_ui_imported(ui);
         self.brush_sliders(ui, false);
         self.game_textures_toggle(ui);
         if ui
@@ -2000,6 +2482,115 @@ impl DwApp {
                 let style = t.dominant_style();
                 t.auto_paint(style);
             }
+            self.terrain.dirty = true;
+        }
+    }
+
+    /// Textures importées du terrain : bouton d'import, choix pour peindre, surface au toucher, retrait.
+    fn terrain_ui_imported(&mut self, ui: &mut egui::Ui) {
+        let Some(t) = self.proj.terrain.as_ref() else { return };
+        let list: Vec<(String, u8)> = t.textures.iter().map(|x| (x.name.clone(), x.surf)).collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Importées").small().strong());
+            if ui.small_button("Importer une image (PNG)…").on_hover_text("Ta propre texture de sol : mise au plus à 512 px de côté (taille en puissance de 2), répétée tous les 6 m, gardée dans le projet et rangée à l'export dans le dictionnaire du terrain (dw_terrain_txd). Choisis ensuite sa surface au toucher (bruit des pas, adhérence).").clicked() {
+                if let Some(paths) = rfd::FileDialog::new().add_filter("Image PNG", &["png"]).set_title("Textures de sol à importer").pick_files() {
+                    let (mut ok, mut err) = (0, String::new());
+                    let mut add = Vec::new();
+                    for p in paths {
+                        match crate::design::import_png(&p) {
+                            Ok(c) => add.push(c),
+                            Err(e) => err = e,
+                        }
+                    }
+                    if !add.is_empty() {
+                        self.push_undo();
+                    }
+                    if let Some(t) = self.proj.terrain.as_mut() {
+                        for c in add {
+                            if t.textures.len() >= (255 - CUSTOM_MAT) as usize {
+                                err = "trop de textures importées".into();
+                                break;
+                            }
+                            let mut name = c.name.clone();
+                            let mut k = 2;
+                            while t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
+                                name = format!("{}_{k}", c.name);
+                                k += 1;
+                            }
+                            t.textures.push(TerrainTex { name, png: c.png, surf: 1 });
+                            self.terrain.paint = CUSTOM_MAT + (t.textures.len() - 1) as u8;
+                            ok += 1;
+                        }
+                    }
+                    if ok > 0 {
+                        self.set_terrain_brush(Brush::Paint);
+                    }
+                    self.terrain.tex_sig = None;
+                    self.terrain.dirty = true;
+                    self.status = if err.is_empty() { format!("{ok} texture(s) de sol importée(s) : peins-les sur le terrain.") } else { format!("{ok} texture(s) importée(s) ; erreur : {err}") };
+                }
+            }
+        });
+        let mut del: Option<usize> = None;
+        let mut surf: Option<(usize, u8)> = None;
+        for (i, (n, s)) in list.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let m = CUSTOM_MAT + i as u8;
+                if ui.selectable_label(self.terrain.paint == m, RichText::new(n).strong()).on_hover_text("Peindre avec cette texture").clicked() {
+                    self.terrain.paint = m;
+                    self.set_terrain_brush(Brush::Paint);
+                }
+                let mut v = *s;
+                egui::ComboBox::from_id_salt(("terr_surf", i))
+                    .width(110.0)
+                    .selected_text(format!("comme {}", MATERIALS[(v as usize).min(MATERIALS.len() - 1)].0.to_lowercase()))
+                    .show_ui(ui, |ui| {
+                        for (k, (mn, _)) in MATERIALS.iter().enumerate().filter(|(k, _)| *k != ROAD as usize) {
+                            ui.selectable_value(&mut v, k as u8, *mn);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Surface au toucher (collision) : bruit des pas, traces, adhérence des véhicules");
+                if v != *s {
+                    surf = Some((i, v));
+                }
+                if ui.small_button("Retirer").clicked() {
+                    del = Some(i);
+                }
+            });
+        }
+        if let Some((i, v)) = surf {
+            if let Some(t) = self.proj.terrain.as_mut() {
+                t.textures[i].surf = v;
+            }
+        }
+        if let Some(i) = del {
+            self.push_undo();
+            if let Some(t) = self.proj.terrain.as_mut() {
+                t.textures.remove(i);
+                // cases peintes avec : sable ; les textures suivantes reculent d'un rang
+                let fix = |m: u32| -> u32 {
+                    if m >= CUSTOM_MAT as u32 && m < 256 {
+                        let k = m - CUSTOM_MAT as u32;
+                        if k == i as u32 {
+                            return 0;
+                        } else if k > i as u32 {
+                            return m - 1;
+                        }
+                    }
+                    m
+                };
+                for m in std::sync::Arc::make_mut(&mut t.mat).iter_mut() {
+                    *m = fix(*m as u32) as u8;
+                }
+                for rp in t.road_paint.iter_mut() {
+                    rp[1] = fix(rp[1]);
+                }
+            }
+            if self.terrain.paint >= CUSTOM_MAT {
+                self.terrain.paint = 0;
+            }
+            self.terrain.tex_sig = None;
             self.terrain.dirty = true;
         }
     }
@@ -2429,17 +3020,44 @@ impl DwApp {
     }
 }
 
-/// Matériaux de collision du jeu (ordre du fichier materials.dat) pour chaque matériau du terrain.
-const COLL_NAMES: [&str; 7] = ["SAND_COMPACT", "DIRT_TRACK", "GRASS", "ROCK", "CONCRETE", "TARMAC", "TARMAC"];
+/// Matériaux de collision du jeu (noms de materials.dat) pour chaque matériau du terrain, avec le matériau de base
+/// dont il prend le numéro si le nom est introuvable.
+const COLL_NAMES: [(&str, usize); 24] = [
+    ("SAND_COMPACT", 0),
+    ("DIRT_TRACK", 1),
+    ("GRASS", 2),
+    ("ROCK", 3),
+    ("CONCRETE", 4),
+    ("TARMAC", 5),
+    ("TARMAC", 6),
+    ("GRAVEL_SMALL", 1),
+    ("GRAVEL_SMALL", 1),
+    ("DIRT_TRACK", 1),
+    ("DIRT_TRACK", 1),
+    ("CONCRETE", 4),
+    ("GRASS", 2),
+    ("GRASS", 2),
+    ("GRASS_SHORT", 2),
+    ("LEAVES", 1),
+    ("LEAVES", 1),
+    ("MUD_HARD", 1),
+    ("GRAVEL_LARGE", 3),
+    ("ROCK", 3),
+    ("ROCK_MOSSY", 3),
+    ("SNOW_COMPACT", 0),
+    ("SAND_LOOSE", 0),
+    ("ROCK", 3),
+];
 
-/// Index des matériaux de collision : lus dans materials.dat du jeu, sinon l'ordre habituel — **estimé**.
-fn collision_types(w: Option<&crate::gta::world::GameWorld>) -> [u32; 7] {
-    let mut out = [19, 35, 47, 9, 1, 4, 4];
+/// Index des matériaux de collision de chaque matériau du terrain (puis de chaque texture importée, d'après sa
+/// surface) : lus dans materials.dat du jeu, sinon l'ordre habituel — **estimé**.
+fn collision_types(w: Option<&crate::gta::world::GameWorld>, customs: &[TerrainTex]) -> Vec<u32> {
+    let base = [19u32, 35, 47, 9, 1, 4, 4];
     let names = material_names(w);
-    for (i, n) in COLL_NAMES.iter().enumerate() {
-        if let Some(k) = names.iter().position(|x| x == n) {
-            out[i] = k as u32;
-        }
+    let mut out: Vec<u32> = COLL_NAMES.iter().map(|(n, fb)| names.iter().position(|x| x == n).map(|k| k as u32).unwrap_or_else(|| names.iter().position(|x| x == COLL_NAMES[*fb].0).map(|k| k as u32).unwrap_or(base[*fb]))).collect();
+    for c in customs {
+        let s = (c.surf as usize).min(MATERIALS.len() - 1);
+        out.push(out[s]);
     }
     out
 }
@@ -2561,7 +3179,7 @@ impl Terrain {
     /// BoundComposite::ReadXml 0x06004170) : on les laisse à 0 / par défaut ici.
     /// `pids` : ProceduralID de chaque herbe (pids[0] = 0 sans herbe, pids[k] = herbe k) ; un matériau par couple
     /// (surface, herbe), triangle m = herbe × 7 + surface.
-    pub fn collision_xml(&self, types: [u32; 7], pids: &[u32]) -> String {
+    pub fn collision_xml(&self, types: &[u32], pids: &[u32]) -> String {
         use std::fmt::Write;
         let (mn, mx) = self.bounds();
         let c = (mn + mx) * 0.5;
@@ -2594,7 +3212,9 @@ impl Terrain {
                     }
                 }
                 let w = i1 - i0 + 1;
-                let mut used = [false; 7];
+                // matériaux de ce morceau : un par couple (type de surface, herbe) réellement employé (numéro sur
+                // un octet dans le .ybn : 24 matériaux × toutes les herbes dépasseraient 255)
+                let mut used: Vec<(u32, u32)> = Vec::new();
                 let mut polys = String::new();
                 // les sommets sont relatifs au centre de la pièce (GeometryCenter) : c'est ainsi que les lit
                 // CodeWalker (les .ybn.xml de Sollumz de la map désert, qui marchent en jeu, font pareil) ;
@@ -2615,23 +3235,30 @@ impl Terrain {
                             continue;
                         }
                         let g = (self.grass_at(i, j) as usize).min(pids.len().saturating_sub(1));
-                        let m = (self.mat[j * (self.nx - 1) + i] as usize).min(6) + g * 7;
-                        used[m % 7] = true;
+                        let s = self.slot(self.mat[j * (self.nx - 1) + i]);
+                        let pair = (types.get(s).copied().unwrap_or(types[0]), pids.get(g).copied().unwrap_or(0));
+                        let m = match used.iter().position(|p| *p == pair) {
+                            Some(k) => k,
+                            None => {
+                                used.push(pair);
+                                used.len() - 1
+                            }
+                        };
                         let a = (j - j0) * w + (i - i0);
                         let (b, cc, d) = (a + 1, a + w, a + w + 1);
                         let _ = writeln!(polys, "     <Triangle m=\"{m}\" v1=\"{a}\" v2=\"{b}\" v3=\"{d}\" f1=\"0\" f2=\"0\" f3=\"0\" />");
                         let _ = writeln!(polys, "     <Triangle m=\"{m}\" v1=\"{a}\" v2=\"{d}\" v3=\"{cc}\" f1=\"0\" f2=\"0\" f3=\"0\" />");
                     }
                 }
-                let _ = used;
+                if used.is_empty() {
+                    used.push((types[0], 0));
+                }
                 s.push_str("   <Item type=\"GeometryBVH\">\n");
                 head(&mut s, "    ", bmn, bmx, 0.04);
                 let gc = (bmn + bmx) * 0.5;
                 let _ = writeln!(s, "    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n    {}\n    <UnkFloat1 value=\"0\" />\n    <UnkFloat2 value=\"0.0025\" />\n    <Materials>", xyz("GeometryCenter", gc));
-                for pid in pids.iter().copied().chain(if pids.is_empty() { Some(0) } else { None }) {
-                    for t in types {
-                        let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"{pid}\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
-                    }
+                for (t, pid) in &used {
+                    let _ = writeln!(s, "     <Item>\n      <Type value=\"{t}\" />\n      <ProceduralID value=\"{pid}\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>");
                 }
                 let _ = writeln!(s, "    </Materials>\n    <Vertices>\n{verts}    </Vertices>\n    <Polygons>\n{polys}    </Polygons>\n   </Item>");
                 i0 = i1;
@@ -2665,7 +3292,7 @@ impl DwApp {
         }
         let txd = TERRAIN_TXD;
         let lod = TERRAIN_LOD_DIST;
-        let types = collision_types(self.game.world.as_deref());
+        let types = collision_types(self.game.world.as_deref(), &t.textures);
         // herbe du jeu : ProceduralID de chaque herbe, lu dans procedural.meta (procTagTable)
         let pids = crate::grass::proc_ids(self.game.world.as_deref());
         let mut written_tex = false;
@@ -2694,7 +3321,7 @@ impl DwApp {
                 let (m, k, tx) = tile.model();
                 if !written_tex {
                     // tous les matériaux, même ceux absents de cette tuile
-                    let mut all: Vec<(u64, TexData)> = (0..MATERIALS.len()).map(|m| (material_key(m), material_texture(m))).collect();
+                    let mut all: Vec<(u64, TexData)> = (0..t.slots()).map(|m| (t.slot_key(m), t.slot_texture(m))).collect();
                     if !t.roads.is_empty() {
                         all.extend(crate::roads::road_textures());
                     }
@@ -2710,7 +3337,7 @@ impl DwApp {
                     written_tex = true;
                 }
                 let pieces = write_split(stream, &name, &m, &k, &tx, txd)?;
-                std::fs::write(stream.join(format!("dw_terrain_col_r{row}c{col}.ybn.xml")), tile.collision_xml(types, &pids)).map_err(|e| e.to_string())?;
+                std::fs::write(stream.join(format!("dw_terrain_col_r{row}c{col}.ybn.xml")), tile.collision_xml(&types, &pids)).map_err(|e| e.to_string())?;
                 // type d'objet : boîte du modèle (repère de la tuile : x, y depuis son coin, z absolu)
                 let (mn, mx) = tile.bounds();
                 let lmn = v3(0.0, 0.0, mn.z);
@@ -2777,7 +3404,7 @@ impl DwApp {
                     let anchor = v3(r.samples[0][0].floor(), r.samples[0][1].floor(), 0.0);
                     let (pos, uv, parts) = r.mesh(anchor);
                     // collision : chaussée, trottoirs, accotements (types de surface lus dans materials.dat)
-                    let shoulder = COLL_NAMES[(k.shoulder_mat as usize).min(COLL_NAMES.len() - 1)];
+                    let shoulder = COLL_NAMES[(k.shoulder_mat as usize).min(COLL_NAMES.len() - 1)].0;
                     let ctypes = [coll_type(&names, k.coll, if k.dirt { 35 } else { 4 }), coll_type(&names, "PAVING_SLAB", coll_type(&names, "CONCRETE", 1)), coll_type(&names, shoulder, 1), coll_type(&names, "CONCRETE", 1), coll_type(&names, "METAL_SOLID_SMALL", coll_type(&names, "CONCRETE", 1)), coll_type(&names, "GRASS", 1), coll_type(&names, "CONCRETE", 1) | crate::roads::MAT_STAIRS];
                     (anchor, pos, uv, parts, ctypes)
                 }
@@ -2928,6 +3555,59 @@ mod tests {
     }
 
     #[test]
+    fn sols_du_jeu_et_textures_importees() {
+        // chaque sol « du jeu » a sa texture et son dictionnaire déclarés
+        for m in GAME_ONLY..MATERIALS.len() {
+            let g = crate::groundtex::MAP.iter().find(|g| g.key == material_key(m)).expect("texture du jeu");
+            assert!(crate::groundtex::TXDS.contains(&g.txd), "{}", g.txd);
+            assert!(crate::groundtex::game_only(material_key(m)));
+        }
+        assert!(!crate::groundtex::game_only(material_key(2)));
+        // les textures des routes (goudron, trottoir, passage piéton) ne sont pas des sols « du jeu seulement »
+        for k in [crate::roads::SIDEWALK_KEY, crate::roads::ASPHALT_KEY, crate::roads::DIRT_PLAIN_KEY, crate::roads::CROSSWALK_KEY, crate::roads::road_tex_key(0)] {
+            assert!(!crate::groundtex::game_only(k), "{k:x}");
+        }
+        // texture importée : un emplacement de plus, clé à part, collision « comme » la surface choisie
+        let dir = std::env::temp_dir().join("dw_test_terrtex");
+        let _ = std::fs::create_dir_all(&dir);
+        let png = dir.join("pavés.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 10, 10, 255])).save(&png).unwrap();
+        let c = crate::design::import_png(&png).unwrap();
+        let mut t = Terrain::new(V3::ZERO, 32.0, 0.0, 0);
+        t.textures.push(TerrainTex { name: c.name, png: c.png, surf: 3 });
+        {
+            let mat = std::sync::Arc::make_mut(&mut t.mat);
+            mat[0] = CUSTOM_MAT;
+            mat[1] = 2;
+            mat[2] = CUSTOM_MAT + 5; // texture absente → sable
+        }
+        assert_eq!(t.slots(), MATERIALS.len() + 1);
+        assert_eq!(t.slot(CUSTOM_MAT), MATERIALS.len());
+        assert_eq!(t.slot(CUSTOM_MAT + 5), 0);
+        assert_eq!(t.slot_key(MATERIALS.len()), custom_tex_key("pavés"));
+        assert_eq!(t.slot_texture(MATERIALS.len()).w, 8);
+        let types = collision_types(None, &t.textures);
+        assert_eq!(types.len(), t.slots());
+        assert_eq!(types[MATERIALS.len()], types[3]);
+        // collision : seulement les matériaux employés (sable, herbe, importée)
+        let x = t.collision_xml(&types, &[]);
+        assert_eq!(x.matches("<ProceduralID value=\"0\" />\n      <RoomID").count(), 3, "{}", &x[..x.len().min(3000)]);
+        std::sync::Arc::make_mut(&mut t.mat)[3] = 21;
+        let (m, keys, texs) = t.model();
+        assert!(keys.contains(&custom_tex_key("pavés")));
+        assert!(!m.geoms.is_empty());
+        // export : la neige part dans un morceau qui nomme la texture du jeu (dictionnaire globalprologue), la texture
+        // importée reste dans le dictionnaire du terrain
+        let out = dir.join("stream");
+        let _ = std::fs::create_dir_all(&out);
+        let pieces = write_split(&out, "dw_terrain_t", &m, &keys, &texs, TERRAIN_TXD).unwrap();
+        let g = pieces.iter().find(|(_, d)| d == "globalprologue").expect("morceau neige");
+        let snow = std::fs::read_to_string(out.join(format!("{}.ydr.xml", g.0))).unwrap();
+        assert!(snow.contains("plg_im_snow_ground_019"));
+        assert!(pieces.iter().any(|(n, d)| n == "dw_terrain_t" && d == TERRAIN_TXD));
+    }
+
+    #[test]
     fn hd_distance_covers_tile_centre() {
         let d = hd_dist_from_corner(200.0, 200.0);
         // point à TERRAIN_HD_DIST du centre, du côté opposé au coin
@@ -2948,4 +3628,37 @@ fn furn_override(mut f: crate::roads::Furniture, o: [Option<bool>; 3]) -> crate:
         f.decals = v;
     }
     f
+}
+
+#[cfg(test)]
+mod tests_gen {
+    use super::*;
+
+    #[test]
+    fn ile_et_zones() {
+        let c = v3(195.0, -934.0, 0.0);
+        // montagnes en île : bords sous l'eau, centre bien au-dessus
+        let spec = GenSpec { preset: 2, island: true, ..GenSpec::default() };
+        let f = GenField::new(&spec, c, 512.0);
+        for (x, y) in [(-256.0, 0.0), (256.0, 0.0), (0.0, 256.0), (0.0, -256.0), (250.0, 250.0)] {
+            assert!(f.at(c.x + x, c.y + y).0 < 0.0, "bord ({x}, {y}) hors de l'eau");
+        }
+        // zones : collines au nord et montagnes à l'est sur fond de mer, sans liaison ; mer au sud-ouest
+        let mut spec = GenSpec { compose: true, zones: [-1, 1, -1, -1, -1, 2, -1, -1, -1], sea_bg: true, link: false, ..GenSpec::default() };
+        let f = GenField::new(&spec, c, 512.0);
+        assert!(f.at(c.x, c.y + 170.0).0 > 0.0, "collines au nord");
+        assert!(f.at(c.x + 170.0, c.y).0 > 0.0, "montagnes à l'est");
+        assert!(f.at(c.x - 170.0, c.y - 170.0).0 < 0.0, "mer au sud-ouest");
+        // avec liaison : le milieu entre les deux zones (diagonale) est à sec
+        spec.link = true;
+        let f = GenField::new(&spec, c, 512.0);
+        assert!(f.at(c.x + 85.0, c.y + 85.0).0 > 0.0);
+        // relief continu (pas de marche) en traversant les zones
+        let mut prev = f.at(c.x - 250.0, c.y + 100.0).0;
+        for k in 1..500 {
+            let h = f.at(c.x - 250.0 + k as f32, c.y + 100.0).0;
+            assert!((h - prev).abs() < 4.0, "marche de {:.1} m à x {}", h - prev, k);
+            prev = h;
+        }
+    }
 }

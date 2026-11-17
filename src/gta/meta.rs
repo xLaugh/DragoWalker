@@ -197,6 +197,31 @@ pub struct GArchetype {
     /// intérieur : objets (avec l'index de leur groupe d'entités, -1 = toujours là) et noms des groupes
     pub mlo_children: Vec<(GEntity, i32)>,
     pub mlo_sets: Vec<u32>,
+    /// intérieur : pièces et portails (CMloRoomDef, CMloPortalDef)
+    pub mlo_rooms: Vec<GRoom>,
+    pub mlo_portals: Vec<GPortal>,
+}
+
+/// Pièce d'un intérieur du jeu (CMloRoomDef, 112 octets) : nom +8 (CharPointer), bbMin +32, bbMax +48,
+/// timecycleName +68, flags +76, floorId +84, attachedObjects +96 (index des objets de l'intérieur).
+#[derive(Clone, Debug, Default)]
+pub struct GRoom {
+    pub name: String,
+    pub bb_min: [f32; 3],
+    pub bb_max: [f32; 3],
+    pub timecycle: u32,
+    pub flags: u32,
+    pub floor_id: i32,
+    pub objects: Vec<u32>,
+}
+
+/// Portail d'un intérieur du jeu (CMloPortalDef, 64 octets) : roomFrom +8, roomTo +12, flags +16, corners +32.
+#[derive(Clone, Debug, Default)]
+pub struct GPortal {
+    pub from: u32,
+    pub to: u32,
+    pub flags: u32,
+    pub corners: Vec<[f32; 3]>,
 }
 
 /// CMapTypes : archetypes = Array_StructurePointer à +24.
@@ -212,7 +237,53 @@ pub fn parse_ytyp(r: &Resource) -> Vec<GArchetype> {
                 // CMloArchetypeDefData après les 144 octets de base : entities +152, entitySets +200
                 let mut mlo_children = Vec::new();
                 let mut mlo_sets = Vec::new();
+                let mut mlo_rooms = Vec::new();
+                let mut mlo_portals = Vec::new();
                 if h == h_mlo {
+                    // CMloArchetypeDefData : rooms +168, portals +184
+                    if let Some((_, ra, rn)) = m.array(a + 168) {
+                        for k in 0..rn.min(64) {
+                            let p = ra + k * 112;
+                            let mut name = String::new();
+                            let n = r.u16(p + 16) as usize;
+                            if let Some((_, sp)) = m.resolve(r.u64(p + 8)) {
+                                for i in 0..n.min(128) {
+                                    let c = r.u8(sp + i);
+                                    if c == 0 {
+                                        break;
+                                    }
+                                    name.push(c as char);
+                                }
+                            }
+                            let mut objects = Vec::new();
+                            if let Some((_, oa, on)) = m.array(p + 96) {
+                                for i in 0..on.min(4096) {
+                                    objects.push(r.u32(oa + i * 4));
+                                }
+                            }
+                            mlo_rooms.push(GRoom { name, bb_min: r.v3(p + 32), bb_max: r.v3(p + 48), timecycle: r.u32(p + 68), flags: r.u32(p + 76), floor_id: r.i32(p + 84), objects });
+                        }
+                    }
+                    if let Some((_, pa, pn)) = m.array(a + 184) {
+                        for k in 0..pn.min(256) {
+                            let p = pa + k * 64;
+                            if std::env::var("DW_DEBUG_PORTAL").is_ok() {
+                                eprintln!("portail {k} : ptr {:016x} n {} n2 {} brut {:02x?}", r.u64(p + 32), r.u16(p + 40), r.u16(p + 42), (0..64).map(|i| r.u8(p + i)).collect::<Vec<u8>>());
+                            }
+                            let mut corners = Vec::new();
+                            if std::env::var("DW_DEBUG_PORTAL").is_ok() {
+                                if let Some((_, ca, cn)) = m.array(p + 32) {
+                                    eprintln!("  coins bruts ({cn}) : {:?}", (0..16).map(|i| r.f32(ca + i * 4)).collect::<Vec<f32>>());
+                                }
+                            }
+                            if let Some((_, ca, cn)) = m.array(p + 32) {
+                                for i in 0..cn.min(8) {
+                                    corners.push(r.v3(ca + i * 16));
+                                }
+                            }
+                            mlo_portals.push(GPortal { from: r.u32(p + 8), to: r.u32(p + 12), flags: r.u32(p + 16), corners });
+                        }
+                    }
                     if let Some((_, ea, en)) = m.array(a + 152) {
                         for k in 0..en.min(4096) {
                             if let Some((_, ep)) = m.resolve(r.u64(ea + k * 8)) {
@@ -238,6 +309,8 @@ pub fn parse_ytyp(r: &Resource) -> Vec<GArchetype> {
                 out.push(GArchetype {
                     mlo_children,
                     mlo_sets,
+                    mlo_rooms,
+                    mlo_portals,
                     lod_dist: r.f32(a + 8),
                     flags: r.u32(a + 12),
                     bb_min: r.v3(a + 32),

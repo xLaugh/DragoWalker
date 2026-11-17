@@ -254,6 +254,13 @@ pub struct Room {
     /// pièce de forme libre (design.rs) : sol, plafond et murs viennent de la coque modelable, pas de sa boîte
     #[serde(default)]
     pub free: bool,
+    /// pièce reprise d'un intérieur du jeu (mcp_game.rs) : ses murs, sols et plafonds sont ceux du jeu, pas de coque
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub game: bool,
+    /// vrai sol d'une pièce reprise du jeu (repère de l'intérieur ; la boîte de Rockstar descend dessous) : la
+    /// collision exportée y pose une fine surface avec le numéro de la pièce (le jeu sait où est le joueur)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_z: Option<f32>,
 }
 
 impl Room {
@@ -269,6 +276,8 @@ impl Room {
             floor_id: 0,
             ext_vis_depth: mech::ROOM_EXT_VIS_DEPTH,
             free: false,
+            game: false,
+            floor_z: None,
         }
     }
 }
@@ -462,6 +471,13 @@ pub struct Project {
     /// points d'interaction des intérieurs exportés en zones ox_target / qb-target (interactions.rs)
     #[serde(default)]
     pub targets: bool,
+    /// collisions du jeu rattachées à un intérieur du projet (intérieur repris du jeu : sa collision d'origine,
+    /// « v_sheriff2 »…), déclarées avec la sienne dans <Interiors> du _manifest.ymf : (intérieur, collisions)
+    #[serde(default)]
+    pub mlo_bounds: Vec<(String, Vec<String>)>,
+    /// props assemblés dans le Studio (formes simples), gardés pour être retouchés
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<crate::propstudio::PropDef>,
 }
 
 impl Project {

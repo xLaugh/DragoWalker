@@ -39,6 +39,8 @@ pub struct StudioState {
     /// intérieur complet tout prêt choisi (gabarits.rs) à la place d'un départ vide, et son style (0 = au hasard)
     pub new_tpl: Option<usize>,
     pub new_theme: usize,
+    /// onglet de la fenêtre : 0 intérieurs (MLO), 1 props
+    pub tab: u8,
     /// coupe au-dessus de l'étage : on voit dans les pièces, sans plafond
     pub cut: bool,
     saved: Option<Saved>,
@@ -141,7 +143,7 @@ impl DwApp {
         // un intérieur sans pièce se dessine d'abord de dessus
         self.cam.map_view = self.proj.ytyps[ti].mlos[mi].rooms.len() <= 1;
         self.set_selection(vec![]);
-        self.status = format!("Studio MLO : « {} ». Outils à gauche de la vue, réglages dans le panneau de gauche, ambiance, meubles et objet choisi à droite.", self.studio.mlo);
+        self.status = format!("Studio : « {} ». Outils à gauche de la vue, réglages dans le panneau de gauche, ambiance, meubles et objet choisi à droite.", self.studio.mlo);
     }
 
     /// Sort du studio ; `place` : garde la vue sur l'intérieur, choisi, avec les poignées de déplacement.
@@ -182,7 +184,7 @@ impl DwApp {
             self.set_selection(inst);
             self.status = format!("« {name} » est choisi : déplace-le avec les flèches (G), tourne-le avec R, puis Ctrl+S.");
         } else {
-            self.status = format!("Sorti du Studio MLO (« {name} »).");
+            self.status = format!("Sorti du Studio (« {name} »).");
         }
     }
 
@@ -214,7 +216,7 @@ impl DwApp {
         self.studio_enter(&n);
         if self.studio.new_kind == 0 {
             self.plan.mode = 6;
-            self.status = format!("Studio MLO : « {n} » est vide. Outil « Pièce » : clique les coins de la première pièce sur la grille, double-clic pour finir.");
+            self.status = format!("Studio : « {n} » est vide. Outil « Pièce » : clique les coins de la première pièce sur la grille, double-clic pour finir.");
         }
     }
 
@@ -258,14 +260,29 @@ impl DwApp {
             .flat_map(|(ti, t)| t.mlos.iter().map(move |m| (ti, m)))
             .map(|(ti, m)| (m.name.clone(), m.rooms.len().saturating_sub(1), self.proj.mlo_placement(&m.name).is_some(), self.mlo_ytyp_imported(ti)))
             .collect();
-        egui::Window::new(RichText::new(look::label(ic::CUBE_TRANSPARENT, "Studio MLO")).strong())
+        egui::Window::new(RichText::new(look::label(ic::CUBE_TRANSPARENT, "Studio")).strong())
             .id(egui::Id::new("studio_choose"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(420.0)
+            .default_width(460.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if look::tool(ui, self.studio.tab == 0, ic::HOUSE, "Intérieurs (MLO)", "Construire un intérieur FiveM de A à Z").clicked() {
+                        self.studio.tab = 0;
+                    }
+                    if look::tool(ui, self.studio.tab == 1, ic::CUBE, "Props", "Créer tes propres objets : depuis une image, un modèle Blender ou des formes simples").clicked() {
+                        self.studio.tab = 1;
+                    }
+                });
+                ui.separator();
+                if self.studio.tab == 1 {
+                    egui::ScrollArea::vertical().max_height(ui.ctx().screen_rect().height() * 0.7).show(ui, |ui| {
+                        self.props_studio_ui(ui);
+                    });
+                    return;
+                }
                 ui.label(RichText::new("Un espace à part pour construire un intérieur FiveM de A à Z : rien d'autre à l'écran, les outils de construction à gauche de la vue, les pièces et réglages dans le panneau de gauche, l'ambiance, les meubles et l'objet choisi à droite. Tout reste dans ton projet et s'exporte comme d'habitude.").weak());
                 ui.add_space(6.0);
                 look::heading(ui, ic::PLUS_CIRCLE, "Nouvel intérieur");

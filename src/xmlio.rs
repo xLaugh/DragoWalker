@@ -274,9 +274,12 @@ pub fn write_ytyp(t: &Ytyp) -> String {
                     val(&mut o, "     ", "mirrorPriority", p.mirror_priority);
                     val(&mut o, "     ", "opacity", p.opacity);
                     val(&mut o, "     ", "audioOcclusion", p.audio_occlusion);
-                    o.push_str("     <corners>\n");
+                    // coins : tableau de Vector3 en texte (« x y z » par ligne) — CodeWalker (XmlMeta) ignore des balises
+                    // <Item x y z /> ici : le fichier binaire avait des portails sans coins, et le jeu plantait en
+                    // chargeant l'intérieur (FiveM, GTA5_b3889.exe+6351AF, pointeur nul lu sur le portail de sortie)
+                    o.push_str("     <corners content=\"vector3_array\">\n");
                     for c in &p.corners {
-                        vec_tag(&mut o, "      ", "Item", *c);
+                        let _ = writeln!(o, "      {} {} {}", f(c.x), f(c.y), f(c.z));
                     }
                     o.push_str("     </corners>\n");
                     let att = m.portal_attached(pi);
@@ -501,8 +504,19 @@ pub fn read_ytyp(src: &str, fallback_name: &str) -> Result<Ytyp, String> {
                 for p in ports.children().filter(|c| c.is_element()) {
                     let mut corners = [V3::ZERO; 4];
                     if let Some(cs) = child(p, "corners") {
-                        for (i, c) in cs.children().filter(|c| c.is_element()).take(4).enumerate() {
-                            corners[i] = v3(attr_f(c, "x"), attr_f(c, "y"), attr_f(c, "z"));
+                        let items: Vec<_> = cs.children().filter(|c| c.is_element()).collect();
+                        if items.is_empty() {
+                            // forme de CodeWalker : texte « x, y, z » ou « x y z », un coin par ligne
+                            let nums: Vec<f32> = cs.text().unwrap_or("").split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).filter_map(|t| t.parse().ok()).collect();
+                            for (i, c) in nums.chunks(3).take(4).enumerate() {
+                                if c.len() == 3 {
+                                    corners[i] = v3(c[0], c[1], c[2]);
+                                }
+                            }
+                        } else {
+                            for (i, c) in items.into_iter().take(4).enumerate() {
+                                corners[i] = v3(attr_f(c, "x"), attr_f(c, "y"), attr_f(c, "z"));
+                            }
                         }
                     }
                     let mut portal = Portal::new(cval_i(p, "roomFrom", 0) as u32, cval_i(p, "roomTo", 0) as u32, corners);
@@ -564,6 +578,18 @@ mod tests {
         assert_eq!(back.mlos[0].rooms.len(), 3);
         assert_eq!(back.mlos[0].portals.len(), 2);
         assert_eq!(back.mlos[0].entities[0].room, 2);
+        // coins des portails : au format que CodeWalker lit (sinon portails sans coins dans le binaire : plantage en jeu)
+        assert!(s.contains("<corners content=\"vector3_array\">") && !s.contains("<corners>"));
+        for (a, b) in t.mlos[0].portals.iter().zip(&back.mlos[0].portals) {
+            for (ca, cb) in a.corners.iter().zip(&b.corners) {
+                assert!((*ca - *cb).len() < 1e-4, "{ca:?} {cb:?}");
+            }
+        }
+        // ancienne forme (<Item x y z />) et forme de CodeWalker (« x, y, z ») relues toutes les deux
+        let old = s.replacen("<corners content=\"vector3_array\">", "<corners>", 1);
+        assert!(read_ytyp(&old, "t").is_ok());
+        let cw = s.replace("<corners content=\"vector3_array\">\n      ", "<corners content=\"vector3_array\">\n      ");
+        assert!(read_ytyp(&cw, "t").is_ok());
     }
     #[test]
     fn pieces_des_ensembles() {

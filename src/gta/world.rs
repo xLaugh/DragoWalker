@@ -246,6 +246,9 @@ pub struct MloChild {
 pub struct MloDef {
     pub children: Vec<MloChild>,
     pub sets: Vec<u32>,
+    /// pièces et portails de l'intérieur (lus dans le .ytyp du jeu)
+    pub rooms: Vec<crate::gta::meta::GRoom>,
+    pub portals: Vec<crate::gta::meta::GPortal>,
 }
 
 /// Côté d'une case de la grille de recherche (mètres).
@@ -518,7 +521,7 @@ impl GameWorld {
                             }
                         })
                         .collect();
-                    mlo_defs.insert(a.name, (prio, Arc::new(MloDef { children, sets: a.mlo_sets.clone() })));
+                    mlo_defs.insert(a.name, (prio, Arc::new(MloDef { children, sets: a.mlo_sets.clone(), rooms: a.mlo_rooms.clone(), portals: a.mlo_portals.clone() })));
                 }
                 let arch = Arch {
                     flags: a.flags,

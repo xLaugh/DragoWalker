@@ -658,7 +658,7 @@ impl DwApp {
             imaps.push(("dw_terrain_lod".into(), false, vec!["dw_terrain_types".into()]));
         }
         let mut ityps: Vec<(String, Vec<String>)> = Vec::new();
-        let mut interiors: Vec<String> = Vec::new();
+        let mut interiors: Vec<(String, Vec<String>)> = Vec::new();
         // intérieurs des MLO importés : listés s'ils ont leur collision du même nom (recopiée par export_mlos)
         let imported_cols: std::collections::HashSet<String> = self.proj.mlo_res.iter().flat_map(|r| r.ybns.iter()).filter_map(|b| std::path::Path::new(b).file_stem().map(|s| s.to_string_lossy().to_lowercase())).collect();
         let external = self.mlo_external_ytyps();
@@ -668,8 +668,11 @@ impl DwApp {
             for m in &t.mlos {
                 let low = m.name.to_lowercase();
                 let has_col = if ext { imported_cols.contains(&low) } else { interior_bounds.iter().any(|b| b.eq_ignore_ascii_case(&low)) };
-                if has_col && !interiors.iter().any(|x: &String| x.eq_ignore_ascii_case(&low)) {
-                    interiors.push(m.name.clone());
+                let extra: Vec<String> = self.proj.mlo_bounds.iter().filter(|(n, _)| n.eq_ignore_ascii_case(&low)).flat_map(|(_, b)| b.iter().cloned()).collect();
+                if (has_col || !extra.is_empty()) && !interiors.iter().any(|x: &(String, Vec<String>)| x.0.eq_ignore_ascii_case(&low)) {
+                    let mut bounds = if has_col { vec![m.name.clone()] } else { Vec::new() };
+                    bounds.extend(extra);
+                    interiors.push((m.name.clone(), bounds));
                 }
                 for e in m.entities.iter().chain(m.entity_sets.iter().flat_map(|s| s.entities.iter())) {
                     if let Some(yt) = ytyp_of(&e.archetype) {
@@ -719,8 +722,12 @@ impl DwApp {
             s += "  <Interiors/>\n";
         } else {
             s += "  <Interiors itemType=\"CInteriorBoundsFiles\">\n";
-            for n in &interiors {
-                s += &format!("    <Item>\n      <Name>{n}</Name>\n      <Bounds>\n        <Item>{n}</Item>\n      </Bounds>\n    </Item>\n");
+            for (n, bounds) in &interiors {
+                s += &format!("    <Item>\n      <Name>{n}</Name>\n      <Bounds>\n");
+                for b in bounds {
+                    s += &format!("        <Item>{b}</Item>\n");
+                }
+                s += "      </Bounds>\n    </Item>\n";
             }
             s += "  </Interiors>\n";
         }

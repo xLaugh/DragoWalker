@@ -184,6 +184,20 @@ impl DwApp {
                     if b.x - a.x < 0.1 || b.y - a.y < 0.1 {
                         continue;
                     }
+                    // pièce reprise du jeu : murs et sol sont dans la collision du jeu ; une fine surface au vrai sol,
+                    // juste au-dessus, avec le numéro de la pièce (une pièce recoupée garde sinon celui de Rockstar)
+                    if r.game {
+                        if let Some(fz) = r.floor_z.filter(|_| ri as u32 <= ROOM_ID_MAX) {
+                            let mi = mats.len() as u8;
+                            mats.push((concrete, ri as u32));
+                            let z = fz + 0.01;
+                            let base = verts.len() as u32;
+                            verts.extend([v3(a.x, a.y, z), v3(b.x, a.y, z), v3(b.x, b.y, z), v3(a.x, b.y, z)]);
+                            tris.push((base, base + 1, base + 2, mi));
+                            tris.push((base, base + 2, base + 3, mi));
+                        }
+                        continue;
+                    }
                     // le numéro de pièce d'une surface tient sur 5 bits : pièces 1 à 31 seulement (une pièce 32
                     // deviendrait 0, « dehors »)
                     if ri as u32 > ROOM_ID_MAX {

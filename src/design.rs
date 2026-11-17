@@ -113,6 +113,11 @@ fn custom_by_key(k: u64) -> Option<(f32, Option<TexData>)> {
     CUSTOM.read().ok()?.iter().find(|c| c.0 == k).map(|c| (c.1, c.2.clone()))
 }
 
+/// Image PNG en base64 → texture avec ses niveaux de détail.
+pub fn b64_png_tex(b64: &str) -> Option<TexData> {
+    decode_png_tex(b64)
+}
+
 fn decode_png_tex(b64: &str) -> Option<TexData> {
     let bytes = b64_decode(b64)?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();

@@ -338,6 +338,26 @@ pub struct JCorner {
     pub hv: f32,
     pub rc: f32,
     pub curb: f32,
+    /// coin calculé sur les vraies routes (virages compris) : centre de l'arrondi (depuis le centre du
+    /// carrefour), normale de U et de V vers le coin, pointe intérieure où les deux bordures se croisent ; sans
+    /// lui, routes supposées droites (corner_geom)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f32; 8]>,
+}
+
+impl JCorner {
+    /// (centre de l'arrondi, normale de U vers le coin, normale de V vers le coin, pointe intérieure), depuis le
+    /// centre du carrefour.
+    pub fn geom(&self) -> Option<(V3, V3, V3, V3)> {
+        if let Some(a) = self.at {
+            return Some((v3(a[0], a[1], 0.0), v3(a[2], a[3], 0.0), v3(a[4], a[5], 0.0), v3(a[6], a[7], 0.0)));
+        }
+        let u = v3(self.u[0], self.u[1], 0.0);
+        let v = v3(self.v[0], self.v[1], 0.0);
+        let (cen, nu, nv, _, _) = corner_geom(u, self.hu, v, self.hv, self.rc)?;
+        let tip = corner_geom(u, self.hu, v, self.hv, 0.0).map(|g| g.0).unwrap_or(V3::ZERO);
+        Some((cen, nu, nv, tip))
+    }
 }
 
 /// Branche d'un carrefour : direction (à plat), demi-chaussée, demi-largeur totale (trottoirs compris),
@@ -349,6 +369,24 @@ pub struct JArm {
     pub total: f32,
     pub len: f32,
     pub cross: bool,
+    /// courbure de la route dans cette branche (1 / rayon, positive vers la gauche en s'éloignant du centre)
+    #[serde(default)]
+    pub bend: f32,
+}
+
+impl JArm {
+    /// Point de l'axe de la branche à `s` m du centre (depuis le centre) et tangente (en s'éloignant) : arc de
+    /// cercle de courbure `bend`.
+    pub fn frame(&self, s: f32) -> (V3, V3) {
+        let d = v3(self.dir[0], self.dir[1], 0.0);
+        let l = v3(-d.y, d.x, 0.0);
+        let k = self.bend;
+        if k.abs() < 1e-4 {
+            return (d * s, d);
+        }
+        let th = k * s;
+        (d * (th.sin() / k) + l * ((1.0 - th.cos()) / k), d * th.cos() + l * th.sin())
+    }
 }
 
 /// Géométrie d'un coin de trottoir entre la route U (axe `u`, demi-chaussée `hu`) et la route V (axe `v`,
@@ -409,6 +447,162 @@ fn seg_inter(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> Option<(f32,
     let t = (ac[0] * q[1] - ac[1] * q[0]) / den;
     let u = (ac[0] * r[1] - ac[1] * r[0]) / den;
     if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) { Some((t, u)) } else { None }
+}
+
+/// Premier croisement (le plus près des deux départs) de deux lignes (point, distance le long de leur route).
+fn poly_cross(a: &[(V3, f32)], b: &[(V3, f32)], ja: f32, jb: f32) -> Option<(V3, f32, f32)> {
+    let mut best: Option<(f32, V3, f32, f32)> = None;
+    for wa in a.windows(2) {
+        for wb in b.windows(2) {
+            let Some((t, u)) = seg_inter([wa[0].0.x, wa[0].0.y], [wa[1].0.x, wa[1].0.y], [wb[0].0.x, wb[0].0.y], [wb[1].0.x, wb[1].0.y]) else { continue };
+            let p = wa[0].0 + (wa[1].0 - wa[0].0) * t;
+            let ka = wa[0].1 + (wa[1].1 - wa[0].1) * t;
+            let kb = wb[0].1 + (wb[1].1 - wb[0].1) * u;
+            let cost = (ka - ja).abs() + (kb - jb).abs();
+            if best.is_none_or(|x| cost < x.0) {
+                best = Some((cost, p, ka, kb));
+            }
+        }
+    }
+    best.map(|b| (b.1, b.2, b.3))
+}
+
+/// Jusqu'où chercher un coin de trottoir le long des routes (m) : routes qui se rejoignent en biais très fermé
+/// comprises (≈ 10°).
+const CORNER_REACH: f32 = 120.0;
+
+/// Coin de trottoir arrondi entre la route `a` (branche qui part de la distance `ja` dans le sens `sa`, demi-chaussée
+/// `ha`) et la route `b` (de `jb` dans le sens `sb`, demi-chaussée `hb`), sur les vraies courbes : le centre de
+/// l'arrondi est à `ha + rc` de l'axe de a et à `hb + rc` de l'axe de b (croisement des deux bords décalés).
+/// Rend le coin (voir JCorner::at, depuis `c`) et les ouvertures de trottoir de a et de b [début, fin, côté].
+fn solve_corner(a: &Road, ja: f32, sa: f32, ha: f32, b: &Road, jb: f32, sb: f32, hb: f32, rc: f32, c: V3) -> Option<([f32; 8], [f32; 3], [f32; 3])> {
+    let (ta, tb) = (a.at(ja).1, b.at(jb).1);
+    let (da, db) = (ta * sa, tb * sb);
+    if (da.x * db.y - da.y * db.x).abs() < 0.03 && da.dot(db) > 0.0 {
+        return None; // branches confondues
+    }
+    let side_a = if db.dot(v3(ta.y, -ta.x, 0.0)) > 0.0 { 1.0 } else { -1.0 };
+    let side_b = if da.dot(v3(tb.y, -tb.x, 0.0)) > 0.0 { 1.0 } else { -1.0 };
+    let pa = a.offset_pts(side_a, ha + rc, ja, ja + sa * CORNER_REACH);
+    let pb = b.offset_pts(side_b, hb + rc, jb, jb + sb * CORNER_REACH);
+    let (p, ka, kb) = poly_cross(&pa, &pb, ja, jb)?;
+    // pointe intérieure : croisement des deux bordures
+    let ea = a.offset_pts(side_a, ha, ja, ka + sa * 2.0);
+    let eb = b.offset_pts(side_b, hb, jb, kb + sb * 2.0);
+    let tip = poly_cross(&ea, &eb, ja, jb).map(|x| x.0).unwrap_or(v3(c.x, c.y, 0.0));
+    let flat = |q: V3| v3(q.x, q.y, 0.0);
+    let nu = (p - flat(a.at(ka).0)).norm();
+    let nv = (p - flat(b.at(kb).0)).norm();
+    let rel = p - flat(c);
+    let tr = tip - flat(c);
+    Some(([rel.x, rel.y, nu.x, nu.y, nv.x, nv.y, tr.x, tr.y], [ja.min(ka), ja.max(ka), side_a], [jb.min(kb), jb.max(kb), side_b]))
+}
+
+/// Bout `idx` de la route `br` posé sur la route `th` : carrefour en T (trottoirs ouverts, coins arrondis,
+/// branches). Rend la hauteur de raccord du bout et le carrefour (aucun pour un prolongement bout à bout ou une
+/// bretelle qui se fond dans l'autoroute) ; None si le bout n'est pas sur `th`.
+fn t_join(br: &mut Road, idx: usize, th: &mut Road) -> Option<(f32, Option<Junction>)> {
+    let n = br.samples.len();
+    let len = br.length();
+    let hw = br.kind().width * 0.5;
+    let my_ext = br.ext();
+    let ohw = th.kind().width * 0.5;
+    let o_ext = th.ext();
+    let olen = th.length();
+    let dirt = br.kind().dirt && th.kind().dirt;
+    let s = br.samples[idx];
+        let Some((d, p, along, tan)) = th.nearest_point(s[0], s[1]) else { return None };
+        if d > ohw + 0.5 || (s[2] - p.z).abs() > JOIN_DZ {
+            return None;
+        }
+        // bretelle posée sur une autoroute : elle s'y fond, sans carrefour ni trottoir ouvert
+        if br.kind().ramp && th.kind().width >= 20.0 {
+            return Some((p.z, None));
+        }
+        if !th.ring && (along < 1.0 || along > olen - 1.0) {
+            // prolongement bout à bout : rien à ouvrir
+            return Some((p.z, None));
+        }
+        // côté de l'autre route par lequel arrive la nouvelle
+        let inner = br.samples[if idx == 0 { 5.min(n - 1) } else { n.saturating_sub(6) }];
+        let dir = v3(inner[0] - s[0], inner[1] - s[1], 0.0);
+        let right = v3(tan.y, -tan.x, 0.0);
+        let side = if dir.dot(right) > 0.0 { 1.0 } else { -1.0 };
+        // deux routes à trottoirs : chaque trottoir s'arrête exactement là où commence le coin arrondi
+        // (rayon = la plus petite largeur de trottoir) ; sinon ouverture large comme avant
+        let rc = br.kind().sidewalk.min(th.kind().sidewalk);
+        let din0 = dir.norm();
+        let geoms: Vec<(f32, Option<(V3, V3, V3, f32, f32)>)> = [1.0f32, -1.0].iter().map(|sg| (*sg, if rc > 0.0 { corner_geom(tan * *sg, ohw, din0, hw, rc) } else { None })).collect();
+        // coins sur les vraies routes (virages compris) ; anneau de rond-point : routes supposées droites
+        let (bj, bs) = if idx == 0 { (0.0, 1.0) } else { (len, -1.0) };
+        let solved: Option<Vec<([f32; 8], [f32; 3], [f32; 3])>> = if rc > 0.0 && !th.ring && !br.ring {
+            [1.0f32, -1.0].iter().map(|sg| solve_corner(th, along, *sg, ohw, br, bj, bs, hw, rc, p)).collect()
+        } else {
+            None
+        };
+        if let Some(list) = &solved {
+            for (_, ga, gb) in list {
+                th.gaps.push(*ga);
+                // bout de la route : ouverture jusqu'au bout (et un peu au-delà)
+                br.gaps.push(if idx == 0 { [-1.0, gb[1], gb[2]] } else { [gb[0], len + 1.0, gb[2]] });
+            }
+        } else if geoms.iter().all(|g| g.1.is_some()) {
+            // le sens de la nouvelle route à ce bout (pour savoir quel trottoir est de quel côté)
+            let dn = if idx == 0 { din0 } else { din0 * -1.0 };
+            let rn = v3(dn.y, -dn.x, 0.0);
+            for (sg, g) in &geoms {
+                let (_, _, _, tu, tv) = g.unwrap();
+                th.gaps.push(if *sg > 0.0 { [along, along + tu, side] } else { [along - tu, along, side] });
+                let side_n = if (tan * *sg).dot(rn) > 0.0 { 1.0 } else { -1.0 };
+                br.gaps.push(if idx == 0 { [0.0, tv, side_n] } else { [len - tv, len + 1.0, side_n] });
+            }
+        } else {
+            th.gaps.push([along - hw - 1.0, along + hw + 1.0, side]);
+            if idx == 0 {
+                br.gaps.push([0.0, o_ext, 0.0]);
+            } else {
+                br.gaps.push([len - o_ext, len + 1.0, 0.0]);
+            }
+        }
+        // branches : la nouvelle route (vers l'intérieur de la nouvelle route) et l'autre dans ses deux sens
+        let din = dir.norm();
+        let my_total = br.half_total();
+        let o_total = th.half_total();
+        // pas de passage piéton en travers de l'anneau d'un rond-point (seulement sur les routes qui y entrent)
+        let my_cross = br.kind().sidewalk > 0.0 && !br.ring;
+        let o_cross = th.kind().sidewalk > 0.0 && !th.ring;
+        // courbure de chaque branche (en s'éloignant du centre)
+        let (kb, ko) = (br.curvature_at(bj) * bs, if th.ring { 0.0 } else { th.curvature_at(along) });
+        let arms = vec![
+            JArm { dir: [din.x, din.y], hw, total: my_total, len: o_ext, cross: my_cross, bend: kb },
+            JArm { dir: [tan.x, tan.y], hw: ohw, total: o_total, len: my_ext, cross: o_cross, bend: ko },
+            JArm { dir: [-tan.x, -tan.y], hw: ohw, total: o_total, len: my_ext, cross: o_cross, bend: -ko },
+        ];
+        let mut corners = Vec::new();
+        let curb = br.kind().curb.min(th.kind().curb);
+        if let Some(list) = &solved {
+            for (sgn, (at, _, _)) in [1.0f32, -1.0].iter().zip(list) {
+                corners.push(JCorner { u: [tan.x * sgn, tan.y * sgn], v: [din.x, din.y], hu: ohw, hv: hw, rc, curb, at: Some(*at) });
+            }
+        } else if geoms.iter().all(|g| g.1.is_some()) {
+            for sgn in [1.0f32, -1.0] {
+                corners.push(JCorner { u: [tan.x * sgn, tan.y * sgn], v: [din.x, din.y], hu: ohw, hv: hw, rc, curb, at: None });
+            }
+        }
+        // rond-point : priorité à l'anneau, ni feux ni stops
+        let control = if th.ring || br.ring { 3 } else { 0 };
+    Some((p.z, Some(Junction { pos: [p.x, p.y, p.z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control, props: Vec::new() })))
+}
+
+/// Raccord en douceur des hauteurs de `r` vers `zc` au point `i0` (sur HEIGHT_BLEND m).
+fn blend_heights(r: &mut Road, i0: usize, zc: f32) {
+    let d0 = r.samples[i0][3];
+    let delta = zc - r.samples[i0][2];
+    for s in r.samples.iter_mut() {
+        let w = (1.0 - (s[3] - d0).abs() / HEIGHT_BLEND).max(0.0);
+        s[2] += delta * w * w * (3.0 - 2.0 * w);
+    }
+    r.samples[i0][2] = zc;
 }
 
 impl Road {
@@ -836,6 +1030,33 @@ impl Road {
         (v3(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f), v3(b[0] - a[0], b[1] - a[1], 0.0).norm())
     }
 
+    /// Courbure de l'axe à la distance `d` (1 / rayon, positive quand la route tourne à gauche).
+    pub fn curvature_at(&self, d: f32) -> f32 {
+        let len = self.length();
+        let h = (len * 0.25).clamp(0.5, 5.0);
+        let (d0, d1) = ((d - h).max(0.0), (d + h).min(len));
+        if d1 - d0 < 0.5 {
+            return 0.0;
+        }
+        let (t0, t1) = (self.at(d0).1, self.at(d1).1);
+        (t0.x * t1.y - t0.y * t1.x).atan2(t0.x * t1.x + t0.y * t1.y) / (d1 - d0)
+    }
+
+    /// Bord décalé de `off` (côté `side` : 1 droite, -1 gauche) de `from` à `to` (dans cet ordre), tous les 0,5 m :
+    /// (point à plat, distance le long de la route).
+    fn offset_pts(&self, side: f32, off: f32, from: f32, to: f32) -> Vec<(V3, f32)> {
+        let len = self.length();
+        let (from, to) = (from.clamp(0.0, len), to.clamp(0.0, len));
+        let steps = ((to - from).abs() / 0.5).ceil().max(1.0) as usize;
+        (0..=steps)
+            .map(|i| {
+                let d = from + (to - from) * i as f32 / steps as f32;
+                let (p, t) = self.at(d);
+                (v3(p.x, p.y, 0.0) + v3(t.y, -t.x, 0.0) * (side * off), d)
+            })
+            .collect()
+    }
+
     /// Vrai si la distance `d` le long de la route est sur un tronçon en pont.
     pub fn in_span(&self, d: f32) -> bool {
         self.spans.iter().any(|s| d >= s[0] && d <= s[1])
@@ -1069,70 +1290,26 @@ impl Road {
             // extrémités de la nouvelle route posées sur l'autre (un rond-point n'en a pas)
             let ends: &[usize] = if self.ring { &[] } else { &[0, n - 1] };
             for &idx in ends {
-                let s = self.samples[idx];
-                let Some((d, p, along, tan)) = o.nearest_point(s[0], s[1]) else { continue };
-                if d > ohw + 0.5 || (s[2] - p.z).abs() > JOIN_DZ {
-                    continue;
+                if let Some((z, j)) = t_join(self, idx, o) {
+                    cons.push((idx, z));
+                    js.extend(j);
                 }
-                cons.push((idx, p.z));
-                // bretelle posée sur une autoroute : elle s'y fond, sans carrefour ni trottoir ouvert
-                if self.kind().ramp && o.kind().width >= 20.0 {
-                    continue;
-                }
-                if !o.ring && (along < 1.0 || along > olen - 1.0) {
-                    // prolongement bout à bout : rien à ouvrir
-                    continue;
-                }
-                // côté de l'autre route par lequel arrive la nouvelle
-                let inner = self.samples[if idx == 0 { 5.min(n - 1) } else { n.saturating_sub(6) }];
-                let dir = v3(inner[0] - s[0], inner[1] - s[1], 0.0);
-                let right = v3(tan.y, -tan.x, 0.0);
-                let side = if dir.dot(right) > 0.0 { 1.0 } else { -1.0 };
-                // deux routes à trottoirs : chaque trottoir s'arrête exactement là où commence le coin arrondi
-                // (rayon = la plus petite largeur de trottoir) ; sinon ouverture large comme avant
-                let rc = self.kind().sidewalk.min(o.kind().sidewalk);
-                let din0 = dir.norm();
-                let geoms: Vec<(f32, Option<(V3, V3, V3, f32, f32)>)> = [1.0f32, -1.0].iter().map(|sg| (*sg, if rc > 0.0 { corner_geom(tan * *sg, ohw, din0, hw, rc) } else { None })).collect();
-                if geoms.iter().all(|g| g.1.is_some()) {
-                    // le sens de la nouvelle route à ce bout (pour savoir quel trottoir est de quel côté)
-                    let dn = if idx == 0 { din0 } else { din0 * -1.0 };
-                    let rn = v3(dn.y, -dn.x, 0.0);
-                    for (sg, g) in &geoms {
-                        let (_, _, _, tu, tv) = g.unwrap();
-                        o.gaps.push(if *sg > 0.0 { [along, along + tu, side] } else { [along - tu, along, side] });
-                        let side_n = if (tan * *sg).dot(rn) > 0.0 { 1.0 } else { -1.0 };
-                        self.gaps.push(if idx == 0 { [0.0, tv, side_n] } else { [len - tv, len + 1.0, side_n] });
+            }
+            // extrémités de l'autre route posées sur la nouvelle (route tracée par-dessus le bout d'une autre)
+            if !o.ring && o.samples.len() >= 2 {
+                let on = o.samples.len();
+                for idx in [0, on - 1] {
+                    let s = o.samples[idx];
+                    if js.iter().any(|q: &Junction| (q.pos[0] - s[0]).powi(2) + (q.pos[1] - s[1]).powi(2) < 4.0) {
+                        continue; // déjà un carrefour ici
                     }
-                } else {
-                    o.gaps.push([along - hw - 1.0, along + hw + 1.0, side]);
-                    if idx == 0 {
-                        self.gaps.push([0.0, o_ext, 0.0]);
-                    } else {
-                        self.gaps.push([len - o_ext, len + 1.0, 0.0]);
+                    if let Some((z, j)) = t_join(o, idx, self) {
+                        if j.is_some() {
+                            blend_heights(o, idx, z);
+                        }
+                        js.extend(j);
                     }
                 }
-                // branches : la nouvelle route (vers l'intérieur de la nouvelle route) et l'autre dans ses deux sens
-                let din = dir.norm();
-                let my_total = self.half_total();
-                let o_total = o.half_total();
-                // pas de passage piéton en travers de l'anneau d'un rond-point (seulement sur les routes qui y entrent)
-                let my_cross = self.kind().sidewalk > 0.0 && !self.ring;
-                let o_cross = o.kind().sidewalk > 0.0 && !o.ring;
-                let arms = vec![
-                    JArm { dir: [din.x, din.y], hw, total: my_total, len: o_ext, cross: my_cross },
-                    JArm { dir: [tan.x, tan.y], hw: ohw, total: o_total, len: my_ext, cross: o_cross },
-                    JArm { dir: [-tan.x, -tan.y], hw: ohw, total: o_total, len: my_ext, cross: o_cross },
-                ];
-                let mut corners = Vec::new();
-                if geoms.iter().all(|g| g.1.is_some()) {
-                    let curb = self.kind().curb.min(o.kind().curb);
-                    for sgn in [1.0f32, -1.0] {
-                        corners.push(JCorner { u: [tan.x * sgn, tan.y * sgn], v: [din.x, din.y], hu: ohw, hv: hw, rc, curb });
-                    }
-                }
-                // rond-point : priorité à l'anneau, ni feux ni stops
-                let control = if o.ring || self.ring { 3 } else { 0 };
-                js.push(Junction { pos: [p.x, p.y, p.z], r: hw.max(ohw) * 1.15 + 0.5, dirt, arms, corners, control, props: Vec::new() });
             }
             // croisements au milieu
             for j in 0..n - 1 {
@@ -1145,6 +1322,9 @@ impl Road {
                         continue; // extrémité : déjà traitée
                     }
                     let dk = c[3] + (dd[3] - c[3]) * u;
+                    if !o.ring && (dk < hw + 1.0 || dk > olen - hw - 1.0) {
+                        continue; // extrémité de l'autre route : carrefour en T
+                    }
                     let z = c[2] + (dd[2] - c[2]) * u;
                     if (a[2] + (b[2] - a[2]) * t - z).abs() > JOIN_DZ {
                         continue; // l'une passe au-dessus de l'autre (pont)
@@ -1160,8 +1340,19 @@ impl Road {
                     let dk0 = v3(dd[0] - c[0], dd[1] - c[1], 0.0).norm();
                     let quads = [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)];
                     let cg: Vec<Option<(V3, V3, V3, f32, f32)>> = quads.iter().map(|(su, sv)| if rc > 0.0 { corner_geom(ds0 * *su, hw, dk0 * *sv, ohw, rc) } else { None }).collect();
-                    let corners_ok = cg.iter().all(|g| g.is_some());
-                    if corners_ok {
+                    let jc = v3(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, z);
+                    let solved: Option<Vec<([f32; 8], [f32; 3], [f32; 3])>> = if rc > 0.0 && !o.ring && !self.ring {
+                        quads.iter().map(|(su, sv)| solve_corner(self, dj, *su, hw, o, dk, *sv, ohw, rc, jc)).collect()
+                    } else {
+                        None
+                    };
+                    let corners_ok = solved.is_some() || cg.iter().all(|g| g.is_some());
+                    if let Some(list) = &solved {
+                        for (_, ga, gb) in list {
+                            self.gaps.push(*ga);
+                            o.gaps.push(*gb);
+                        }
+                    } else if corners_ok {
                         let (rs, ro) = (v3(ds0.y, -ds0.x, 0.0), v3(dk0.y, -dk0.x, 0.0));
                         for ((su, sv), g) in quads.iter().zip(&cg) {
                             let (_, _, _, tu, tv) = g.unwrap();
@@ -1178,17 +1369,19 @@ impl Road {
                     let dk2 = v3(dd[0] - c[0], dd[1] - c[1], 0.0).norm();
                     let (my_total, o_total) = (self.half_total(), o.half_total());
                     let (mc, oc) = (self.kind().sidewalk > 0.0 && !self.ring, o.kind().sidewalk > 0.0 && !o.ring);
+                    let (k1, k2) = (if self.ring { 0.0 } else { self.curvature_at(dj) }, if o.ring { 0.0 } else { o.curvature_at(dk) });
                     let arms = vec![
-                        JArm { dir: [ds.x, ds.y], hw, total: my_total, len: o_ext, cross: mc },
-                        JArm { dir: [-ds.x, -ds.y], hw, total: my_total, len: o_ext, cross: mc },
-                        JArm { dir: [dk2.x, dk2.y], hw: ohw, total: o_total, len: my_ext, cross: oc },
-                        JArm { dir: [-dk2.x, -dk2.y], hw: ohw, total: o_total, len: my_ext, cross: oc },
+                        JArm { dir: [ds.x, ds.y], hw, total: my_total, len: o_ext, cross: mc, bend: k1 },
+                        JArm { dir: [-ds.x, -ds.y], hw, total: my_total, len: o_ext, cross: mc, bend: -k1 },
+                        JArm { dir: [dk2.x, dk2.y], hw: ohw, total: o_total, len: my_ext, cross: oc, bend: k2 },
+                        JArm { dir: [-dk2.x, -dk2.y], hw: ohw, total: o_total, len: my_ext, cross: oc, bend: -k2 },
                     ];
                     let mut corners = Vec::new();
                     if corners_ok {
                         let curb = self.kind().curb.min(o.kind().curb);
-                        for (su, sv) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
-                            corners.push(JCorner { u: [ds.x * su, ds.y * su], v: [dk2.x * sv, dk2.y * sv], hu: hw, hv: ohw, rc, curb });
+                        for (qi, (su, sv)) in quads.iter().enumerate() {
+                            let at = solved.as_ref().map(|l| l[qi].0);
+                            corners.push(JCorner { u: [ds.x * su, ds.y * su], v: [dk2.x * sv, dk2.y * sv], hu: hw, hv: ohw, rc, curb, at });
                         }
                     }
                     let control = if o.ring || self.ring { 3 } else { 0 };
@@ -1198,13 +1391,7 @@ impl Road {
         }
         // hauteur : raccord en douceur vers chaque point imposé
         for (i0, zc) in cons {
-            let d0 = self.samples[i0][3];
-            let delta = zc - self.samples[i0][2];
-            for s in self.samples.iter_mut() {
-                let w = (1.0 - (s[3] - d0).abs() / HEIGHT_BLEND).max(0.0);
-                s[2] += delta * w * w * (3.0 - 2.0 * w);
-            }
-            self.samples[i0][2] = zc;
+            blend_heights(self, i0, zc);
         }
         js
     }
@@ -1213,6 +1400,28 @@ impl Road {
     /// Chaussée un peu au-dessus du terrain aplani (+0,08 m), trottoirs à la hauteur de la bordure, et une
     /// jupe qui descend sous le terrain sur les bords pour qu'aucun trou ne se voie.
     pub fn mesh(&self, origin: V3) -> (Vec<V3>, Vec<[f32; 2]>, Vec<(u64, Vec<u32>, u8)>) {
+        // trottoirs ouverts : un point de plus pile à chaque bord d'ouverture, pour que le trottoir s'arrête et reprenne
+        // exactement au coin arrondi (sinon jusqu'à 1,5 m d'encoche ou de débord)
+        if !self.ring && !self.gaps.is_empty() {
+            let len = self.length();
+            let mut cuts: Vec<f32> = self.gaps.iter().flat_map(|g| [g[0], g[1]]).filter(|d| *d > 0.05 && *d < len - 0.05).collect();
+            cuts.retain(|d| !self.samples.iter().any(|s| (s[3] - d).abs() < 0.05));
+            if !cuts.is_empty() {
+                let mut r = self.clone();
+                for d in cuts {
+                    let Some(i) = r.samples.iter().position(|s| s[3] > d) else { continue };
+                    if i == 0 || (r.samples[i][3] - d).abs() < 0.05 || (r.samples[i - 1][3] - d).abs() < 0.05 {
+                        continue;
+                    }
+                    let (a, b) = (r.samples[i - 1], r.samples[i]);
+                    let f = (d - a[3]) / (b[3] - a[3]).max(1e-6);
+                    r.samples.insert(i, [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, d]);
+                }
+                if r.samples.len() > self.samples.len() {
+                    return r.mesh(origin);
+                }
+            }
+        }
         let k = self.kind();
         let hw = k.width * 0.5;
         let n = self.samples.len();
@@ -1355,6 +1564,18 @@ impl Road {
             let key = crate::terrain::material_key(k.shoulder_mat as usize);
             strip(&[(-hw - sh, -0.5, (-hw - sh) / 6.0), (-hw - sh, lift - 0.04, (-hw - sh) / 6.0 + 0.1), (-hw, lift, -hw / 6.0 + 0.1)], 6.0, key, 2, Some(-1.0));
             strip(&[(hw, lift, hw / 6.0), (hw + sh, lift - 0.04, (hw + sh) / 6.0), (hw + sh, -0.5, (hw + sh) / 6.0 + 0.1)], 6.0, key, 2, Some(1.0));
+        }
+        // carrefours : là où le trottoir (ou l'accotement) s'ouvre, goudron uni à la hauteur de la chaussée, qui suit
+        // la route (sinon on voyait le terrain entre la chaussée et le coin de trottoir dans les virages)
+        let edge = k.sidewalk.max(k.shoulder);
+        if edge > 0.0 && !k.foot && !self.ring {
+            let key = if k.dirt { DIRT_PLAIN_KEY } else { ASPHALT_KEY };
+            for sd in [-1.0f32, 1.0] {
+                let open = |m: f32| !in_span(m) && !in_tun(m) && gaps.iter().any(|g| m >= g[0] && m <= g[1] && (g[2] == 0.0 || g[2] == sd));
+                // jupe qui descend sous le terrain côté extérieur
+                let cols = if sd < 0.0 { [(-hw - edge, -0.6, (-hw - edge) / 6.0 - 0.1), (-hw - edge, lift, (-hw - edge) / 6.0), (-hw, lift, -hw / 6.0)] } else { [(hw, lift, hw / 6.0), (hw + edge, lift, (hw + edge) / 6.0), (hw + edge, -0.6, (hw + edge) / 6.0 + 0.1)] };
+                strip_ex(&cols, 6.0, key, 0, None, &open, false);
+            }
         }
         if !spans.is_empty() {
             let concrete = crate::terrain::material_key(4);
@@ -1750,18 +1971,28 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
         idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     };
     for a in &j.arms {
-        let d = v3(a.dir[0], a.dir[1], 0.0);
-        let r = v3(d.y, -d.x, 0.0);
         let z = v3(0.0, 0.0, 0.095);
-        let corners = [c + z - r * a.total, c + z + r * a.total, c + z + r * a.total + d * a.len, c + z - r * a.total + d * a.len];
         let w = |p: V3| [(p.x + origin.x) / 6.0, (p.y + origin.y) / 6.0];
-        let u = [w(corners[0]), w(corners[1]), w(corners[2]), w(corners[3])];
-        quad(&mut pos, &mut uv, &mut plain, corners, u);
-        if crosswalks && a.cross && a.len > 3.6 {
+        // goudron de la branche : bande de toute la largeur qui suit la route (virage compris)
+        let seg = if a.bend.abs() < 1e-4 { 1 } else { ((a.len / 1.5).ceil() as usize).clamp(2, 24) };
+        for i in 0..seg {
+            let (s0, s1) = (a.len * i as f32 / seg as f32, a.len * (i + 1) as f32 / seg as f32);
+            let ((p0, t0), (p1, t1)) = (a.frame(s0), a.frame(s1));
+            let (r0, r1) = (v3(t0.y, -t0.x, 0.0), v3(t1.y, -t1.x, 0.0));
+            let q = [c + z + p0 - r0 * a.total, c + z + p0 + r0 * a.total, c + z + p1 + r1 * a.total, c + z + p1 - r1 * a.total];
+            let u = [w(q[0]), w(q[1]), w(q[2]), w(q[3])];
+            quad(&mut pos, &mut uv, &mut plain, q, u);
+        }
+        // passage piéton seulement s'il y a une route en travers (pas là où deux routes se rejoignent en biais
+        // très fermé : il tomberait loin du carrefour)
+        let crossed = j.arms.iter().any(|b| (a.dir[0] * b.dir[0] + a.dir[1] * b.dir[1]).abs() < 0.7);
+        if crosswalks && a.cross && crossed && a.len > 3.6 {
             let z = v3(0.0, 0.0, 0.1);
             let d0 = crosswalk_start(j, a);
             let d1 = d0 + 3.0;
-            let q = [c + z - r * a.hw + d * d0, c + z + r * a.hw + d * d0, c + z + r * a.hw + d * d1, c + z - r * a.hw + d * d1];
+            let ((p0, t0), (p1, t1)) = (a.frame(d0), a.frame(d1));
+            let (r0, r1) = (v3(t0.y, -t0.x, 0.0), v3(t1.y, -t1.x, 0.0));
+            let q = [c + z + p0 - r0 * a.hw, c + z + p0 + r0 * a.hw, c + z + p1 + r1 * a.hw, c + z + p1 - r1 * a.hw];
             let u = [[0.0, 0.0], [a.hw * 2.0, 0.0], [a.hw * 2.0, 1.0], [0.0, 1.0]];
             quad(&mut pos, &mut uv, &mut zebra, q, u);
         }
@@ -1770,9 +2001,7 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
     // chaussée ; chaque face une seule fois, dans le bon sens (dessus vers le haut, bordure vers la chaussée)
     let mut side = Vec::new();
     for k in &j.corners {
-        let u = v3(k.u[0], k.u[1], 0.0);
-        let v = v3(k.v[0], k.v[1], 0.0);
-        let Some((cen, nu, nv, _, _)) = corner_geom(u, k.hu, v, k.hv, k.rc) else { continue };
+        let Some((cen, nu, nv, tip)) = k.geom() else { continue };
         let top = 0.08 + k.curb;
         let ctr = c + cen;
         let seg = 10;
@@ -1796,11 +2025,12 @@ pub fn junction_arms_mesh(j: &Junction, origin: V3, crosswalks: bool) -> (Vec<V3
         let up = v3(0.0, 0.0, 1.0);
         let lift_top = v3(0.0, 0.0, top);
         let lift_bot = v3(0.0, 0.0, 0.08);
-        // goudron entre le centre du carrefour et l'arrondi (angle obtus des routes en biais)
+        // goudron entre la pointe où les deux bordures se croisent et l'arrondi (angle obtus des routes en biais,
+        // routes qui se rejoignent en biais très fermé)
         let lift_road = v3(0.0, 0.0, 0.095);
         let start = pos.len();
         for w in arc.windows(2) {
-            tri(&mut pos, &mut uv, &mut plain, [c + lift_road, w[0] + lift_road, w[1] + lift_road], up);
+            tri(&mut pos, &mut uv, &mut plain, [c + tip + lift_road, w[0] + lift_road, w[1] + lift_road], up);
         }
         // même échelle que le reste du goudron (6 m au lieu de 2 m)
         for t in uv[start..].iter_mut() {
@@ -2402,6 +2632,40 @@ mod bridge_tests {
         }
         let rr = old.reversed().reversed();
         assert!(old.samples.iter().zip(&rr.samples).all(|(a, b)| (a[3] - b[3]).abs() < 1e-3 && a[0] == b[0]));
+    }
+
+    #[test]
+    fn carrefour_en_t_dans_un_virage_et_trace_par_dessus() {
+        // route principale en arc (rayon 35 m) qui passe par l'origine, rue qui y finit par le nord
+        let arc: Vec<V3> = (0..7).map(|i| { let t = (i as f32 - 3.0) / 3.0 * 1.3; v3(35.0 * t.sin(), 35.0 * t.cos() - 35.0, 0.0) }).collect();
+        let main = Road::build(0, &arc, flat, MAX_GRADE, false).unwrap();
+        let branch = Road::build(0, &[v3(0.0, 70.0, 0.0), v3(0.0, 0.0, 0.0)], flat, MAX_GRADE, false).unwrap();
+        for swap in [false, true] {
+            let (mut first, mut second) = if swap { (branch.clone(), main.clone()) } else { (main.clone(), branch.clone()) };
+            let mut others = vec![first.clone()];
+            let js = second.attach(&mut others);
+            first = others.remove(0);
+            assert_eq!(js.len(), 1, "un carrefour (ordre inversé : {swap})");
+            let j = &js[0];
+            assert_eq!(j.arms.len(), 3);
+            assert_eq!(j.corners.len(), 2);
+            let (m, b) = if swap { (&second, &first) } else { (&first, &second) };
+            for k in &j.corners {
+                let (cen, nu, nv, _) = k.geom().unwrap();
+                let p = cen + v3(j.pos[0], j.pos[1], 0.0);
+                // le centre de l'arrondi est à demi-chaussée + rayon des deux axes (virage compris)
+                let dm = m.nearest_point(p.x, p.y).unwrap().0;
+                let db = b.nearest_point(p.x, p.y).unwrap().0;
+                assert!((dm - (5.5 + k.rc)).abs() < 0.3, "{dm}");
+                assert!((db - (5.5 + k.rc)).abs() < 0.3, "{db}");
+                assert!(nu.len() > 0.99 && nv.len() > 0.99);
+                // côté nord du virage (celui de la rue)
+                assert!(p.y > 0.0);
+            }
+            // la route principale est ouverte côté rue seulement, la rue des deux côtés à son bout
+            assert!(m.gaps.len() == 2 && m.gaps.iter().all(|g| g[2] == m.gaps[0][2] && g[2] != 0.0));
+            assert!(b.gaps.len() == 2);
+        }
     }
 
     #[test]

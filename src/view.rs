@@ -5,7 +5,7 @@ use crate::math::{v3, V3};
 use crate::mech;
 use crate::model::{Entity, ItemRef};
 use crate::render;
-use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke};
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, RichText, Sense, Stroke};
 use std::collections::HashSet;
 
 impl DwApp {
@@ -149,7 +149,12 @@ impl DwApp {
         }
         if resp.hovered() {
             let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
+            let rmb = ctx.input(|i| i.pointer.secondary_down());
+            if scroll != 0.0 && rmb && !self.cam.map_view {
+                // clic droit maintenu (on regarde autour) + molette : vitesse de déplacement
+                self.set_move_speed(self.speed_mult * if scroll > 0.0 { 1.2 } else { 1.0 / 1.2 });
+                self.status = format!("Vitesse de déplacement ×{:.2} (clic droit maintenu + molette ; bouton sous la boussole pour la souris).", self.speed_mult);
+            } else if scroll != 0.0 {
                 if self.group_place.is_some() || self.furn.place.is_some() {
                     // pose d'un groupe ou d'un meuble : la molette le tourne (groups.rs, meubler.rs)
                 } else if self.tool == Tool::Erase && mods.alt {
@@ -494,6 +499,7 @@ impl DwApp {
         painter.line_segment([c, c + n * 17.0], Stroke::new(3.0_f32, Color32::from_rgb(230, 70, 60)));
         painter.line_segment([c, c - n * 12.0], Stroke::new(2.0_f32, Color32::from_gray(200)));
         painter.text(c + n * 29.0, egui::Align2::CENTER_CENTER, "N", egui::FontId::proportional(12.0), Color32::WHITE);
+        self.cam_speed_widget(&ctx, rect);
         // aide
         let help = match self.tool {
             Tool::Select => "Sélection : clic = choisir (reclic = celui de derrière) · glisser = déplacer ou rectangle · H = cacher · C = couper le haut · Suppr = supprimer",
@@ -916,5 +922,66 @@ impl DwApp {
             let d = if d.x.abs() > d.y.abs() { v3(d.x.signum(), 0.0, 0.0) } else { v3(0.0, d.y.signum(), 0.0) };
             self.move_selected(d * step);
         }
+    }
+}
+
+impl DwApp {
+    /// Vitesse de déplacement (×), gardée dans les réglages.
+    pub fn set_move_speed(&mut self, v: f32) {
+        self.speed_mult = v.clamp(crate::app::MOVE_SPEED.0, crate::app::MOVE_SPEED.1);
+        crate::app::save_setting("cam_speed", serde_json::json!(self.speed_mult));
+    }
+
+    /// Sensibilité de la souris (×), gardée dans les réglages.
+    pub fn set_mouse_sens(&mut self, v: f32) {
+        self.cam.sens = v.clamp(crate::app::MOUSE_SENS.0, crate::app::MOUSE_SENS.1);
+        crate::app::save_setting("cam_sensitivity", serde_json::json!(self.cam.sens));
+    }
+
+    /// Bouton sous la boussole : vitesse de déplacement et sensibilité de la souris, réglables là où l'on se balade.
+    fn cam_speed_widget(&mut self, ctx: &egui::Context, rect: Rect) {
+        use crate::look::ic;
+        let at = rect.right_top() + egui::vec2(-72.0, 66.0);
+        egui::Area::new(egui::Id::new("cam_speed_btn")).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+            let txt = RichText::new(format!("{} ×{:.1}", ic::GAUGE, self.speed_mult)).size(12.0);
+            let b = egui::Button::new(txt).fill(Color32::from_rgba_unmultiplied(0, 0, 0, 150)).min_size(egui::vec2(72.0, 20.0)).selected(self.cam_panel);
+            if ui.add(b).on_hover_text("Vitesse de déplacement et sensibilité de la souris (aussi : clic droit maintenu + molette = vitesse)").clicked() {
+                self.cam_panel = !self.cam_panel;
+            }
+        });
+        if !self.cam_panel {
+            return;
+        }
+        let at = rect.right_top() + egui::vec2(-262.0, 92.0);
+        egui::Area::new(egui::Id::new("cam_speed_panel")).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(250.0);
+                ui.label(RichText::new("Se déplacer").strong());
+                let mut v = self.speed_mult;
+                ui.horizontal(|ui| {
+                    ui.label("Vitesse");
+                    if ui.add(egui::Slider::new(&mut v, crate::app::MOVE_SPEED.0..=crate::app::MOVE_SPEED.1).logarithmic(true).suffix(" ×").max_decimals(2)).on_hover_text("Z Q S D / flèches, Page préc. / suiv. ; Maj ×5, Ctrl ×0,2").changed() {
+                        self.set_move_speed(v);
+                    }
+                });
+                let mut m = self.cam.sens;
+                ui.horizontal(|ui| {
+                    ui.label("Souris ");
+                    if ui.add(egui::Slider::new(&mut m, crate::app::MOUSE_SENS.0..=crate::app::MOUSE_SENS.1).logarithmic(true).suffix(" ×").max_decimals(2)).on_hover_text("Vitesse à laquelle la vue tourne quand tu glisses avec le clic droit").changed() {
+                        self.set_mouse_sens(m);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Par défaut").clicked() {
+                        self.set_move_speed(1.0);
+                        self.set_mouse_sens(1.0);
+                    }
+                    if ui.small_button("Fermer").clicked() {
+                        self.cam_panel = false;
+                    }
+                });
+                ui.label(RichText::new("Astuce : clic droit maintenu + molette change la vitesse en te baladant.").small().weak());
+            });
+        });
     }
 }

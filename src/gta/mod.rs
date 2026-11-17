@@ -155,6 +155,43 @@ pub fn probe(game: &str, cw: &str) {
         let prog = std::sync::Arc::new(std::sync::Mutex::new(world::Progress { text: String::new(), frac: 0.0 }));
         match world::GameWorld::load(Path::new(game), cw, prog) {
             Ok(w) => {
+                // DW_ARCH_FLAGS="nom1,nom2" : drapeaux et dictionnaires de types d'objets du jeu
+                if let Ok(list) = std::env::var("DW_ARCH_FLAGS") {
+                    for n in list.split(',') {
+                        match w.archetypes.get(&crypto::joaat(n.trim())) {
+                            Some(a) => println!("{n:<28} flags {:>10} (0x{:08x}) lod {:>6.1} txd {} phys/drawdict {} type {}", a.flags, a.flags, a.lod_dist, w.name_of(a.texture_dict), w.name_of(a.drawable_dict), a.asset_type),
+                            None => println!("{n:<28} introuvable"),
+                        }
+                    }
+                    return;
+                }
+                if std::env::var("DW_GROUNDTEX").is_ok() {
+                    let n = crate::groundtex::load(&w);
+                    println!("textures du sol du jeu lues : {n} / {}", crate::groundtex::MAP.len());
+                    crate::groundtex::set_enabled_quiet(true);
+                    for g in &crate::groundtex::MAP {
+                        let ok = crate::groundtex::get(g.key).map(|t| format!("{}x{}", t.w, t.h)).unwrap_or_else(|| "ABSENTE".into());
+                        println!("   {:<20} {:<22} {:<36} {ok}", g.label, g.txd, g.tex);
+                    }
+                    // DW_GROUNDTEX=<fichier.png> : planche des textures (128 px chacune)
+                    if let Ok(out) = std::env::var("DW_GROUNDTEX") {
+                        if out.ends_with(".png") {
+                            let n = crate::groundtex::MAP.len() as u32;
+                            let cols = 6u32;
+                            let mut img = image::RgbaImage::new(cols * 128, n.div_ceil(cols) * 128);
+                            for (i, g) in crate::groundtex::MAP.iter().enumerate() {
+                                if let Some(r) = crate::groundtex::get(g.key).and_then(|t| crate::texdecode::decode_level(&t, 128)) {
+                                    if let Some(sub) = image::RgbaImage::from_raw(r.w as u32, r.h as u32, r.px) {
+                                        let sub = image::imageops::resize(&sub, 128, 128, image::imageops::FilterType::Triangle);
+                                        image::imageops::overlay(&mut img, &sub, ((i as u32 % cols) * 128) as i64, ((i as u32 / cols) * 128) as i64);
+                                    }
+                                }
+                            }
+                            let _ = img.save(&out);
+                        }
+                    }
+                    return;
+                }
                 println!("monde chargé en {:.1} s : {} archives, {} fichiers, {} ymaps, {} objets, {} types, {} noms, {} modèles, catalogue {}, visibles {}", t0.elapsed().as_secs_f32(), w.vfs.archives.len(), w.vfs.files.len(), w.ymaps.len(), w.ents.len(), w.archetypes.len(), w.names.len(), w.models.len(), w.catalog.len(), w.visible_ents);
                 for g in &w.groups { if g.ymaps > 0 || g.archetypes > 0 { println!("  {:<45} ymaps {:>5} types {:>6}", g.label, g.ymaps, g.archetypes); } }
                 let near = w.visible_near(crate::math::v3(200.0, -900.0, 150.0), crate::math::v3(200.0, -900.0, 30.0), 1500.0, 1.0);
@@ -800,6 +837,49 @@ pub fn probe(game: &str, cw: &str) {
         let a = meta::parse_ytyp(&r);
         println!("{} : {} archétypes", f.path(), a.len());
         for x in a.iter().take(3) { println!("   {:?}", x); }
+    }
+}
+
+/// Portails d'intérieur sans leurs 4 coins dans un ytyp binaire (RSC7) : (intérieur, portail, nombre de coins).
+pub fn ytyp_portal_problems(path: &std::path::Path) -> Vec<(String, usize, usize)> {
+    let Ok(d) = std::fs::read(path) else { return Vec::new() };
+    if d.len() < 16 || &d[0..4] != b"RSC7" {
+        return Vec::new();
+    }
+    let sys = u32::from_le_bytes(d[8..12].try_into().unwrap());
+    let gfx = u32::from_le_bytes(d[12..16].try_into().unwrap());
+    let Some(data) = crypto::inflate(&d[16..]) else { return Vec::new() };
+    let r = rpf::Resource::new(data, sys, gfx);
+    let mut out = Vec::new();
+    for a in meta::parse_ytyp(&r).into_iter().filter(|a| a.mlo) {
+        for (i, p) in a.mlo_portals.iter().enumerate() {
+            if p.corners.len() != 4 {
+                out.push((format!("{:08x}", a.name), i, p.corners.len()));
+            }
+        }
+    }
+    out
+}
+
+/// Mode test : `dragowalker --read-ytyp <fichier.ytyp>` relit un ytyp binaire : intérieurs, pièces, portails.
+pub fn read_ytyp_file(path: &str) {
+    let Ok(d) = std::fs::read(path) else { println!("illisible"); return };
+    if d.len() < 16 || &d[0..4] != b"RSC7" { println!("pas un fichier RSC7"); return };
+    let sys = u32::from_le_bytes(d[8..12].try_into().unwrap());
+    let gfx = u32::from_le_bytes(d[12..16].try_into().unwrap());
+    let Some(data) = crypto::inflate(&d[16..]) else { println!("décompression impossible"); return };
+    let r = rpf::Resource::new(data, sys, gfx);
+    for a in meta::parse_ytyp(&r) {
+        if !a.mlo {
+            continue;
+        }
+        println!("intérieur {:08x} : {} objets, {} pièces, {} portails", a.name, a.mlo_children.len(), a.mlo_rooms.len(), a.mlo_portals.len());
+        for (i, rm) in a.mlo_rooms.iter().enumerate() {
+            println!("  pièce {i} {} bb {:?} {:?} flags {} objets {}", rm.name, rm.bb_min, rm.bb_max, rm.flags, rm.objects.len());
+        }
+        for (i, p) in a.mlo_portals.iter().enumerate() {
+            println!("  portail {i} {} -> {} flags {} coins {:?}", p.from, p.to, p.flags, p.corners);
+        }
     }
 }
 

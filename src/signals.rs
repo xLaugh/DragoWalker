@@ -60,6 +60,37 @@ fn facing(d: V3) -> Quat {
     Quat::from_z((-d.x).atan2(d.y))
 }
 
+/// Place d'un feu (depuis le centre) pour les voitures qui roulent dans le sens `d` (leur droite `r`) : de l'autre
+/// côté du carrefour, à droite. Sur le coin de trottoir arrondi s'il y en a un ; sinon le long de la branche qui
+/// continue tout droit (ou de la route croisée), en suivant son virage, pour rester sur le trottoir.
+fn far_right(j: &Junction, d: V3, r: V3, along: f32, lateral: f32) -> V3 {
+    let dot = |a: &[f32; 2], b: V3| a[0] * b.x + a[1] * b.y;
+    // coin entre la branche qui continue (≈ d) et la branche de droite (≈ r)
+    for k in &j.corners {
+        let fits = |x: &[f32; 2], y: &[f32; 2]| dot(x, d) > 0.7 && dot(y, r) > 0.3;
+        if fits(&k.u, &k.v) || fits(&k.v, &k.u) {
+            if let Some((cen, nu, nv, _)) = k.geom() {
+                let w = (nu + nv) * -1.0;
+                if w.len() > 1e-3 {
+                    return cen + w.norm() * (k.rc * 0.45);
+                }
+            }
+        }
+    }
+    let best = |want: V3| j.arms.iter().filter(|b| dot(&b.dir, want) > 0.7).max_by(|x, y| dot(&x.dir, want).total_cmp(&dot(&y.dir, want)));
+    if let Some(b) = best(d) {
+        let (q, t) = b.frame(along);
+        return q + v3(t.y, -t.x, 0.0) * lateral;
+    }
+    if let Some(e) = best(r) {
+        let (q, t) = e.frame(lateral);
+        let n = v3(-t.y, t.x, 0.0);
+        let n = if n.dot(d) >= 0.0 { n } else { n * -1.0 };
+        return q + n * along;
+    }
+    d * along + r * lateral
+}
+
 /// Feux et panneaux d'un carrefour : (modèle, position, orientation).
 pub fn junction_props(j: &Junction) -> Vec<(&'static str, V3, Quat)> {
     let c = v3(j.pos[0], j.pos[1], j.pos[2]);
@@ -80,15 +111,21 @@ pub fn junction_props(j: &Junction) -> Vec<(&'static str, V3, Quat)> {
         // sur le trottoir (un peu plus près de la bordure que du bord extérieur), sinon 1,2 m après la chaussée
         let lateral = if walk { a.hw + (a.total - a.hw) * 0.45 } else { a.hw + 1.2 };
         let base = |on_walk: bool| j.pos[2] + 0.08 + if on_walk { 0.18 } else { 0.0 };
+        // routes qui se rejoignent en biais très fermé : aucune route en travers, pas de feu
+        if ctl[i] == 1 && ohw <= 0.0 {
+            continue;
+        }
         if ctl[i] == 1 {
             let o_walk = ototal - ohw > 0.5;
             let along = if o_walk { ohw + (ototal - ohw) * 0.45 } else { ohw + 1.2 };
-            let p = c + d * along + r * lateral;
+            let p = far_right(j, d, r, along, lateral);
             let model = if a.hw > LONG_ARM_FROM { LIGHT_LONG } else { LIGHT_SHORT };
-            out.push((model, v3(p.x, p.y, base(walk && o_walk)), facing(d)));
+            out.push((model, v3(c.x + p.x, c.y + p.y, base(walk && o_walk)), facing(d)));
         } else {
-            let p = c + dir * (a.len + 1.0) + r * lateral;
-            out.push((STOP_SIGN, v3(p.x, p.y, base(walk)), facing(d)));
+            // avant le carrefour, à droite des voitures qui arrivent (le long de la branche, virage compris)
+            let (q, t) = a.frame(a.len + 1.0);
+            let p = q + v3(-t.y, t.x, 0.0) * lateral;
+            out.push((STOP_SIGN, v3(c.x + p.x, c.y + p.y, base(walk)), facing(d)));
         }
     }
     out

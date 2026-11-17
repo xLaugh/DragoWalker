@@ -153,7 +153,7 @@ impl DwApp {
                 ui.label(RichText::new(t("H : cacher l'objet du jeu sous la souris")).small().weak());
             });
             ui.menu_button(t("Créer"), |ui| {
-                if item(ui, true, ic::CUBE_TRANSPARENT, t("Studio MLO (intérieur de A à Z)…"), "") {
+                if item(ui, true, ic::CUBE_TRANSPARENT, t("Studio (intérieurs MLO et props)…"), "") {
                     self.studio.choose = true;
                     ui.close_menu();
                 }
@@ -418,7 +418,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false };
+        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);
@@ -549,7 +549,7 @@ impl DwApp {
                 if tool(ui, self.atelier.open, ic::HAMMER, t("Atelier"), t("Atelier de bâtiment : tracer l'emprise au sol, choisir les étages, le toit et la façade ; modèle, collision, version lointaine et fenêtres éclairées la nuit faits par DragoWalker")).clicked() {
                     self.atelier.open = !self.atelier.open;
                 }
-                if tool(ui, self.studio.choose, ic::CUBE_TRANSPARENT, t("Studio MLO"), t("Espace à part pour construire un intérieur de A à Z : rien d'autre à l'écran, outils du plan, meubles, variantes, ambiance, test en jeu")).clicked() {
+                if tool(ui, self.studio.choose, ic::CUBE_TRANSPARENT, t("Studio"), t("Construire un intérieur MLO de A à Z (outils du plan, meubles, ambiance, test en jeu) ou créer tes propres props : depuis une image, un modèle Blender ou des formes simples")).clicked() {
                     self.studio.choose = !self.studio.choose;
                 }
                 if tool(ui, self.groups_open, ic::STACK, t("Groupes"), t("Tes groupes d'objets : les poser à la souris (molette = tourner, Maj + molette = quart de tour)")).clicked() {
@@ -1339,7 +1339,7 @@ impl DwApp {
         ui.separator();
         if let Some((t, m)) = self.cur_mlo {
             if let Some(n) = self.proj.ytyps.get(t).and_then(|y| y.mlos.get(m)).map(|m| m.name.clone()) {
-                if crate::look::accent(ui, crate::look::ic::CUBE_TRANSPARENT, "Ouvrir dans le Studio MLO", "Construire cet intérieur dans un espace à part : rien d'autre à l'écran, outils du plan en haut, meubles et propriétés sur les côtés").clicked() {
+                if crate::look::accent(ui, crate::look::ic::CUBE_TRANSPARENT, "Ouvrir dans le Studio", "Construire cet intérieur dans un espace à part : rien d'autre à l'écran, outils du plan en haut, meubles et propriétés sur les côtés").clicked() {
                     self.studio_enter(&n);
                 }
             }
@@ -1640,17 +1640,102 @@ impl DwApp {
         changed
     }
 
+    /// Vignette d'une image de la conversation (chargée une fois).
+    fn chat_thumb(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.chat_thumbs.get(path) {
+            return Some(t.clone());
+        }
+        let img = crate::chats::read_image(std::path::Path::new(path)).ok()?;
+        let img = image::imageops::thumbnail(&img, 320, 320);
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        let t = ctx.load_texture(format!("chat_{path}"), ci, egui::TextureOptions::LINEAR);
+        self.chat_thumbs.insert(path.to_string(), t.clone());
+        Some(t)
+    }
+
     fn ai_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Assistant IA").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Assistant IA").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let busy = self.pending.is_some();
+                if ui.add_enabled(!busy, egui::Button::new(crate::look::label(crate::look::ic::PLUS, "Nouvelle"))).on_hover_text("Nouvelle conversation (celle-ci reste dans l'historique)").clicked() {
+                    self.new_chat();
+                }
+                let mut open: Option<String> = None;
+                let mut del: Option<String> = None;
+                let r = ui.add_enabled_ui(!busy, |ui| ui.menu_button(crate::look::label(crate::look::ic::CLOCK_COUNTER_CLOCKWISE, "Historique"), |ui| {
+                    ui.set_min_width(320.0);
+                    if self.chat_list.is_empty() {
+                        ui.label(RichText::new("Aucune conversation enregistrée.").weak());
+                    }
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for c in &self.chat_list {
+                            ui.horizontal(|ui| {
+                                let cur = c.id == self.chat_id;
+                                let t = if c.title.is_empty() { "(sans titre)".to_string() } else { c.title.clone() };
+                                if ui.selectable_label(cur, RichText::new(t)).on_hover_text(format!("{} message(s) · {}", c.created, crate::chats::ago(c.updated))).clicked() {
+                                    open = Some(c.id.clone());
+                                    ui.close_menu();
+                                }
+                                ui.label(RichText::new(crate::chats::ago(c.updated)).small().weak());
+                                if ui.small_button(crate::look::ic::TRASH).on_hover_text("Supprimer cette conversation").clicked() {
+                                    del = Some(c.id.clone());
+                                }
+                            });
+                        }
+                    });
+                }));
+                if r.inner.response.clicked() {
+                    self.chat_list = crate::chats::list();
+                }
+                if let Some(id) = open {
+                    self.open_chat(&id);
+                }
+                if let Some(id) = del {
+                    crate::chats::delete(&id);
+                    if id == self.chat_id {
+                        self.new_chat();
+                    }
+                    self.chat_list = crate::chats::list();
+                }
+            });
+        });
         self.ai_settings(ui);
-        let h = (ui.available_height() - 90.0).max(120.0);
+        // images glissées sur la fenêtre pendant que l'assistant est ouvert
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for p in dropped {
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+                match crate::chats::read_image(&p) {
+                    Ok(img) => self.attach_image(img),
+                    Err(e) => self.status = e,
+                }
+            }
+        }
+        let h = (ui.available_height() - if self.chat_attach.is_empty() { 110.0 } else { 190.0 }).max(120.0);
+        let lines = self.chat.clone();
+        let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().max_height(h).stick_to_bottom(true).auto_shrink([false; 2]).id_salt("chat").show(ui, |ui| {
-            for l in &self.chat {
+            for l in &lines {
                 let (bg, align) = if l.from_user { (Color32::from_rgb(120, 70, 25), egui::Align::Max) } else { (Color32::from_rgb(48, 54, 64), egui::Align::Min) };
                 ui.with_layout(egui::Layout::top_down(align), |ui| {
                     egui::Frame::new().fill(bg).corner_radius(6.0).inner_margin(6.0).show(ui, |ui| {
                         ui.set_max_width(ui.available_width() * 0.92);
-                        ui.label(&l.text);
+                        for p in &l.images {
+                            match self.chat_thumb(&ctx, p) {
+                                Some(t) => {
+                                    let sz = t.size_vec2();
+                                    let k = (220.0 / sz.x.max(sz.y)).min(1.0);
+                                    ui.add(egui::Image::new(&t).fit_to_exact_size(sz * k).corner_radius(4.0)).on_hover_text(p.as_str());
+                                }
+                                None => {
+                                    ui.label(RichText::new("(image introuvable)").small().weak());
+                                }
+                            }
+                        }
+                        if !l.text.is_empty() {
+                            ui.label(&l.text);
+                        }
                     });
                 });
             }
@@ -1666,16 +1751,59 @@ impl DwApp {
             }
         });
         ui.separator();
-        let r = ui.add(egui::TextEdit::multiline(&mut self.chat_input).hint_text("Ex. : supprime les arbres dans un rayon de 80 m").desired_rows(2).desired_width(f32::INFINITY));
+        // images prêtes à partir
+        if !self.chat_attach.is_empty() {
+            let mut rm: Option<usize> = None;
+            let list = self.chat_attach.clone();
+            ui.horizontal_wrapped(|ui| {
+                for (i, p) in list.iter().enumerate() {
+                    if let Some(t) = self.chat_thumb(&ctx, p) {
+                        let sz = t.size_vec2();
+                        let k = 64.0 / sz.x.max(sz.y);
+                        ui.add(egui::Image::new(&t).fit_to_exact_size(sz * k).corner_radius(3.0));
+                    }
+                    if ui.small_button(crate::look::ic::X).on_hover_text("Retirer l'image").clicked() {
+                        rm = Some(i);
+                    }
+                }
+            });
+            if let Some(i) = rm {
+                let p = self.chat_attach.remove(i);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let r = ui.add(egui::TextEdit::multiline(&mut self.chat_input).hint_text("Ex. : supprime les arbres dans un rayon de 80 m (Ctrl+V : coller une image)").desired_rows(2).desired_width(f32::INFINITY));
         let enter = r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+        // Ctrl+V dans le champ : image du presse-papiers (le texte se colle comme d'habitude)
+        if r.has_focus() && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if t.is_empty()) || matches!(e, egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command))) {
+            if let Some(img) = crate::chats::clipboard_image() {
+                self.attach_image(img);
+            }
+        }
         ui.horizontal(|ui| {
             let send = ui.add_enabled(self.pending.is_none(), egui::Button::new("Envoyer ➡")).clicked();
             if send || enter {
                 self.chat_input = self.chat_input.trim_end_matches('\n').to_string();
                 self.send_chat();
             }
-            if ui.button("Effacer").clicked() {
-                self.chat.truncate(1);
+            if ui.button(crate::look::ic::IMAGE).on_hover_text("Joindre une image (PNG, JPEG) ; tu peux aussi la glisser sur la fenêtre ou la coller (Ctrl+V)").clicked() {
+                if let Some(paths) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_files() {
+                    for p in paths {
+                        match crate::chats::read_image(&p) {
+                            Ok(img) => self.attach_image(img),
+                            Err(e) => self.status = e,
+                        }
+                    }
+                }
+            }
+            if ui.button(crate::look::ic::CAMERA).on_hover_text("Joindre une capture de la vue").clicked() {
+                self.chat_shot = self.frame + 2;
+            }
+            if ui.button(crate::look::ic::CLIPBOARD_TEXT).on_hover_text("Coller l'image du presse-papiers").clicked() {
+                match crate::chats::clipboard_image() {
+                    Some(img) => self.attach_image(img),
+                    None => self.status = "Pas d'image dans le presse-papiers.".into(),
+                }
             }
         });
     }
@@ -1701,12 +1829,38 @@ impl DwApp {
                     Some(p) => ui.label(RichText::new(format!("✔ Claude Code trouvé : {}", p.display())).small().color(ok)),
                     None => ui.label(RichText::new("Claude Code introuvable (commande « claude »). Installe-le puis relance DragoWalker.").small().color(warn)),
                 };
-                ui.label(RichText::new("Utilise ton compte Claude Code, sans clé API. Claude ne reçoit aucun outil : il ne peut que répondre par des actions sur la carte.").weak().small());
+                ui.label(RichText::new("Utilise ton compte Claude Code, sans clé API.").weak().small());
+                let mut agent = self.ai_agent;
+                if ui
+                    .checkbox(&mut agent, "Mode agent : Claude pilote DragoWalker (outils + skills)")
+                    .on_hover_text("Claude reçoit les outils de DragoWalker (scène, catalogue du jeu, intérieurs, aménagement, poser, déplacer, capture de la vue, annuler) et le savoir-faire des skills : il agit étape par étape et vérifie son travail. Aucun accès à tes fichiers ni à des commandes. Décoché : il ne fait que répondre par des actions simples sur la carte.")
+                    .changed()
+                {
+                    self.ai_agent = agent;
+                    save_setting("ai_agent", serde_json::json!(agent));
+                }
+                match &self.mcp {
+                    Some(s) => {
+                        ui.label(RichText::new(format!("✔ Serveur MCP de DragoWalker actif (port {}).", s.port)).small().color(ok));
+                        let cmd = format!("claude --plugin-dir \"{}\"", crate::mcp::plugin_dir().display());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Depuis ton propre Claude Code :").small().weak());
+                            ui.code(&cmd);
+                            if ui.small_button("Copier").on_hover_text("Lance Claude Code avec le plugin DragoWalker : il pilote l'application ouverte (outils et skills)").clicked() {
+                                ui.ctx().copy_text(cmd.clone());
+                            }
+                        });
+                    }
+                    None if self.mcp_failed => {
+                        ui.label(RichText::new("Le serveur MCP n'a pas pu démarrer (aucun port libre).").small().color(warn));
+                    }
+                    None => {}
+                }
                 ui.horizontal(|ui| {
                     ui.label("Modèle");
                     let r = egui::ComboBox::from_id_salt("cc_model").selected_text(if self.cc_model.is_empty() { "par défaut" } else { self.cc_model.as_str() }).show_ui(ui, |ui| {
                         let mut c = false;
-                        for (v, l) in [("", "par défaut"), ("opus", "opus (le plus fort)"), ("sonnet", "sonnet (équilibré)"), ("haiku", "haiku (le plus rapide)")] {
+                        for (v, l) in [("", "par défaut"), ("fable", "fable (le plus récent)"), ("opus", "opus (le plus fort)"), ("sonnet", "sonnet (équilibré)"), ("haiku", "haiku (le plus rapide)")] {
                             c |= ui.selectable_value(&mut self.cc_model, v.to_string(), l).changed();
                         }
                         c
@@ -1780,7 +1934,17 @@ impl DwApp {
         ui.label(RichText::new("Caméra").strong());
         ui.horizontal(|ui| {
             ui.label("Vitesse");
-            ui.add(egui::Slider::new(&mut self.speed_mult, 0.05..=4.0).logarithmic(true).suffix(" ×"));
+            let mut v = self.speed_mult;
+            if ui.add(egui::Slider::new(&mut v, crate::app::MOVE_SPEED.0..=crate::app::MOVE_SPEED.1).logarithmic(true).suffix(" ×")).changed() {
+                self.set_move_speed(v);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Souris");
+            let mut m = self.cam.sens;
+            if ui.add(egui::Slider::new(&mut m, crate::app::MOUSE_SENS.0..=crate::app::MOUSE_SENS.1).logarithmic(true).suffix(" ×")).on_hover_text("Sensibilité de la souris quand tu tournes la vue (clic droit)").changed() {
+                self.set_mouse_sens(m);
+            }
         });
         ui.label(
             RichText::new(format!(

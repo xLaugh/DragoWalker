@@ -30,6 +30,19 @@ impl DwApp {
         self.test_hooks_lineup();
         self.test_hooks_decor();
         self.test_hooks_gabarit();
+        self.test_hooks_export();
+    }
+
+    /// Export d'une ressource FiveM (DW_TEST_EXPORT=dossier) à l'image DW_TEST_EXPORT_FRAME (200 par défaut), compte
+    /// rendu sur la sortie.
+    fn test_hooks_export(&mut self) {
+        let Ok(dir) = std::env::var("DW_TEST_EXPORT") else { return };
+        let at = std::env::var("DW_TEST_EXPORT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+        if self.frame != at {
+            return;
+        }
+        let r = self.export_project(std::path::Path::new(&dir), true);
+        println!("EXPORT : {r}");
     }
 
     /// Intérieur complet tout prêt (DW_TEST_GABARIT=indice, DW_TEST_GABARIT_THEME), vu en 3D du dessus.
@@ -197,9 +210,39 @@ impl DwApp {
         if self.frame != 20 {
             return;
         }
+        // DW_TEST_CHAT=<image> : conversation d'exemple avec une image, une autre prête à partir (avec DW_AI_WINDOW=1)
+        if let Ok(img) = std::env::var("DW_TEST_CHAT") {
+            self.chat.push(crate::ai::ChatLine { from_user: true, text: "Fais une enseigne avec ce logo devant le garage".into(), images: vec![img.clone()] });
+            self.chat.push(crate::ai::ChatLine { from_user: false, text: "Enseigne de 3 m créée avec ton logo et posée devant le garage.".into(), images: vec![] });
+            self.chat_attach.push(img);
+            self.chat_input = "Et une affiche murale à l'intérieur".into();
+        }
         let Ok(v) = std::env::var("DW_TEST_STUDIO") else { return };
         match v.as_str() {
             "choose" => self.studio.choose = true,
+            // onglet Props ; DW_TEST_PROP_IMG=<image> : image déjà choisie
+            "props" => {
+                self.studio.choose = true;
+                self.studio.tab = 1;
+                if let Ok(p) = std::env::var("DW_TEST_PROP_IMG") {
+                    if let Some(img) = std::fs::read(&p).ok().and_then(|d| image::load_from_memory(&d).ok()) {
+                        self.props.name = "test_enseigne".into();
+                        self.props.img = Some((p.into(), img.to_rgba8()));
+                    }
+                }
+                // DW_TEST_PROP_DIR=<dossier> : crée le prop (panneau de 2 m) dans ce dossier et le pose devant la caméra
+                if let Ok(d) = std::env::var("DW_TEST_PROP_DIR") {
+                    self.sollumz.dir = d;
+                    let m = self.props.img.as_ref().map(|(_, i)| crate::propstudio::image_prop(i, 0, 2.0, 0.05));
+                    if let Some(m) = m {
+                        let r = self.studio_write_prop("test_enseigne", &m, 1);
+                        println!("prop : {r:?}");
+                        self.studio.choose = false;
+                        self.studio_place_last();
+                        println!("posé : {} · {}", self.selected.len(), self.status);
+                    }
+                }
+            }
             "new" => {
                 self.studio.new_kind = std::env::var("DW_TEST_STUDIO_KIND").ok().and_then(|k| k.parse().ok()).unwrap_or(0);
                 self.studio_new();
@@ -288,6 +331,55 @@ impl DwApp {
     /// Carte vide avec terrain, puis tous les modes test qui s'en servent (DW_TEST_TERRAIN).
     fn test_hooks_terrain(&mut self) {
         let c = self.test_terrain_base();
+        // DW_TEST_GEN="p=2;island=1" ou "z=-1,1,-1,-1,4,2,5,-1,-1;sea=1;link=1;island=0" : relief de la partie Créer
+        // sur un terrain de 512 m, vue d'ensemble de biais
+        if let Ok(g) = std::env::var("DW_TEST_GEN") {
+            for kv in g.split(';') {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, "1"));
+                match k.trim() {
+                    "p" => self.terrain.preset = v.trim().parse().unwrap_or(1),
+                    "island" => self.terrain.island = v.trim() == "1",
+                    "sea" => self.terrain.sea_bg = v.trim() == "1",
+                    "link" => self.terrain.link = v.trim() == "1",
+                    "z" => {
+                        self.terrain.compose = true;
+                        for (i, x) in v.split(',').take(9).enumerate() {
+                            self.terrain.zones[i] = x.trim().parse().unwrap_or(-1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let spec = self.gen_spec();
+            let mut t = crate::terrain::Terrain::new(c, 512.0, 2.0, 0);
+            let t0 = std::time::Instant::now();
+            t.generate_ex(&spec);
+            println!("relief {:?} en {:.2} s", spec, t0.elapsed().as_secs_f32());
+            // DW_TEST_GEN_PNG=<fichier> : aperçu vu de dessus en grand
+            if let Ok(f) = std::env::var("DW_TEST_GEN_PNG") {
+                let img = crate::terrain::gen_preview(&spec, v3(c.x, c.y, 0.0), 512.0, 320);
+                let raw: Vec<u8> = img.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b(), 255]).collect();
+                let _ = image::save_buffer(&f, &raw, 320, 320, image::ExtendedColorType::Rgba8);
+            }
+            self.proj.terrain = Some(t);
+            self.terrain.dirty = true;
+            self.terrain_section(0);
+            self.tool = Tool::Terrain;
+            self.tab = Tab::Terrain;
+            self.goto(c, 650.0);
+            self.cam.pitch = 0.75;
+            self.cam.snap();
+            return;
+        }
+        // DW_TEST_TPAINT=1 : taches des sols du jeu (gravier, piste, gazon, forêt, neige…) autour du centre
+        if std::env::var("DW_TEST_TPAINT").is_ok() {
+            if let Some(t) = self.proj.terrain.as_mut() {
+                for (k, m) in [7u8, 9, 12, 14, 15, 17, 19, 20, 21, 22].iter().enumerate() {
+                    let a = k as f32 / 10.0 * std::f32::consts::TAU;
+                    t.brush(crate::terrain::Brush::Paint, c + v3(a.cos() * 60.0, a.sin() * 60.0, 0.0), 18.0, 1.0, 1.0, *m, 0.0);
+                }
+            }
+        }
         self.test_terrain_preset();
         self.test_terrain_roads(c);
         self.test_terrain_cross(c);
@@ -822,25 +914,50 @@ impl DwApp {
             let h = |s: &DwApp, x: f32, y: f32| s.proj.terrain.as_ref().and_then(|t| t.height_at(x, y)).unwrap_or(0.0);
             self.terrain.road_kind = km;
             self.terrain.road_pts = vec![v3(c.x - 90.0, c.y, h(self, c.x - 90.0, c.y)), v3(c.x + 90.0, c.y, h(self, c.x + 90.0, c.y))];
-            self.finish_road();
-            println!("{}", self.status);
+            // 5e valeur = rayon (m) : route principale en arc de cercle qui passe au centre (virage vers le sud)
+            if let Some(rad) = v.get(4).copied().filter(|r| *r > 5.0) {
+                let o = v3(c.x, c.y - rad, 0.0);
+                self.terrain.road_pts = (0..7)
+                    .map(|i| {
+                        let t = (i as f32 - 3.0) / 3.0 * (80.0 / rad).min(1.3);
+                        let q = v3(o.x + rad * t.sin(), o.y + rad * t.cos(), 0.0);
+                        v3(q.x, q.y, h(self, q.x, q.y))
+                    })
+                    .collect();
+            }
+            // 6e valeur = 1 : la branche est tracée d'abord, la route principale ensuite (par-dessus son bout)
+            let swap = v.get(5).copied().unwrap_or(0.0) > 0.5;
+            let main_pts = std::mem::take(&mut self.terrain.road_pts);
             let a = ang.to_radians();
             let far = v3(c.x - 70.0 * a.cos(), c.y - 70.0 * a.sin(), 0.0);
-            self.terrain.road_kind = kb;
             let mut pts = vec![v3(far.x, far.y, h(self, far.x, far.y))];
             if curve {
                 // virage serré : 30 m plus loin, la route repart à angle droit
                 let k = v3(far.x - 30.0 * a.sin(), far.y + 30.0 * a.cos(), 0.0);
                 pts.insert(0, v3(k.x, k.y, h(self, k.x, k.y)));
             }
-            pts.push(v3(c.x, c.y, h(self, c.x, c.y)));
-            self.terrain.road_pts = pts;
-            self.finish_road();
-            println!("{}", self.status);
+            // 7e valeur = m : le bout de la branche s'arrête à cette distance de l'axe (sur le trottoir, à côté)
+            let short = v.get(6).copied().unwrap_or(0.0);
+            let endp = c + (far - v3(c.x, c.y, 0.0)).norm() * short;
+            pts.push(v3(endp.x, endp.y, h(self, endp.x, endp.y)));
+            let order = if swap { [(kb, pts), (km, main_pts)] } else { [(km, main_pts), (kb, pts)] };
+            for (k, p) in order {
+                self.terrain.road_kind = k;
+                self.terrain.road_pts = p;
+                self.finish_road();
+                println!("{}", self.status);
+            }
             let (l, s) = self.signals_count();
             println!("signalisation : {l} feu(x), {s} stop(s)");
             if let Some(j) = self.proj.terrain.as_ref().and_then(|t| t.junctions.first()).cloned() {
                 println!("   branches {:?}", j.arms.iter().map(|a| (a.dir, a.hw, a.total, a.len)).collect::<Vec<_>>());
+                println!("   coins {:?}", j.corners.iter().map(|k| (k.u, k.v, k.rc)).collect::<Vec<_>>());
+                if let Some(t) = self.proj.terrain.as_ref() {
+                    for (i, r) in t.roads.iter().enumerate() {
+                        println!("   route {i} : longueur {:.1}, ouvertures {:?}", r.length(), r.gaps);
+                    }
+                    println!("   carrefours : {}", t.junctions.len());
+                }
                 for (n, p, _) in crate::signals::junction_props(&j) {
                     println!("      {n} à ({:.1}, {:.1}, {:.2})", p.x - j.pos[0], p.y - j.pos[1], p.z);
                 }
@@ -853,6 +970,12 @@ impl DwApp {
                 let at = if look.as_deref() == Some("v") { v3(far.x, far.y, j.pos[2]) } else { v3(j.pos[0], j.pos[1], j.pos[2]) };
                 self.goto(at, 40.0);
                 self.cam.target.z = j.pos[2];
+                // DW_TEST_TJOIN_TOP=1 : vue de dessus, nord en haut
+                if std::env::var("DW_TEST_TJOIN_TOP").is_ok() {
+                    self.cam.pitch = 1.45;
+                    self.cam.yaw = 0.0;
+                    self.cam.dist = std::env::var("DW_TEST_TJOIN_DIST").ok().and_then(|v| v.parse().ok()).unwrap_or(45.0);
+                }
                 self.cam.snap();
             }
         }

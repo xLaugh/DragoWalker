@@ -28,6 +28,8 @@ pub struct PlanState {
     pub drag: Option<V3>,
     /// modèle des portes posées par « Poser les portes » (vide : choisi par DragoWalker)
     pub door_model: String,
+    /// « Poser les portes » seulement dans les passages de ces pièces (assistant IA) ; None : partout
+    pub door_rooms: Option<Vec<usize>>,
     /// coque modelable (design.rs) : points cliqués du mur ou de la pièce en cours, réglages
     pub pts: Vec<V3>,
     pub wall_t: f32,
@@ -262,7 +264,13 @@ impl DwApp {
         let m = &mut self.proj.ytyps[ti].mlos[mi];
         let mut n = 0;
         let portals = m.portals.clone();
+        let only = self.plan.door_rooms.clone();
         for p in &portals {
+            if let Some(list) = &only {
+                if !list.contains(&(p.room_from as usize)) && !list.contains(&(p.room_to as usize)) {
+                    continue;
+                }
+            }
             let c = p.corners;
             let h = c[1].z - c[0].z;
             if !(1.8..=3.2).contains(&h) {

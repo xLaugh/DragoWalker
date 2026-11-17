@@ -381,6 +381,7 @@ pub fn scan_resource_dir(dir: &std::path::Path) -> Vec<(Level, String)> {
     let mut xml: Vec<String> = Vec::new();
     let mut archives: Vec<String> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
+    let mut bad_portals: Vec<String> = Vec::new();
     let mut total = 0usize;
     let mut stack = vec![stream.clone()];
     while let Some(d) = stack.pop() {
@@ -400,13 +401,22 @@ pub fn scan_resource_dir(dir: &std::path::Path) -> Vec<(Level, String)> {
                 archives.push(rel.clone());
             }
             if e.metadata().map(|m| m.len() == 0).unwrap_or(false) {
-                empty.push(rel);
+                empty.push(rel.clone());
+            }
+            // intérieur dont un portail n'a pas ses 4 coins dans le fichier binaire : le jeu plante en le chargeant
+            if name.ends_with(".ytyp") {
+                for (mlo, pi, n) in crate::gta::ytyp_portal_problems(&p) {
+                    bad_portals.push(format!("{rel} : intérieur {mlo}, portail {pi} ({n} coin(s))"));
+                }
             }
         }
     }
     let list = |v: &Vec<String>| v.iter().take(4).cloned().collect::<Vec<_>>().join(", ") + if v.len() > 4 { "…" } else { "" };
     if !stream.is_dir() {
         out.push((Level::Warning, "Pas de dossier stream/ : cette ressource ne diffuse aucun fichier de carte ou de modèle.".into()));
+    }
+    if !bad_portals.is_empty() {
+        out.push((Level::Error, format!("Portail(s) d'intérieur sans leurs 4 coins dans le fichier converti — le jeu plante en chargeant l'intérieur : {}. Réexporte avec DragoWalker 0.3.2 ou plus récent.", list(&bad_portals))));
     }
     if !xml.is_empty() {
         out.push((Level::Error, format!("{} fichier(s) .xml dans stream/ ({}) : le jeu ne les charge pas. Il faut les convertir en fichiers binaires (CodeWalker / Sollumz) ; c'est ce qui arrive quand CodeWalker est introuvable pendant l'export.", xml.len(), list(&xml))));

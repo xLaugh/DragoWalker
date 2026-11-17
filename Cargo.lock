@@ -906,9 +906,10 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dragowalker"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes",
+ "arboard",
  "eframe",
  "egui-phosphor",
  "flate2",
@@ -1664,6 +1665,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

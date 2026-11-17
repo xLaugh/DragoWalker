@@ -58,8 +58,13 @@ impl DwApp {
                     n += 1;
                 }
             }
-            // textures du modèle (dossier du même nom ou même dossier)
+            // textures du modèle (dossier du même nom ou même dossier) ; dictionnaire .ytd.xml du même nom (props
+            // du Studio)
             let dir = m.file.parent().unwrap_or(Path::new("."));
+            let ytd = dir.join(format!("{}.ytd.xml", m.name));
+            if ytd.is_file() && std::fs::copy(&ytd, stream.join(format!("{}.ytd.xml", m.name))).is_ok() {
+                n += 1;
+            }
             for d in [dir.join(&m.name), dir.to_path_buf()] {
                 if let Ok(rd) = std::fs::read_dir(&d) {
                     for e in rd.flatten() {

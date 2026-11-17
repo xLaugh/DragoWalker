@@ -92,11 +92,20 @@ pub struct DwApp {
     pub shot_sent: bool,
     pub shot_wait: u32,
     pub speed_mult: f32,
+    /// petit panneau « vitesse et souris » ouvert dans la vue (sous la boussole)
+    pub cam_panel: bool,
     pub drag: Drag,
     pub cat_filter: String,
     pub cat_cat: &'static str,
     pub chat: Vec<ChatLine>,
     pub chat_input: String,
+    /// conversation en cours (chats.rs), images prêtes à partir avec le prochain message, liste des conversations
+    /// (lue à l'ouverture du menu), vignettes des images, capture de la vue demandée pour le message
+    pub chat_id: String,
+    pub chat_attach: Vec<String>,
+    pub chat_list: Vec<crate::chats::Conversation>,
+    pub chat_thumbs: std::collections::HashMap<String, egui::TextureHandle>,
+    pub chat_shot: u64,
     pub api_key: String,
     #[allow(dead_code)]
     pub use_claude: bool,
@@ -104,6 +113,13 @@ pub struct DwApp {
     pub ai_provider: ai::Provider,
     pub claude_code: Option<PathBuf>,
     pub cc_model: String,
+    /// serveur MCP (mcp.rs) : Claude Code pilote DragoWalker avec de vrais outils ; capture demandée (image où la
+    /// prendre, largeur, réponse) ; serveur voulu, échec au démarrage ; assistant en mode agent (outils + skills)
+    pub mcp: Option<crate::mcp::McpServer>,
+    pub mcp_shot: Option<(u64, u32, crate::mcp::Reply)>,
+    pub mcp_on: bool,
+    pub mcp_failed: bool,
+    pub ai_agent: bool,
     pub oa_base: String,
     pub oa_key: String,
     pub oa_model: String,
@@ -183,6 +199,8 @@ pub struct DwApp {
     pub plan: crate::plan::PlanState,
     /// Studio MLO : espace à part pour construire un intérieur (studio.rs)
     pub studio: crate::studio::StudioState,
+    /// Studio, onglet « Props » (propstudio.rs)
+    pub props: crate::propstudio::PropStudio,
     /// intérieurs : meubler à la main, ambiance par pièce, réduction des portails (meubler.rs)
     pub furn: crate::meubler::FurnState,
     /// éditeur de terrain
@@ -227,6 +245,10 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 /// Réglages enregistrés (clé API, dossier du jeu, zones actives…).
+/// Bornes des réglages de la caméra : vitesse de déplacement (×) et sensibilité de la souris (×).
+pub const MOVE_SPEED: (f32, f32) = (0.05, 8.0);
+pub const MOUSE_SENS: (f32, f32) = (0.15, 4.0);
+
 pub fn load_settings() -> serde_json::Value {
     settings_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -276,12 +298,16 @@ impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         crate::update::start();
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
             proj,
-            cam: Camera::new(),
+            cam: {
+                let mut c = Camera::new();
+                c.sens = load_settings()["cam_sensitivity"].as_f64().map(|v| v as f32).unwrap_or(1.0).clamp(MOUSE_SENS.0, MOUSE_SENS.1);
+                c
+            },
             selected: Vec::new(),
             sel_set: HashSet::new(),
             hover: None,
@@ -309,20 +335,32 @@ impl DwApp {
             shot_path,
             shot_sent: false,
             shot_wait: 0,
-            speed_mult: 1.0,
+            speed_mult: load_settings()["cam_speed"].as_f64().map(|v| v as f32).unwrap_or(1.0).clamp(MOVE_SPEED.0, MOVE_SPEED.1),
+            cam_panel: std::env::var("DW_CAM_PANEL").is_ok(),
             drag: Drag::None,
             cat_filter: String::new(),
             cat_cat: "Tous",
             chat: vec![ChatLine {
                 from_user: false,
                 text: "Salut ! Dis-moi ce que tu veux faire sur la carte, par exemple « pose 12 arbres en cercle », « supprime tout dans un rayon de 50 m » ou « crée un intérieur de 4 pièces ».".into(),
+                images: vec![],
             }],
             chat_input: String::new(),
+            chat_id: crate::chats::new_id(),
+            chat_attach: Vec::new(),
+            chat_list: Vec::new(),
+            chat_thumbs: Default::default(),
+            chat_shot: 0,
             api_key: load_api_key(),
             use_claude: true,
             ai_provider: ai::Provider::Local,
             claude_code: ai::find_claude_code(),
             cc_model: load_settings()["ai_cc_model"].as_str().unwrap_or("").to_string(),
+            mcp: None,
+            mcp_shot: None,
+            mcp_on: load_settings()["mcp_on"].as_bool().unwrap_or(true),
+            mcp_failed: false,
+            ai_agent: load_settings()["ai_agent"].as_bool().unwrap_or(true),
             oa_base: load_settings()["ai_oa_base"].as_str().unwrap_or("http://localhost:11434/v1").to_string(),
             oa_key: crate::secret::load_secret("ai_oa_key"),
             oa_model: load_settings()["ai_oa_model"].as_str().unwrap_or("").to_string(),
@@ -372,6 +410,7 @@ impl DwApp {
             lists: crate::lists::Lists::default(),
             plan: Default::default(),
             studio: Default::default(),
+            props: Default::default(),
             furn: Default::default(),
             atelier: crate::atelier::AtelierState { square: true, wall_door: true, open: std::env::var("DW_ATELIER").is_ok(), ..Default::default() },
             intlib: crate::intlib::IntLib::new(std::env::var("DW_INTLIB").is_ok(), std::env::var("DW_INTLIB_FILTER").unwrap_or_default()),

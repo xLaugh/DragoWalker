@@ -16,6 +16,9 @@ mod cwbridge;
 mod decor;
 mod interactions;
 mod gabarits;
+mod mcp;
+mod mcp_plus;
+mod mcp_game;
 mod docking;
 mod edit_ops;
 mod export;
@@ -35,6 +38,8 @@ mod grass;
 mod check;
 mod shell;
 mod studio;
+mod propstudio;
+mod chats;
 mod lights;
 mod groups;
 mod occlusion;
@@ -81,6 +86,12 @@ fn main() -> eframe::Result<()> {
                 Ok(m) => println!("{f} : {} sommets, {} triangles, {} textures, boîte {:?}..{:?}, textures cherchées {:?}, attendu {:08x}", m.model.verts.len(), m.tris, m.textures.len(), m.bb_min, m.bb_max, m.model.geoms.iter().map(|g| format!("{:08x}", g.tex)).collect::<Vec<_>>(), gta::crypto::joaat("prop_bench_01a_t6ba514ac")),
                 Err(e) => println!("{f} : {e}"),
             }
+        }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--read-ytyp" {
+        for f in &args[2..] {
+            gta::read_ytyp_file(f);
         }
         return Ok(());
     }

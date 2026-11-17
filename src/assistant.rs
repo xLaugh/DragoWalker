@@ -166,11 +166,13 @@ impl DwApp {
 
     pub fn send_chat(&mut self) {
         let text = self.chat_input.trim().to_string();
-        if text.is_empty() || self.pending.is_some() {
+        if (text.is_empty() && self.chat_attach.is_empty()) || self.pending.is_some() {
             return;
         }
         self.chat_input.clear();
-        self.chat.push(ChatLine { from_user: true, text: text.clone() });
+        let images = std::mem::take(&mut self.chat_attach);
+        self.chat.push(ChatLine { from_user: true, text: text.clone(), images });
+        self.save_chat();
         if self.ai_provider != ai::Provider::Local {
             let cfg = ai::AiConfig {
                 provider: self.ai_provider,
@@ -181,6 +183,7 @@ impl DwApp {
                 oa_key: self.oa_key.clone(),
                 oa_model: self.oa_model.clone(),
                 cli_cmd: self.cli_cmd.clone(),
+                agent: if self.ai_provider == ai::Provider::ClaudeCode && self.ai_agent { self.mcp.as_ref().map(|s| (s.url(), crate::mcp::plugin_dir())) } else { None },
             };
             self.pending = Some(ai::ask(cfg, self.chat.clone(), self.scene_summary()));
         } else {
@@ -199,6 +202,82 @@ impl DwApp {
             out.push_str(&format!("\n✔ {res}"));
         }
         self.status = out.lines().last().unwrap_or("").trim_start_matches("✔ ").to_string();
-        self.chat.push(ChatLine { from_user: false, text: out });
+        self.chat.push(ChatLine { from_user: false, text: out, images: vec![] });
+        self.save_chat();
+    }
+
+    /// Enregistre la conversation en cours (chats.rs).
+    pub fn save_chat(&mut self) {
+        if let Err(e) = crate::chats::save(&self.chat_id, &self.chat) {
+            self.status = format!("Conversation non enregistrée : {e}");
+        }
+    }
+
+    /// Nouvelle conversation (l'ancienne reste dans l'historique).
+    pub fn new_chat(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        for p in self.chat_attach.drain(..) {
+            let _ = std::fs::remove_file(p);
+        }
+        self.chat.truncate(1);
+        self.chat_id = crate::chats::new_id();
+    }
+
+    /// Reprend une conversation de l'historique.
+    pub fn open_chat(&mut self, id: &str) {
+        if self.pending.is_some() {
+            return;
+        }
+        if let Some(c) = crate::chats::load(id) {
+            let first = self.chat.first().cloned();
+            self.chat = c.lines;
+            if self.chat.first().map(|l| l.from_user).unwrap_or(true) {
+                if let Some(f) = first {
+                    self.chat.insert(0, f);
+                }
+            }
+            self.chat_id = c.id;
+            self.chat_attach.clear();
+            self.status = format!("Conversation « {} » reprise.", c.title);
+        }
+    }
+
+    /// Capture de la vue demandée pour le prochain message (bouton 📷).
+    pub fn chat_shot_tick(&mut self, ctx: &eframe::egui::Context) {
+        if self.chat_shot == 0 {
+            return;
+        }
+        let img = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                eframe::egui::Event::Screenshot { image, user_data, .. } if user_data.data.as_ref().and_then(|d| d.downcast_ref::<&str>()).copied() == Some("chat") => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = img {
+            self.chat_shot = 0;
+            let [w, h] = img.size;
+            let mut buf = Vec::with_capacity(w * h * 4);
+            for p in &img.pixels {
+                buf.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
+            }
+            if let Some(i) = image::RgbaImage::from_raw(w as u32, h as u32, buf) {
+                self.attach_image(i);
+            }
+        } else if self.frame == self.chat_shot {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Screenshot(eframe::egui::UserData::new("chat")));
+        } else if self.frame > self.chat_shot + 240 {
+            self.chat_shot = 0;
+        }
+        ctx.request_repaint();
+    }
+
+    /// Joint une image au prochain message.
+    pub fn attach_image(&mut self, img: image::RgbaImage) {
+        match crate::chats::store_image(&self.chat_id, img) {
+            Ok(p) => self.chat_attach.push(p.to_string_lossy().to_string()),
+            Err(e) => self.status = format!("Image non jointe : {e}"),
+        }
     }
 }

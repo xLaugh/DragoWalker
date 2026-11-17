@@ -28,6 +28,8 @@ pub struct Camera {
     pub right: V3,
     pub up: V3,
     pub rect: Rect,
+    /// sensibilité de la souris (multiplie mech::CAM_SENSITIVITY ; réglage cam_sensitivity)
+    pub sens: f32,
 }
 
 impl Camera {
@@ -52,6 +54,7 @@ impl Camera {
             right: V3::ZERO,
             up: V3::ZERO,
             rect: Rect::from_min_size(pos2(0.0, 0.0), eframe::egui::vec2(1280.0, 720.0)),
+            sens: 1.0,
         };
         c.update_vectors();
         c
@@ -59,8 +62,8 @@ impl Camera {
 
     /// Rotation à la souris (Camera::MouseRotate).
     pub fn mouse_rotate(&mut self, dx: f32, dy: f32) {
-        self.yaw += dx * mech::CAM_SENSITIVITY;
-        self.pitch += dy * mech::CAM_SENSITIVITY;
+        self.yaw += dx * mech::CAM_SENSITIVITY * self.sens;
+        self.pitch += dy * mech::CAM_SENSITIVITY * self.sens;
     }
 
     /// Molette (Camera::MouseZoom) : ×1.1 en arrière, ÷1.1 en avant.
