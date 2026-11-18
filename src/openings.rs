@@ -36,6 +36,60 @@ pub struct Opening {
     /// porte ou fenêtre du jeu posée dans l'ouverture (vide = aucune)
     #[serde(default)]
     pub prop: String,
+    /// objet du projet posé dans l'ouverture (« Poser dans l'ouverture », vitre automatique) : une porte posée ainsi
+    /// devient une vraie porte en jeu (dw_doors.lua)
+    #[serde(default)]
+    pub prop_id: Option<u64>,
+    /// porte fermée à clé en jeu
+    #[serde(default)]
+    pub locked: bool,
+}
+
+impl Opening {
+    /// Fenêtre ou baie vitrée (reçoit une vitre et un cadre automatiques).
+    pub fn is_window(&self) -> bool {
+        let k = self.kind.to_lowercase();
+        k.contains("fenêtre") || k.contains("baie")
+    }
+}
+
+/// Épaisseur (m) des montants du cadre des vitres automatiques, et leur profondeur — **estimé** (menuiserie courante).
+pub const FRAME_BAR: f32 = 0.06;
+pub const FRAME_DEPTH: f32 = 0.08;
+/// Largeur (m) au-delà de laquelle la fenêtre reçoit un meneau au milieu (deux battants) — **estimé**.
+pub const MULLION_FROM: f32 = 1.4;
+
+/// Nom du prop « vitre et cadre » d'une ouverture de `w` × `h` m (au centimètre près).
+pub fn window_prop_name(w: f32, h: f32) -> String {
+    format!("dw_vitre_{}x{}", (w * 100.0).round() as i32, (h * 100.0).round() as i32)
+}
+
+/// Vitre et cadre d'une ouverture de `w` × `h` m : origine au coin bas-gauche (comme une porte, x le long du mur,
+/// z vers le haut), centrés sur y = 0 ; cadre blanc cassé, vitre bleu-gris (texture dessinée, un reflet en biais).
+pub fn window_shapes(w: f32, h: f32) -> (Vec<crate::propstudio::Shape>, Vec<(String, image::RgbaImage, f32)>) {
+    use crate::propstudio::Shape;
+    let (b, d) = (FRAME_BAR, FRAME_DEPTH);
+    let col = [226, 224, 216];
+    let bx = |x: f32, z: f32, sx: f32, sz: f32| Shape { kind: 0, size: [sx, d, sz], off: [x, 0.0, z], yaw: 0.0, color: col, tex: None };
+    let mut s = vec![
+        bx(w * 0.5, 0.0, w, b),
+        bx(w * 0.5, h - b, w, b),
+        bx(b * 0.5, b, b, h - 2.0 * b),
+        bx(w - b * 0.5, b, b, h - 2.0 * b),
+    ];
+    if w > MULLION_FROM {
+        s.push(bx(w * 0.5, b, b, h - 2.0 * b));
+    }
+    // vitre : plaque fine au milieu du cadre
+    s.push(Shape { kind: 2, size: [w - b, 0.01, h - b], off: [w * 0.5, 0.0, b * 0.5], yaw: 0.0, color: [255; 3], tex: Some("dw_vitre".into()) });
+    let img = image::RgbaImage::from_fn(64, 64, |x, y| {
+        // bleu-gris plus clair vers le haut, une bande de reflet en biais
+        let g = 0.78 + (63 - y) as f32 / 63.0 * 0.22;
+        let band = ((x as i32 - y as i32 + 64) % 64) as f32;
+        let refl = if (18.0..26.0).contains(&band) { 1.25 } else { 1.0 };
+        image::Rgba([(66.0 * g * refl) as u8, (84.0 * g * refl) as u8, (98.0 * g * refl) as u8, 255])
+    });
+    (s, vec![("dw_vitre".into(), img, w.max(h))])
 }
 
 /// Préréglages : (nom, largeur, hauteur, appui, hauteur du bas au-dessus du sol).
@@ -234,9 +288,29 @@ pub struct WallSpan {
     pub back: f32,
     pub mesh: usize,
     pub template: Vx,
+    /// le triangle de la face avant touché (positions et UV) : la texture du mur se prolonge dans les embrasures
+    pub tri: Option<[(V3, [f32; 2]); 3]>,
 }
 
-fn ray_t(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f32> {
+impl WallSpan {
+    /// UV du mur en un point de son plan (application affine du triangle touché), et sa variation par mètre le
+    /// long d'une direction du plan.
+    fn uv_at(&self, p: V3) -> Option<[f32; 2]> {
+        let t = self.tri?;
+        let (e1, e2, d) = (t[1].0 - t[0].0, t[2].0 - t[0].0, p - t[0].0);
+        let (a11, a12, a22) = (e1.dot(e1), e1.dot(e2), e2.dot(e2));
+        let det = a11 * a22 - a12 * a12;
+        if det.abs() < 1e-10 {
+            return None;
+        }
+        let (b1, b2) = (d.dot(e1), d.dot(e2));
+        let (x, y) = ((b1 * a22 - b2 * a12) / det, (b2 * a11 - b1 * a12) / det);
+        let uv = |k: usize| t[0].1[k] + x * (t[1].1[k] - t[0].1[k]) + y * (t[2].1[k] - t[0].1[k]);
+        Some([uv(0), uv(1)])
+    }
+}
+
+pub(crate) fn ray_t(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f32> {
     let e1 = b - a;
     let e2 = c - a;
     let p = d.cross(e2);
@@ -287,14 +361,23 @@ pub fn wall_span(meshes: &[GMesh], primary: &[usize], b: &OBox) -> Option<WallSp
     }
     let m = &meshes[f.1];
     let v0 = m.idx[f.2 * 3] as usize;
-    Some(WallSpan { front: f.0 - b.hd, back: k.0 - b.hd, mesh: f.1, template: m.verts[v0].clone() })
+    let tri = m.layout.uv.map(|u| [0, 1, 2].map(|j| {
+        let v = &m.verts[m.idx[f.2 * 3 + j] as usize];
+        (pos_of(&m.layout, v), [v[u], v[u + 1]])
+    }));
+    Some(WallSpan { front: f.0 - b.hd, back: k.0 - b.hd, mesh: f.1, template: m.verts[v0].clone(), tri })
 }
 
-fn push_quad(m: &mut GMesh, template: &Vx, pts: [V3; 4], nrm: V3) {
+/// `push_quad` avec des UV par coin (sinon celles du modèle de sommet).
+fn push_quad_uv(m: &mut GMesh, template: &Vx, pts: [V3; 4], nrm: V3, uvs: Option<[[f32; 2]; 4]>) {
     let l = m.layout.clone();
     let base = m.verts.len() as u32;
-    for p in pts {
+    for (i, p) in pts.into_iter().enumerate() {
         let mut v = template.clone();
+        if let (Some(u), Some(uv)) = (l.uv, uvs) {
+            v[u] = uv[i][0];
+            v[u + 1] = uv[i][1];
+        }
         v[l.pos] = p.x;
         v[l.pos + 1] = p.y;
         v[l.pos + 2] = p.z;
@@ -319,13 +402,33 @@ pub fn add_reveals(meshes: &mut [GMesh], span: &WallSpan, b: &OBox, sill: bool) 
     let (f, k) = (span.front, span.back);
     let p = |r: f32, s: f32, u: f32| b.c + b.r * r + b.n * s + b.u * u;
     let (hw, hh) = (b.hw, b.hh);
+    // UV : la texture de la face avant, prolongée dans l'épaisseur comme si le mur tournait au bord de
+    // l'ouverture (le long du bord : les UV du mur ; en profondeur : la même échelle que dans l'autre sens du mur)
+    let uvs = |q: [(f32, f32, f32); 4], across: V3| -> Option<[[f32; 2]; 4]> {
+        let mut out = [[0.0f32; 2]; 4];
+        for (i, (r, sd, u)) in q.into_iter().enumerate() {
+            let on = p(r, f, u);
+            let a = span.uv_at(on)?;
+            let g = span.uv_at(on + across)?;
+            let depth = sd - f;
+            out[i] = [a[0] + (g[0] - a[0]) * depth, a[1] + (g[1] - a[1]) * depth];
+        }
+        Some(out)
+    };
     let m = &mut meshes[span.mesh];
     // jambage gauche (normale vers la droite), droit, linteau, appui
-    push_quad(m, &span.template, [p(-hw, f, -hh), p(-hw, f, hh), p(-hw, k, hh), p(-hw, k, -hh)], b.r);
-    push_quad(m, &span.template, [p(hw, f, -hh), p(hw, f, hh), p(hw, k, hh), p(hw, k, -hh)], -b.r);
-    push_quad(m, &span.template, [p(-hw, f, hh), p(hw, f, hh), p(hw, k, hh), p(-hw, k, hh)], -b.u);
-    if sill {
-        push_quad(m, &span.template, [p(-hw, f, -hh), p(hw, f, -hh), p(hw, k, -hh), p(-hw, k, -hh)], b.u);
+    let quads: [([(f32, f32, f32); 4], V3, V3); 4] = [
+        ([(-hw, f, -hh), (-hw, f, hh), (-hw, k, hh), (-hw, k, -hh)], b.r, b.r),
+        ([(hw, f, -hh), (hw, f, hh), (hw, k, hh), (hw, k, -hh)], -b.r, b.r),
+        ([(-hw, f, hh), (hw, f, hh), (hw, k, hh), (-hw, k, hh)], -b.u, b.u),
+        ([(-hw, f, -hh), (hw, f, -hh), (hw, k, -hh), (-hw, k, -hh)], b.u, b.u),
+    ];
+    for (i, (q, nrm, across)) in quads.into_iter().enumerate() {
+        if i == 3 && !sill {
+            continue;
+        }
+        let pts = q.map(|(r, sd, u)| p(r, sd, u));
+        push_quad_uv(m, &span.template, pts, nrm, uvs(q, across));
     }
 }
 
@@ -875,15 +978,24 @@ pub fn apply_to_ydr_xml(src: &str, openings: &[Opening]) -> Option<(String, usiz
             if let Some(s) = wall_span(&meshes[pi..pi + 1], &[0], &b) {
                 let better = span.as_ref().map(|c| s.front < c.front).unwrap_or(true);
                 if better {
-                    span = Some(WallSpan { front: s.front, back: s.back, mesh: pi, template: s.template });
+                    span = Some(WallSpan { mesh: pi, ..s });
                 }
             }
         }
-        for m in meshes.iter_mut() {
-            changed += cut_mesh(m, &[b]);
+        // niveaux de détail lointains : percés (avec leurs embrasures) seulement si le mur y a deux faces ; un mur à
+        // une seule face (coque de LOD) reste plein, sinon on verrait le vide de loin à travers l'ouverture
+        let far: Vec<(usize, Option<WallSpan>)> = (0..meshes.len()).filter(|i| !primary.contains(i)).map(|i| (i, wall_span(&meshes[i..i + 1], &[0], &b).map(|s| WallSpan { mesh: i, ..s }))).collect();
+        for &pi in &primary {
+            changed += cut_mesh(&mut meshes[pi], &[b]);
         }
         if let Some(s) = span {
             add_reveals(&mut meshes, &s, &b, o.sill);
+        }
+        for (i, s) in far {
+            if let Some(s) = s {
+                changed += cut_mesh(&mut meshes[i], &[b]);
+                add_reveals(&mut meshes, &s, &b, o.sill);
+            }
         }
     }
     Some((write_ydr_xml(&x, &meshes), changed))
@@ -911,7 +1023,7 @@ mod tests {
     }
 
     fn opening(depth: f32, sill: bool) -> Opening {
-        Opening { pos: [0.5, 0.0, 1.5], dir: [0.0, 1.0], w: 1.0, h: 2.0, depth, kind: "porte".into(), sill, prop: String::new() }
+        Opening { pos: [0.5, 0.0, 1.5], dir: [0.0, 1.0], w: 1.0, h: 2.0, depth, kind: "porte".into(), sill, prop: String::new(), prop_id: None, locked: false }
     }
 
     #[test]
@@ -936,6 +1048,23 @@ mod tests {
         for t in m.idx.chunks_exact(3) {
             let (a, b, c) = (pos_of(&m.layout, &m.verts[t[0] as usize]), pos_of(&m.layout, &m.verts[t[1] as usize]), pos_of(&m.layout, &m.verts[t[2] as usize]));
             assert!((b - a).cross(c - a).y < 0.0);
+        }
+    }
+
+    /// Les embrasures prennent la texture du mur : UV le long du bord comme sur le mur (uv = x, z), et qui
+    /// avancent avec la profondeur (pas une seule couleur).
+    #[test]
+    fn embrasures_avec_la_texture_du_mur() {
+        let mut thick = vec![wall(0.15, 1.0), wall(-0.15, -1.0)];
+        apply_openings(&mut thick, &[0, 1], &[opening(0.6, true)]);
+        // sommets des embrasures : normale qui ne regarde pas le long de y
+        let rv: Vec<&Vx> = thick.iter().flat_map(|m| m.verts.iter()).filter(|v| v[4].abs() < 0.5).collect();
+        assert!(rv.len() >= 16, "{}", rv.len());
+        let distinct: std::collections::HashSet<(i32, i32)> = rv.iter().map(|v| ((v[6] * 1000.0) as i32, (v[7] * 1000.0) as i32)).collect();
+        assert!(distinct.len() > 4, "UV toutes pareilles : {distinct:?}");
+        // jambage gauche (x = 0) : v = z comme sur le mur
+        for v in rv.iter().filter(|v| v[0].abs() < 1e-3 && v[3].abs() > 0.5) {
+            assert!((v[7] - v[2]).abs() < 1e-3, "{v:?}");
         }
     }
 

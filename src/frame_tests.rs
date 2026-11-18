@@ -31,6 +31,78 @@ impl DwApp {
         self.test_hooks_decor();
         self.test_hooks_gabarit();
         self.test_hooks_export();
+        self.test_hooks_mcp();
+        self.test_hooks_conflicts();
+    }
+
+    /// DW_TEST_IMPORT_FOLDERS="dossier1|dossier2" : importe les MLO de ces dossiers, liste les conflits ;
+    /// DW_TEST_FIX_CONFLICTS=1 : les règle ; DW_TEST_SHIFT=1 : applique aussi les décalages.
+    fn test_hooks_conflicts(&mut self) {
+        if self.game.world.is_none() || std::env::var("DW_TEST_CONFLICTS_DONE").is_ok() {
+            return;
+        }
+        let Ok(list) = std::env::var("DW_TEST_IMPORT_FOLDERS") else { return };
+        std::env::set_var("DW_TEST_CONFLICTS_DONE", "1");
+        for d in list.split('|') {
+            println!("import : {}", self.import_mlo_folder(std::path::Path::new(d)));
+        }
+        // DW_TEST_MLO_AT="x,y,z" : le premier MLO importé est posé là (pour tester les conflits avec la carte)
+        if let Some(v) = std::env::var("DW_TEST_MLO_AT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 3) {
+            if let Some(r) = self.proj.mlo_res.first().cloned() {
+                let ids: Vec<u64> = self.proj.ymaps.iter().filter(|y| r.ymaps.contains(&y.name)).flat_map(|y| y.entities.iter().map(|e| e.id)).collect();
+                let by = crate::math::v3(v[0], v[1], v[2]) - r.ref_pos;
+                println!("déplacé : {}", self.apply_fix(&crate::conflicts::Fix::Shift { ids, by }));
+            }
+        }
+        for c in self.find_conflicts() {
+            println!("conflit [{}] {} → {:?}", c.level, c.text, c.fix_label());
+        }
+        if std::env::var("DW_TEST_FIX_CONFLICTS").is_ok() {
+            println!("réglage : {}", self.fix_all_conflicts());
+            if std::env::var("DW_TEST_SHIFT").is_ok() {
+                for c in self.find_conflicts() {
+                    if matches!(c.fix, crate::conflicts::Fix::Shift { .. }) {
+                        println!("décalage : {}", self.apply_fix(&c.fix));
+                    }
+                }
+            }
+            for c in self.find_conflicts() {
+                println!("reste [{}] {}", c.level, c.text);
+            }
+        }
+        self.conflicts.open = true;
+    }
+
+    /// Outils MCP appelés dans l'application (DW_TEST_MCP=fichier JSON : [[nom, arguments], …]), un par image à
+    /// partir de l'image DW_TEST_MCP_FRAME (60 par défaut) ; les résultats sont écrits sur la sortie.
+    fn test_hooks_mcp(&mut self) {
+        let Ok(path) = std::env::var("DW_TEST_MCP") else { return };
+        let start = std::env::var("DW_TEST_MCP_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(60u64);
+        if self.frame < start || self.game.world.is_none() && std::env::var("DW_TEST_MCP_NOGAME").is_err() {
+            return;
+        }
+        let Ok(s) = std::fs::read_to_string(&path) else { return };
+        let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&s) else {
+            println!("DW_TEST_MCP : JSON illisible");
+            std::env::remove_var("DW_TEST_MCP");
+            return;
+        };
+        // un appel par passage (l'image peut ne pas changer entre deux passages)
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        if LAST.swap(self.frame, std::sync::atomic::Ordering::Relaxed) == self.frame {
+            return;
+        }
+        let k = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(c) = list.get(k) else {
+            if k == list.len() {
+                println!("MCP : fin");
+            }
+            return;
+        };
+        let name = c[0].as_str().unwrap_or("");
+        let out = self.mcp_run_text(name, &c[1]);
+        println!("MCP {name} → {out}");
     }
 
     /// Export d'une ressource FiveM (DW_TEST_EXPORT=dossier) à l'image DW_TEST_EXPORT_FRAME (200 par défaut), compte
@@ -54,6 +126,16 @@ impl DwApp {
         let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         self.studio_new_gabarit(g, env("DW_TEST_GABARIT_THEME", 0.0) as usize);
         println!("{}", self.status);
+        // DW_TEST_VERTEX="dx,dy" : déplace le sommet de la coque le plus au sud-ouest (outil « Sommets »)
+        if let Some(v) = std::env::var("DW_TEST_VERTEX").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 2) {
+            let vs = self.plan_vertices();
+            let portals = self.cur_mlo.map(|(t, m)| self.proj.ytyps[t].mlos[m].portals.len()).unwrap_or(0);
+            if let Some(p) = vs.iter().copied().min_by(|a, b| (a[0] + a[1]).total_cmp(&(b[0] + b[1]))) {
+                let r = self.design_move_vertex(p, [p[0] + v[0], p[1] + v[1]]);
+                let portals2 = self.cur_mlo.map(|(t, m)| self.proj.ytyps[t].mlos[m].portals.len()).unwrap_or(0);
+                println!("sommets {} ; {p:?} → {r} ; portails {portals} → {portals2}", vs.len());
+            }
+        }
         let pts = self.interaction_points();
         println!("points d'interaction : {}", pts.len());
         for p in pts.iter().take(40) {
@@ -354,6 +436,7 @@ impl DwApp {
             let mut t = crate::terrain::Terrain::new(c, 512.0, 2.0, 0);
             let t0 = std::time::Instant::now();
             t.generate_ex(&spec);
+            t.sea_all = std::env::var("DW_TEST_SEA_ALL").is_ok();
             println!("relief {:?} en {:.2} s", spec, t0.elapsed().as_secs_f32());
             // DW_TEST_GEN_PNG=<fichier> : aperçu vu de dessus en grand
             if let Ok(f) = std::env::var("DW_TEST_GEN_PNG") {
@@ -366,9 +449,21 @@ impl DwApp {
             self.terrain_section(0);
             self.tool = Tool::Terrain;
             self.tab = Tab::Terrain;
-            self.goto(c, 650.0);
+            // DW_TEST_GEN_AT="dx,dy,distance" : vue rapprochée (depuis le centre du terrain)
+            let at: Vec<f32> = std::env::var("DW_TEST_GEN_AT").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+            if at.len() == 3 {
+                let p = v3(c.x + at[0], c.y + at[1], 0.0);
+                let z = self.proj.terrain.as_ref().and_then(|t| t.height_at(p.x, p.y)).unwrap_or(0.0);
+                self.goto(v3(p.x, p.y, z), at[2]);
+            } else {
+                self.goto(c, 650.0);
+            }
             self.cam.pitch = 0.75;
             self.cam.snap();
+            if let Ok(dir) = std::env::var("DW_TEST_TERRAIN_EXPORT") {
+                let r = self.export_project(std::path::Path::new(&dir), true);
+                println!("export : {r}");
+            }
             return;
         }
         // DW_TEST_TPAINT=1 : taches des sols du jeu (gravier, piste, gazon, forêt, neige…) autour du centre
@@ -1080,7 +1175,7 @@ impl DwApp {
                         }
                     }
                 }
-                t.waters.push(crate::scenery::WaterZone { min: [x0, y0], max: [x1, y1], z });
+                t.waters.push(crate::scenery::WaterZone { min: [x0, y0], max: [x1, y1], z, clear: false });
                 for (k, (dx, dy)) in [(-20.0f32, -60.0f32), (-30.0, -50.0), (-40.0, -60.0)].iter().enumerate() {
                     let (x, y) = (c.x + dx, c.y + dy);
                     let zz = t.height_at(x, y).unwrap_or(0.0) + 0.3;
@@ -1315,7 +1410,7 @@ impl DwApp {
                     let v: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                     if v.len() == 8 {
                         let cut = self.bedit.as_ref().map(|b| b.cut.clone()).unwrap_or_default();
-                        let o = crate::openings::Opening { pos: [v[0], v[1], v[2]], dir: [v[3], v[4]], w: v[5], h: v[6], depth: v[7], kind: "test".into(), sill: false, prop: String::new() };
+                        let o = crate::openings::Opening { pos: [v[0], v[1], v[2]], dir: [v[3], v[4]], w: v[5], h: v[6], depth: v[7], kind: "test".into(), sill: false, prop: String::new(), prop_id: None, locked: false };
                         if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
                             c.openings.push(o);
                         }
@@ -1324,6 +1419,13 @@ impl DwApp {
                             self.goto(target, 14.0);
                         }
                         println!("ouverture percée : {spec}");
+                        // DW_TEST_OPENING_GLASS=1 : vitre et cadre automatiques dans l'ouverture
+                        if std::env::var("DW_TEST_OPENING_GLASS").is_ok() {
+                            let last = self.proj.building_cuts.iter().find(|c| c.name == cut).map(|c| c.openings.len().saturating_sub(1)).unwrap_or(0);
+                            println!("milieu du mur : {:.2} m", self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.openings.get(last)).map(|o| self.bedit_wall_mid(o)).unwrap_or(-1.0));
+                            self.bedit_glaze(&cut, last);
+                            println!("vitre : {}", self.status);
+                        }
                         // DW_TEST_OPENING_PROP="modèle" : pose aussi cette porte dans l'ouverture
                         if let Ok(pn) = std::env::var("DW_TEST_OPENING_PROP") {
                             if let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) {
@@ -1334,6 +1436,7 @@ impl DwApp {
                             let last = self.proj.building_cuts.iter().find(|c| c.name == cut).map(|c| c.openings.len().saturating_sub(1)).unwrap_or(0);
                             self.bedit_place_prop(&cut, last);
                             println!("porte : {}", self.status);
+                            println!("portes exportées (dw_doors.lua) : {:?}", self.door_exports().iter().map(|d| d.model.clone()).collect::<Vec<_>>());
                             // la porte posée, dans le repère de l'ouverture (r : le long du mur, n : épaisseur, u : hauteur)
                             let ob = self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.openings.get(last)).map(|o| (o.obox(), o.w, o.h));
                             let be_ent = self.bedit.as_ref().and_then(|b| self.proj.find_id(b.entity)).and_then(|r| self.proj.ent(r)).cloned();

@@ -60,6 +60,22 @@ pub struct MloRes {
     /// de ces fichiers n'en fait pas partie (fix_misplaced_mlos) ; vide pour un projet importé avant le 13 nov. 2026
     #[serde(default)]
     pub mlo_names: Vec<String>,
+    /// fichiers renommés à l'export pour éviter un conflit avec une autre ressource (conflicts.rs) : (ancien nom,
+    /// nouveau nom), sans extension, en minuscules ; les références du .ytyp et des cartes suivent
+    #[serde(default)]
+    pub renames: Vec<(String, String)>,
+}
+
+impl MloRes {
+    /// Nom de fichier à l'export (renommé si besoin).
+    pub fn export_name(&self, fname: &str) -> String {
+        let p = Path::new(fname);
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        match (self.renames.iter().find(|x| x.0 == stem), p.extension()) {
+            (Some(x), Some(e)) => format!("{}.{}", x.1, e.to_string_lossy()),
+            _ => fname.to_string(),
+        }
+    }
 }
 
 /// Copie un fichier du créateur dans le dossier exporté en lui donnant la date de maintenant : la copie garde sinon
@@ -1049,23 +1065,47 @@ impl DwApp {
             if ext == "ytyp" {
                 match crate::xmlio::read_ytyp(&src, &stem) {
                     Ok(mut t) => {
-                        t.name = stem.clone();
                         interiors += t.mlos.len();
                         res.mlo_names.extend(t.mlos.iter().map(|m| m.name.to_lowercase()));
-                        self.proj.ytyps.retain(|y| !y.name.eq_ignore_ascii_case(&stem));
+                        let bin_s = if bin.as_os_str().is_empty() { String::new() } else { bin.to_string_lossy().to_string() };
+                        // fichier de types de même nom venu d'une autre ressource : identique, il est partagé ; différent,
+                        // celui-ci est renommé (le fichier garde son contenu, seul son nom change)
+                        let other = self.proj.mlo_res.iter().filter(|r| r.dir != res.dir).find_map(|r| r.ytyp_files.iter().find(|f| f.0.eq_ignore_ascii_case(&stem)).cloned());
+                        let name = match &other {
+                            Some((_, ob)) if !ob.is_empty() && !bin_s.is_empty() && std::fs::read(ob).ok() == std::fs::read(&bin_s).ok() => {
+                                res.ytyp_files.push((stem.clone(), bin_s));
+                                continue;
+                            }
+                            Some(_) => {
+                                let taken: Vec<String> = self.proj.ytyps.iter().map(|y| y.name.to_lowercase()).collect();
+                                crate::conflicts::renamed(&stem.to_lowercase(), &|n| taken.iter().any(|x| x == n))
+                            }
+                            None => stem.clone(),
+                        };
+                        t.name = name.clone();
+                        self.proj.ytyps.retain(|y| !y.name.eq_ignore_ascii_case(&name));
                         self.proj.ytyps.push(t);
-                        res.ytyp_files.push((stem.clone(), if bin.as_os_str().is_empty() { String::new() } else { bin.to_string_lossy().to_string() }));
+                        res.ytyp_files.push((name, bin_s));
                     }
                     Err(e) => res.unreadable.push(format!("{stem}.ytyp ({e})")),
                 }
             } else {
                 match crate::xmlio::read_ymap(&src, &stem) {
                     Ok(mut y) => {
-                        y.name = stem.clone();
+                        // carte de même nom déjà là, venue d'une autre ressource (ou du projet) : celle-ci est
+                        // renommée (elle est réécrite à l'export) au lieu de remplacer l'autre
+                        let other = self.proj.ymaps.iter().any(|m| m.name.eq_ignore_ascii_case(&stem)) && !self.proj.mlo_res.iter().any(|r| r.dir == res.dir && r.ymaps.iter().any(|x| x.eq_ignore_ascii_case(&stem)));
+                        let name = if other {
+                            let taken: Vec<String> = self.proj.ymaps.iter().map(|m| m.name.to_lowercase()).collect();
+                            crate::conflicts::renamed(&stem.to_lowercase(), &|n| taken.iter().any(|t| t == n))
+                        } else {
+                            stem.clone()
+                        };
+                        y.name = name.clone();
                         n_ent += y.entities.len();
-                        self.proj.ymaps.retain(|m| !m.name.eq_ignore_ascii_case(&stem));
+                        self.proj.ymaps.retain(|m| !m.name.eq_ignore_ascii_case(&name));
                         self.proj.ymaps.push(y);
-                        res.ymaps.push(stem.clone());
+                        res.ymaps.push(name);
                     }
                     Err(e) => res.unreadable.push(format!("{stem}.ymap ({e})")),
                 }
@@ -1533,7 +1573,7 @@ impl DwApp {
                     let _ = std::fs::remove_file(stream.join(fname));
                     continue;
                 }
-                let mut dest = stream.join(fname);
+                let mut dest = stream.join(r.export_name(&fname.to_string_lossy()));
                 if fname.to_string_lossy().eq_ignore_ascii_case("_manifest.ymf") && ours_ymf {
                     // nom différent pour ne pas écraser celui de DragoWalker — **estimé** (FiveM lit les .ymf du dossier stream)
                     dest = stream.join(format!("{}_manifest.ymf", r.name.replace(' ', "_").to_lowercase()));
@@ -1543,7 +1583,53 @@ impl DwApp {
                 }
             }
             for (n, f) in &r.ytyp_files {
-                if !f.is_empty() && copy_fresh(Path::new(f), &stream.join(format!("{n}.ytyp"))).is_ok() {
+                if f.is_empty() {
+                    continue;
+                }
+                // fichiers renommés (conflit avec une autre ressource) : références corrigées dans le .ytyp, relu en
+                // XML par CodeWalker et réécrit (converti en binaire avec le reste)
+                if !r.renames.is_empty() {
+                    if let Some(d) = dll {
+                        let tmp = std::env::temp_dir().join("dragowalker_cw").join("mlo_ren");
+                        let _ = std::fs::create_dir_all(&tmp);
+                        let x = tmp.join(format!("{n}.ytyp.xml"));
+                        if crate::cwbridge::to_xml(d, &[(PathBuf::from(f), x.clone())]).is_ok() {
+                            if let Ok(src) = std::fs::read_to_string(&x) {
+                                let mut out = src;
+                                let mut k = 0;
+                                for (old, new) in &r.renames {
+                                    let (o2, c) = crate::conflicts::replace_name_xml(&out, old, new);
+                                    out = o2;
+                                    k += c;
+                                }
+                                // rien à corriger dans ce fichier : recopié tel quel
+                                if k == 0 {
+                                    if copy_fresh(Path::new(f), &stream.join(format!("{n}.ytyp"))).is_ok() {
+                                        copied += 1;
+                                    }
+                                    continue;
+                                }
+                                // fichier de types partagé avec une autre ressource (identique à l'import) : la version
+                                // corrigée prend un autre nom, l'autre ressource garde le sien
+                                let shared = self.proj.mlo_res.iter().any(|o| o.name != r.name && o.ytyp_files.iter().any(|f| f.0.eq_ignore_ascii_case(n)));
+                                let n = if shared {
+                                    // préfixé du nom de la ressource (jamais un nom réservé de DragoWalker, « dw_… »)
+                                    format!("{res_low}_{}", n.to_lowercase())
+                                } else {
+                                    n.clone()
+                                };
+                                let _ = std::fs::remove_file(stream.join(format!("{n}.ytyp")));
+                                if std::fs::write(stream.join(format!("{n}.ytyp.xml")), out).is_ok() {
+                                    copied += 1;
+                                    report.push(format!("MLO « {} » : {} fichier(s) renommé(s) pour éviter un conflit, {k} référence(s) corrigée(s) dans {n}.ytyp.", r.name, r.renames.len()));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    report.push(format!("MLO « {} » : fichiers renommés, mais {n}.ytyp n'a pas pu être corrigé (CodeWalker) : recopié tel quel.", r.name));
+                }
+                if copy_fresh(Path::new(f), &stream.join(format!("{n}.ytyp"))).is_ok() {
                     copied += 1;
                 }
             }
@@ -1575,12 +1661,12 @@ impl DwApp {
                     // reste d'un export précédent dans ce dossier : retiré, sinon FiveM le chargerait encore
                     let _ = std::fs::remove_file(stream.join(fname));
                 } else if interior || !moved_mlo {
-                    if copy_fresh(p, &stream.join(fname)).is_ok() {
+                    if copy_fresh(p, &stream.join(if interior { fname.to_string_lossy().to_string() } else { r.export_name(&fname.to_string_lossy()) })).is_ok() {
                         copied += 1;
                         interior_cols += interior as usize;
                     }
                 } else {
-                    to_move.push((b, stem_of(p)));
+                    to_move.push((b, Path::new(&r.export_name(&fname.to_string_lossy())).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| stem_of(p))));
                 }
             }
             if !to_move.is_empty() {
@@ -2248,6 +2334,10 @@ impl DwApp {
         let mut remove = None;
         let mut goto = None;
         let mut open_pieces = None;
+        if ui.button("Conflits des MLO…").on_hover_text("Intérieurs qui se recouvrent, intérieurs ou objets du jeu au même endroit, fichiers de même nom dans plusieurs ressources : les voir et les régler").clicked() {
+            self.conflicts.open = true;
+            self.conflicts.checked = false;
+        }
         egui::CollapsingHeader::new(RichText::new(format!("MLO importés ({})", self.proj.mlo_res.len())).color(Color32::from_rgb(80, 220, 255))).id_salt("mlo_res").default_open(true).show(ui, |ui| {
             for (i, r) in self.proj.mlo_res.iter().enumerate() {
                 ui.label(RichText::new(&r.name).strong());

@@ -18,6 +18,60 @@ fn num(a: &Value, k: &str) -> Option<f32> {
     a.get(k).and_then(|v| v.as_f64()).map(|v| v as f32)
 }
 
+/// Murs d'un modèle coupé à la hauteur `z` (triangles dans un même repère) : morceaux des faces à peu près
+/// verticales, réunis par droite (angle à 2° près, décalage à 5 cm près) et triés du plus long au plus court ; seules
+/// les droites d'au moins 1 m restent.
+pub fn footprint_walls(tris: &[[V3; 3]], z: f32) -> Vec<([f32; 2], [f32; 2])> {
+    let mut segs: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    for t in tris {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
+        if n.len() < 1e-6 || (n.z / n.len()).abs() > 0.3 {
+            continue;
+        }
+        let mut pts: Vec<[f32; 2]> = Vec::new();
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if (a.z - z) * (b.z - z) < 0.0 {
+                let f = (z - a.z) / (b.z - a.z);
+                pts.push([a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f]);
+            }
+        }
+        if pts.len() == 2 && ((pts[1][0] - pts[0][0]).powi(2) + (pts[1][1] - pts[0][1]).powi(2)) > 1e-4 {
+            segs.push((pts[0], pts[1]));
+        }
+    }
+    // droites : (angle 0..180° arrondi à 2°, distance à l'origine arrondie à 5 cm) → étendue le long de la droite
+    let mut lines: std::collections::HashMap<(i32, i32), (f32, f32, f32, f32)> = std::collections::HashMap::new();
+    for (p, q) in &segs {
+        let mut ang = (q[1] - p[1]).atan2(q[0] - p[0]).to_degrees();
+        if ang < 0.0 {
+            ang += 180.0;
+        }
+        let ka = ((ang / 2.0).round() as i32).rem_euclid(90);
+        let a = (ka as f32 * 2.0).to_radians();
+        let (dx, dy) = (a.cos(), a.sin());
+        let off = -dy * p[0] + dx * p[1];
+        let ko = (off / 0.05).round() as i32;
+        let (s0, s1) = (dx * p[0] + dy * p[1], dx * q[0] + dy * q[1]);
+        let e = lines.entry((ka, ko)).or_insert((f32::MAX, f32::MIN, 0.0, off));
+        e.0 = e.0.min(s0.min(s1));
+        e.1 = e.1.max(s0.max(s1));
+        e.2 += (s1 - s0).abs();
+    }
+    let mut out: Vec<(f32, [f32; 2], [f32; 2])> = lines
+        .iter()
+        .filter(|(_, v)| v.2 >= 1.0)
+        .map(|(k, v)| {
+            let a = (k.0 as f32 * 2.0).to_radians();
+            let (dx, dy) = (a.cos(), a.sin());
+            let at = |s: f32| [dx * s - dy * v.3, dy * s + dx * v.3];
+            (v.2, at(v.0), at(v.1))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.into_iter().map(|(_, p, q)| (p, q)).collect()
+}
+
 pub const NAMES: [&str; 11] = ["repair_game_interior", "building_windows", "add_window", "building_bounds", "study_game_interior", "copy_game_interior", "hide_game_interior", "select_game_object", "add_entrance", "split_room", "place_interior"];
 
 pub fn tools_game() -> Vec<Value> {
@@ -43,8 +97,8 @@ pub fn tools_game() -> Vec<Value> {
         ),
         tool(
             "building_bounds",
-            "Mesure le bâtiment du jeu qui entoure un intérieur du projet (ou le centre de la vue) : sa boîte exprimée dans le repère de l'intérieur (x, y min/max, hauteurs), et l'emprise des pièces déjà là. Pour ajouter des pièces qui restent DANS le bâtiment : les rectangles de add_room doivent tenir dans cette boîte (garder 0,3 m pour l'épaisseur des murs).",
-            json!({"interior": interior}),
+            "Mesure le bâtiment du jeu qui entoure un intérieur du projet (ou le centre de la vue) : sa boîte exprimée dans le repère de l'intérieur (x, y min/max, hauteurs), l'emprise des pièces déjà là, et l'EMPRISE EXACTE DES MURS (le modèle coupé à hauteur d'homme : chaque mur de (x, y) à (x, y), sans toit ni débords). Pour ajouter des pièces qui restent DANS le bâtiment : les rectangles de add_room doivent tenir entre ces murs (garder 0,3 m pour leur épaisseur). z : hauteur de la coupe (sinon 1,2 m au-dessus du sol des pièces).",
+            json!({"interior": interior, "z": {"type": "number"}}),
             &[],
         ),
         tool(
@@ -180,6 +234,73 @@ impl DwApp {
         }
         hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(hits[hits.len() / 2])
+    }
+
+    /// Sol d'une pièce reprise du jeu : la texture de la plus grande surface horizontale au niveau de son vrai sol
+    /// (objets de la pièce), devenue texture du projet (PNG, au plus 256 px) avec la taille réelle de son motif.
+    /// Rend le numéro de sol de la coque modelable (CUSTOM_BASE + rang) et le nom de la texture.
+    pub(crate) fn game_floor_texture(&mut self, t: usize, m: usize, gi: usize) -> Option<(u8, String)> {
+        let floor = self.game_room_floor(t, m, gi)?;
+        let w = self.game.world.as_ref()?;
+        let mlo = &self.proj.ytyps[t].mlos[m];
+        let r = mlo.rooms.get(gi)?.clone();
+        let ents: Vec<crate::model::Entity> = mlo.entities.iter().filter(|e| e.room == gi || e.room == 0).cloned().collect();
+        let src = w.model_source();
+        let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let mut cache = Vec::new();
+        // clé de texture → (surface, longueur dans les UV, longueur dans le monde, texture)
+        let mut best: std::collections::HashMap<u64, (f32, f32, f32, Option<crate::gta::drawable::TexData>)> = std::collections::HashMap::new();
+        for e in ents.iter().take(200) {
+            let l = src.load(crate::gta::crypto::joaat(&e.archetype.to_lowercase()), &claimed, &mut cache);
+            let Some(model) = l.model.as_ref() else { continue };
+            let sc = v3(e.scale_xy, e.scale_xy, e.scale_z);
+            for (gk, g) in model.geoms.iter().enumerate() {
+                let key = l.part_keys.get(gk).copied().unwrap_or(0);
+                if key == 0 || g.blend != 0 || g.glass {
+                    continue;
+                }
+                let end = ((g.first + g.count) as usize).min(model.idx.len());
+                for tri in model.idx[g.first as usize..end].chunks_exact(3) {
+                    let v = [0, 1, 2].map(|j| model.verts[tri[j] as usize]);
+                    let p = v.map(|x| e.pos + e.rot.rotate(v3(x.pos[0], x.pos[1], x.pos[2]).mulv(sc)));
+                    let n = (p[1] - p[0]).cross(p[2] - p[0]);
+                    let area = n.len() * 0.5;
+                    if area < 1e-4 || n.z / (2.0 * area) < 0.9 {
+                        continue;
+                    }
+                    let c = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+                    if (c.z - floor).abs() > 0.4 || c.x < r.bb_min.x || c.x > r.bb_max.x || c.y < r.bb_min.y || c.y > r.bb_max.y {
+                        continue;
+                    }
+                    let duv = ((v[1].uv[0] - v[0].uv[0]).powi(2) + (v[1].uv[1] - v[0].uv[1]).powi(2)).sqrt();
+                    let dp = (p[1] - p[0]).len();
+                    let ent = best.entry(key).or_insert((0.0, 0.0, 0.0, None));
+                    ent.0 += area;
+                    ent.1 += duv;
+                    ent.2 += dp;
+                    if ent.3.is_none() {
+                        ent.3 = l.textures.iter().find(|x| x.0 == key).map(|x| x.1.clone());
+                    }
+                }
+            }
+        }
+        let (key, (_, uvl, wl, tex)) = best.into_iter().filter(|b| b.1 .3.is_some()).max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))?;
+        let img = crate::texdecode::decode_level(&tex?, 256)?;
+        let rgba = image::RgbaImage::from_raw(img.w as u32, img.h as u32, img.px)?;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        // taille d'un motif : longueur dans le monde pour une unité d'UV
+        let size = if uvl > 1e-4 { (wl / uvl).clamp(0.2, 8.0) } else { 1.0 };
+        let name = format!("sol_jeu_{key:08x}");
+        let i = match self.proj.custom_textures.iter().position(|c| c.name == name) {
+            Some(i) => i,
+            None if self.proj.custom_textures.len() < 150 => {
+                self.proj.custom_textures.push(crate::design::CustomTex { name: name.clone(), png: crate::design::b64_encode(&png), size });
+                self.proj.custom_textures.len() - 1
+            }
+            None => return None,
+        };
+        Some((crate::design::CUSTOM_BASE + i as u8, name))
     }
 
     /// Intérieur du jeu par son nom : (nom exact, index du placement le plus proche de la vue, définition).
@@ -394,6 +515,7 @@ impl DwApp {
         }
         // bâtiments du jeu (modèles de plus de 6 m) dont la boîte contient le point
         let mut found: Vec<(f32, String)> = Vec::new();
+        let mut biggest: Option<(f32, u32, V3, Quat, f32, f32)> = None;
         for ei in w.ents_in_radius(origin, 80.0) {
             let e = &w.ents[ei as usize];
             if e.mlo || e.lod_level != 0 {
@@ -421,6 +543,9 @@ impl DwApp {
             }
             let dyaw = (er.heading_deg() - rot.heading_deg()).rem_euclid(90.0);
             let aligned = dyaw < 2.0 || dyaw > 88.0;
+            if biggest.map(|b| size.x * size.y > b.0).unwrap_or(true) {
+                biggest = Some((size.x * size.y, e.arch, e.pos, er, sxy, sz));
+            }
             found.push((
                 size.x * size.y,
                 format!(
@@ -447,7 +572,39 @@ impl DwApp {
             for (_, l) in found.iter().take(5) {
                 s += &format!("  {l}\n");
             }
-            s += "La boîte du modèle inclut toit, auvents et débords : les murs sont un peu à l'intérieur (vérifier vu de dessus).";
+            s += "La boîte du modèle inclut toit, auvents et débords : les murs exacts sont mesurés ci-dessous.\n";
+            // emprise exacte : le modèle coupé à hauteur d'homme (1,2 m au-dessus du sol des pièces, sinon 1,5 m
+            // au-dessus du bas du bâtiment), murs à peu près verticaux seulement
+            if let Some((_, arch, bpos, brot, bsxy, bsz)) = biggest {
+                let src = w.model_source();
+                let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
+                let mut cache = Vec::new();
+                if let Some(model) = src.load(arch, &claimed, &mut cache).model {
+                    let an = crate::analyse::analyse(0, &w.name_of(arch), &model, bpos, brot, bsxy, bsz);
+                    let local: Vec<[V3; 3]> = an.tris.iter().map(|(t, _)| t.map(|p| inv.rotate(p - origin))).collect();
+                    let zmin = local.iter().flat_map(|t| t.iter()).fold(f32::MAX, |m, p| m.min(p.z));
+                    let room_floor = rooms.as_ref().and_then(|r| r.iter().skip(1).map(|r| r.floor_z.unwrap_or(r.bb_min.z)).reduce(f32::min));
+                    let zs = a["z"].as_f64().map(|v| v as f32).unwrap_or_else(|| room_floor.map(|f| f + 1.2).unwrap_or(zmin + 1.5));
+                    let walls = footprint_walls(&local, zs);
+                    if walls.is_empty() {
+                        s += &format!("Aucun mur coupé à z {zs:.2} (essaie un autre « z »).");
+                    } else {
+                        let (mut a0, mut a1) = ([f32::MAX; 2], [f32::MIN; 2]);
+                        for (p, q) in &walls {
+                            for v in [p, q] {
+                                a0 = [a0[0].min(v[0]), a0[1].min(v[1])];
+                                a1 = [a1[0].max(v[0]), a1[1].max(v[1])];
+                            }
+                        }
+                        s += &format!("Emprise exacte des murs (coupe à z {zs:.2}) : x {:.2}..{:.2}, y {:.2}..{:.2} ({:.1} × {:.1} m).\nMurs (faces, de (x, y) à (x, y), les plus longs d'abord) :\n", a0[0], a1[0], a0[1], a1[1], a1[0] - a0[0], a1[1] - a0[1]);
+                        for (p, q) in walls.iter().take(24) {
+                            let l = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
+                            s += &format!("  ({:.2}, {:.2}) → ({:.2}, {:.2})  {:.1} m\n", p[0], p[1], q[0], q[1], l);
+                        }
+                        s += "Pour rester dedans : garde 0,3 m entre ces murs (les deux faces d'un même mur sont deux lignes parallèles proches).";
+                    }
+                }
+            }
         }
         Ok(txt(s))
     }
@@ -788,5 +945,30 @@ impl DwApp {
             wall = " Une cloison percée d'une porte est posée le long de la coupe (mur de la coque modelable).".into();
         }
         Ok(txt(format!("Pièce {ri} « {} » coupée : nouvelle pièce {ni} « {} », avec une porte entre les deux.{wall}", ra.name, rb.name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::v3;
+
+    /// Une boîte de 10 × 6 m coupée à mi-hauteur : quatre murs, le toit qui déborde ignoré.
+    #[test]
+    fn murs_d_une_boite() {
+        let c = |x: f32, y: f32, z: f32| v3(x, y, z);
+        let quad = |a: V3, b: V3, cc: V3, d: V3| vec![[a, b, cc], [a, cc, d]];
+        let mut t = Vec::new();
+        t.extend(quad(c(0.0, 0.0, 0.0), c(10.0, 0.0, 0.0), c(10.0, 0.0, 3.0), c(0.0, 0.0, 3.0)));
+        t.extend(quad(c(10.0, 0.0, 0.0), c(10.0, 6.0, 0.0), c(10.0, 6.0, 3.0), c(10.0, 0.0, 3.0)));
+        t.extend(quad(c(10.0, 6.0, 0.0), c(0.0, 6.0, 0.0), c(0.0, 6.0, 3.0), c(10.0, 6.0, 3.0)));
+        t.extend(quad(c(0.0, 6.0, 0.0), c(0.0, 0.0, 0.0), c(0.0, 0.0, 3.0), c(0.0, 6.0, 3.0)));
+        t.extend(quad(c(-1.0, -1.0, 3.0), c(11.0, -1.0, 3.0), c(11.0, 7.0, 3.0), c(-1.0, 7.0, 3.0)));
+        let w = footprint_walls(&t, 1.5);
+        assert_eq!(w.len(), 4, "{w:?}");
+        let l = |p: [f32; 2], q: [f32; 2]| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
+        assert!((l(w[0].0, w[0].1) - 10.0).abs() < 0.01);
+        let xs: Vec<f32> = w.iter().flat_map(|(p, q)| [p[0], q[0]]).collect();
+        assert!(xs.iter().all(|x| *x > -0.01 && *x < 10.01), "pas de débord du toit : {xs:?}");
     }
 }

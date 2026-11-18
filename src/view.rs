@@ -386,7 +386,8 @@ impl DwApp {
         let mlo_extra = self.mlo_preview_insts();
         // aperçu de la pose : vrais modèles semi-transparents (gpu.rs ghost_pass), cadres verts s'ils manquent
         let ghost = self.pose_ghost(&ctx, rect, grouping);
-        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z]).collect()).unwrap_or_default(), extra: mlo_extra, ghost: ghost.iter().map(|(n, p, q, sxy, sz)| (render::arch_hash(n), *p, *q, *sxy, *sz)).collect(), ghost_bad: self.pose_ghost_bad() });
+        let hmap = self.water_hmap();
+        let gctx = self.game.world.as_ref().map(|w| render::GameCtx { world: w, lod_scale: self.game.lod, hover: self.game.hover, max_draw: self.game.max_draw, show_terrain: self.game.terrain, gpu: gpu.clone(), probe: hover_pos, shadows: self.game.shadows, cut_z: self.cut_z(), hidden: &self.game.hidden, hidden_ids: &self.game.hidden_ids, interiors: self.game.interiors, lights: self.game.lights, room_lights: if self.game.lights { self.interior_view_lights(self.cam.eye) } else { Vec::new() }, empty_map: self.game.empty_map, hidden_lod: &self.game.hidden_lod, isolate: self.game.isolate, only: self.isolate_sel.as_ref(), terrain: self.proj.terrain.as_ref().map(|t| { let (mn, mx) = t.bounds(); (crate::gta::crypto::joaat(crate::terrain::TERRAIN_ARCH), t.origin, mn, mx) }), waters: self.proj.terrain.as_ref().map(|t| t.waters.iter().map(|w| [w.min[0], w.min[1], w.max[0], w.max[1], w.z, if w.clear { 1.0 } else { 0.0 }]).collect()).unwrap_or_default(), hmap: hmap.clone(), extra: mlo_extra, ghost: ghost.iter().map(|(n, p, q, sxy, sz)| (render::arch_hash(n), *p, *q, *sxy, *sz)).collect(), ghost_bad: self.pose_ghost_bad() });
         render::draw_scene(&painter, &self.cam, &self.proj, &self.opts, &self.sel_set, self.hover, self.cur_mlo, gctx.as_ref(), &mut drawn);
         drop(gctx);
         self.game.drawn = drawn;
@@ -429,6 +430,16 @@ impl DwApp {
         self.draw_ambiance_preview(&painter, rect);
         self.draw_scenery_overlay(&painter, hover_pos);
         self.draw_life_overlay(&painter, hover_pos);
+        self.draw_ai_plan(&painter);
+        self.draw_conflicts(&painter);
+        self.draw_grass_overlay(&painter);
+        if self.ai_plan.is_some() {
+            egui::Area::new(egui::Id::new("ai_plan_clear")).fixed_pos(rect.center_top() + egui::vec2(-60.0, 56.0)).show(ui.ctx(), |ui| {
+                if ui.button("Retirer le plan").on_hover_text("Le plan dessiné par l'assistant IA (rien n'est construit avec lui)").clicked() {
+                    self.ai_plan = None;
+                }
+            });
+        }
         // Ctrl enfoncé : montre le point exact que la souris touche (WorldForm::BeginMouseHitTest 0x060002a4,
         // MouseRayCollisionVisible quand CtrlPressed) — Ctrl + clic y prend l'objet
         if (mods.command || std::env::var("DW_TEST_CTRL").is_ok()) && self.tool == Tool::Select {
@@ -517,6 +528,7 @@ impl DwApp {
                 crate::life::LifeTool::Parking => "Parking : glisser pour tracer une rangée de places",
                 crate::life::LifeTool::Ped => "PNJ : clic pour en poser un (face à la caméra)",
                 crate::life::LifeTool::Route => "Ronde : clic pour les points · double-clic ou Entrée pour créer le PNJ · Échap pour annuler",
+                crate::life::LifeTool::Zone => "Zone de quartier : glisser un rectangle sur la carte",
             },
         };
         let galley = painter.layout_no_wrap(help.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
@@ -983,5 +995,28 @@ impl DwApp {
                 ui.label(RichText::new("Astuce : clic droit maintenu + molette change la vitesse en te baladant.").small().weak());
             });
         });
+    }
+}
+
+impl DwApp {
+    /// Hauteurs du terrain pour l'eau de la vue (refaites quand le terrain est renvoyé à la carte graphique).
+    fn water_hmap(&mut self) -> Option<std::sync::Arc<crate::gpu::HMap>> {
+        let t = self.proj.terrain.as_ref()?;
+        let gen = self.terrain.generation;
+        if let Some(h) = self.terrain.hmap.as_ref().filter(|h| h.gen == gen) {
+            return Some(h.clone());
+        }
+        let h = std::sync::Arc::new(crate::gpu::HMap {
+            gen,
+            x0: t.origin.x,
+            y0: t.origin.y,
+            sx: (t.nx - 1) as f32 * t.cell,
+            sy: (t.ny - 1) as f32 * t.cell,
+            nx: t.nx,
+            ny: t.ny,
+            data: t.h.clone(),
+        });
+        self.terrain.hmap = Some(h.clone());
+        Some(h)
     }
 }

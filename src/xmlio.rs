@@ -69,6 +69,11 @@ fn entity_fields(out: &mut String, ind: &str, e: &Entity, invert: bool) {
 pub fn write_ymap(y: &Ymap, proj: &Project) -> String {
     let mut y = y.clone();
     y.calc_flags();
+    // modèles d'occlusion des bâtiments de l'Atelier posés dans cette carte (bit 5 de contentFlags, comme les boîtes)
+    let occ_models = crate::occlusion::house_models(&y, proj);
+    if !occ_models.is_empty() {
+        y.content_flags |= 32;
+    }
     let (emn, emx, smn, smx) = y.extents(proj);
     let mut o = String::new();
     o.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n");
@@ -138,6 +143,17 @@ pub fn write_ymap(y: &Ymap, proj: &Project) -> String {
                 Some(raw) => {
                     let items = ours.trim().trim_start_matches("<boxOccluders>").trim_end_matches("</boxOccluders>").to_string();
                     let _ = writeln!(o, " {}", raw.replacen("</boxOccluders>", &format!("{items}</boxOccluders>"), 1));
+                }
+                None => o.push_str(&ours),
+            }
+            continue;
+        }
+        if *tag == "occludeModels" && !occ_models.is_empty() {
+            let ours = crate::occlusion::occlude_models_xml(&occ_models);
+            match y.raw_sections.iter().find(|(t, _)| t == tag).map(|(_, r)| r.trim().to_string()).filter(|r| r.contains("</occludeModels>")) {
+                Some(raw) => {
+                    let items = ours.trim().trim_start_matches("<occludeModels>").trim_end_matches("</occludeModels>").to_string();
+                    let _ = writeln!(o, " {}", raw.replacen("</occludeModels>", &format!("{items}</occludeModels>"), 1));
                 }
                 None => o.push_str(&ours),
             }

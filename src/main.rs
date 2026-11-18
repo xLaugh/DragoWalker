@@ -19,6 +19,7 @@ mod gabarits;
 mod mcp;
 mod mcp_plus;
 mod mcp_game;
+mod mcp_city;
 mod docking;
 mod edit_ops;
 mod export;
@@ -40,6 +41,11 @@ mod shell;
 mod studio;
 mod propstudio;
 mod chats;
+mod lodlights;
+mod zones;
+mod minimap;
+mod navmesh;
+mod conflicts;
 mod lights;
 mod groups;
 mod occlusion;
@@ -80,6 +86,16 @@ mod xmlio;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // --to-xml <dossier de CodeWalker> <fichiers…> : fichiers du jeu relus en XML par CodeWalker (à côté, + .xml)
+    if args.len() >= 4 && args[1] == "--to-xml" {
+        let Some(dll) = cwbridge::dll(&args[2]) else {
+            println!("CodeWalker.Core.dll introuvable");
+            return Ok(());
+        };
+        let pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = args[3..].iter().map(|f| (std::path::PathBuf::from(f), std::path::PathBuf::from(format!("{f}.xml")))).collect();
+        println!("{:?}", cwbridge::to_xml(&dll, &pairs));
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--read-ydr" {
         for f in &args[2..] {
             match sollumz::read_ydr_binary(std::path::Path::new(f), 0, &std::collections::HashMap::new()) {
@@ -111,7 +127,7 @@ fn main() -> eframe::Result<()> {
     if args.len() >= 12 && args[1] == "--open-ydr-xml" {
         // dragowalker --open-ydr-xml <entrée.ydr.xml> <sortie.ydr.xml> x y z dirx diry largeur hauteur profondeur [appui]
         let f = |i: usize| args[i].parse::<f32>().unwrap_or(0.0);
-        let o = openings::Opening { pos: [f(4), f(5), f(6)], dir: [f(7), f(8)], w: f(9), h: f(10), depth: f(11), kind: "test".into(), sill: args.get(12).is_some(), prop: String::new() };
+        let o = openings::Opening { pos: [f(4), f(5), f(6)], dir: [f(7), f(8)], w: f(9), h: f(10), depth: f(11), kind: "test".into(), sill: args.get(12).is_some(), prop: String::new(), prop_id: None, locked: false };
         match std::fs::read_to_string(&args[2]).ok().and_then(|s| openings::apply_to_ydr_xml(&s, &[o])) {
             Some((x, n)) => {
                 let _ = std::fs::write(&args[3], x);

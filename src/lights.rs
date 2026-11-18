@@ -35,6 +35,56 @@ pub const LIGHT_BELOW_CEIL: f32 = 0.1;
 /// Portée en plus de ce qu'il faut pour atteindre le coin du sol éclairé par le spot (m) — **estimé**.
 pub const LIGHT_REACH_MARGIN: f32 = 1.0;
 
+/// Lumière pour la vue de DragoWalker : couleur multipliée par l'intensité (8, celle des spots d'intérieur, donne
+/// 0,6 ; bornée entre 0,3 et 1,2 fois ; le total est encore borné dans le shader : pas de taches blanches) ; spot : direction et demi-angle extérieur en degrés (borné à 80°) — **estimé**,
+/// pour que la pièce paraisse éclairée sans écraser les textures.
+pub fn view_light(p: V3, range: f32, color: [u8; 3], intensity: f32, spot: Option<(V3, f32)>) -> crate::gpu::VLight {
+    let k = (intensity / LIGHT_INTENSITY).clamp(0.3, 1.2) * 0.6;
+    let (dir, cone) = match spot {
+        Some((d, a)) => {
+            let d = if d.len() > 1e-4 { d.norm() } else { v3(0.0, 0.0, -1.0) };
+            ([d.x, d.y, d.z], a.clamp(5.0, 80.0).to_radians().cos())
+        }
+        None => ([0.0, 0.0, -1.0], -2.0),
+    };
+    crate::gpu::VLight { p: [p.x, p.y, p.z], range: range.clamp(0.5, 40.0), col: [color[0] as f32 / 255.0 * k, color[1] as f32 / 255.0 * k, color[2] as f32 / 255.0 * k], dir, cone }
+}
+
+impl crate::app::DwApp {
+    /// Lumières des intérieurs créés dans DragoWalker, comme à l'export (shell.rs export_shells) : lumières posées
+    /// dans la pièce, sinon spots au plafond si aucun objet de la pièce n'a de lumière (d'après les modèles déjà
+    /// chargés). Repère du monde ; seulement les intérieurs à moins de 150 m de `eye`.
+    pub fn interior_view_lights(&self, eye: V3) -> Vec<crate::gpu::VLight> {
+        let mut out = Vec::new();
+        for (ti, mi) in self.shell_mlos() {
+            let m = &self.proj.ytyps[ti].mlos[mi];
+            let Some((p, q)) = self.proj.mlo_placement(&m.name) else { continue };
+            if (p - eye).len() > 150.0 {
+                continue;
+            }
+            let design = self.proj.designs.iter().find(|d| d.mlo.eq_ignore_ascii_case(&m.name));
+            for (ri, r) in m.rooms.iter().enumerate().skip(1) {
+                let placed: Vec<Light> = design.map(|d| crate::design::room_design_lights(d, m, ri)).unwrap_or_default();
+                let lights = if !placed.is_empty() {
+                    placed
+                } else {
+                    let lit = m.entities.iter().filter(|e| e.room == ri).any(|e| crate::gta::loader::model_lights(crate::render::arch_hash(&e.archetype)).map(|l| !l.is_empty()).unwrap_or(false));
+                    if lit {
+                        continue;
+                    }
+                    room_lights(r.bb_min, r.bb_max)
+                };
+                for l in lights {
+                    let wp = p + q.rotate(l.pos);
+                    let spot = (!l.point).then(|| (q.rotate(v3(0.0, 0.0, -1.0)), LIGHT_CONE_OUTER));
+                    out.push(view_light(wp, l.falloff, l.colour.unwrap_or(LIGHT_COLOR), l.intensity.unwrap_or(LIGHT_INTENSITY), spot));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Une lumière posée dans un modèle (repère du modèle).
 #[derive(Clone, Copy, Debug)]
 pub struct Light {

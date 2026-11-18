@@ -20,6 +20,170 @@ pub struct WaterZone {
     pub min: [f32; 2],
     pub max: [f32; 2],
     pub z: f32,
+    /// eau claire (lagon) : plus transparente, turquoise, calme
+    #[serde(default)]
+    pub clear: bool,
+}
+
+/// Transparence de l'eau dans water.xml (a1..a4) : 26 pour presque toute l'eau du jeu, 22 sur une partie de celle
+/// de Cayo Perico (eau claire), 80 dans le marais de Zancudo (eau trouble) — relevé dans water.xml et
+/// water_heistisland.xml le 17 nov. 2026 ; plus bas = plus clair (**estimé**).
+pub const WATER_ALPHA: u8 = 26;
+pub const CLEAR_ALPHA: u8 = 12;
+/// Amortissement des vagues d'une eau claire (CalmingQuads.fDampening : 0 à 0,6 autour de Cayo Perico) — **estimé**.
+pub const CLEAR_CALM: f32 = 0.3;
+/// Vagues vers les plages du terrain (WaveQuads.Amplitude : 1 à 1,5 le plus souvent dans le jeu).
+pub const COAST_WAVE: f32 = 1.0;
+
+/// Mer sur toute la carte, comme la ressource ls-removed (data/water.xml : une seule zone de -24000 à 24500 en x,
+/// de -24000 à 28000 en y, à 0 m, transparence 26).
+pub const SEA_ALL_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<WaterData>\n  <WaterQuads>\n  <Item>\n   <minX value=\"-24000\" />\n   <maxX value=\"24500\" />\n   <minY value=\"-24000\" />\n   <maxY value=\"28000\" />\n   <Type value=\"0\" />\n   <IsInvisible value=\"false\" />\n   <HasLimitedDepth value=\"false\" />\n   <z value=\"0\" />\n   <a1 value=\"26\" />\n   <a2 value=\"26\" />\n   <a3 value=\"26\" />\n   <a4 value=\"26\" />\n   <NoStencil value=\"false\" />\n  </Item>\n  </WaterQuads>\n  <CalmingQuads>\n  </CalmingQuads>\n  <WaveQuads>\n  </WaveQuads>\n</WaterData>\n";
+
+/// Pas de la grille des zones d'eau (m). Dans water.xml et water_heistisland.xml du jeu, toutes les coordonnées
+/// des zones (6 464 valeurs) sont des entiers pairs, presque toutes multiples de 4, et aucune zone ne fait moins de
+/// 4 m : des coordonnées impaires (bords du terrain) faisaient geler le jeu au chargement de l'eau (17 nov. 2026).
+pub const WATER_GRID: f32 = 4.0;
+
+/// Rectangle d'eau calé sur la grille (vers l'extérieur), au moins une case de large.
+pub fn snap_rect(min: [f32; 2], max: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let g = WATER_GRID;
+    let (x0, y0) = ((min[0] / g).floor() * g, (min[1] / g).floor() * g);
+    let (x1, y1) = (((max[0] / g).ceil() * g).max(x0 + g), ((max[1] / g).ceil() * g).max(y0 + g));
+    ([x0, y0], [x1, y1])
+}
+
+/// Eau ajoutée autour des côtes du terrain : (quadrilatères d'eau, d'eau calme, de vagues) au format water.xml.
+/// Mer : seulement si aucune eau du jeu ne recouvre déjà le terrain (sinon deux surfaces d'eau l'une sur l'autre) ;
+/// cases de 32 m qui ont du fond sous 0 m, plus claires sur les hauts-fonds. Vagues : cases de 64 m traversées
+/// par la côte, dirigées vers la terre (vers le haut de la pente), comme les vagues du jeu vers ses plages.
+pub fn coast_water(t: &crate::terrain::Terrain, game: &[[f32; 5]]) -> (String, String, String, usize, usize) {
+    let (mn, mx) = t.bounds();
+    // bords calés sur la grille de l'eau du jeu (les cases de 32 et 64 m en sont des multiples)
+    let (smin, smax) = snap_rect([mn.x, mn.y], [mx.x, mx.y]);
+    let (mn, mx) = (v3(smin[0], smin[1], mn.z), v3(smax[0], smax[1], mx.z));
+    let h = |x: f32, y: f32| t.height_at(x, y);
+    let covered = game.iter().any(|q| q[0] < mx.x && q[2] > mn.x && q[1] < mx.y && q[3] > mn.y && q[4].abs() < 1.0);
+    let (mut quads, mut calm, mut waves) = (String::new(), String::new(), String::new());
+    let (mut nq, mut nw) = (0usize, 0usize);
+    let cell_stats = |x0: f32, y0: f32, s: f32| -> (f32, f32, f32) {
+        let (mut lo, mut hi, mut sum, mut n) = (f32::MAX, f32::MIN, 0.0f32, 0.0f32);
+        for j in 0..=4 {
+            for i in 0..=4 {
+                if let Some(z) = h(x0 + s * i as f32 / 4.0, y0 + s * j as f32 / 4.0) {
+                    lo = lo.min(z);
+                    hi = hi.max(z);
+                    sum += z;
+                    n += 1.0;
+                }
+            }
+        }
+        (lo, hi, if n > 0.0 { sum / n } else { 0.0 })
+    };
+    if !covered {
+        // grille de cases de 32 m : transparence de chacune (None = terre), puis cases voisines de même transparence
+        // fusionnées en rectangles (le moins de zones d'eau possible : le jeu en a ~500 en tout)
+        let s = 32.0;
+        let (cols, rows) = (((mx.x - mn.x) / s).ceil().max(1.0) as usize, ((mx.y - mn.y) / s).ceil().max(1.0) as usize);
+        let mut grid: Vec<Option<u8>> = vec![None; cols * rows];
+        for r in 0..rows {
+            for c in 0..cols {
+                let (x, y) = (mn.x + c as f32 * s, mn.y + r as f32 * s);
+                let (x1, y1) = ((x + s).min(mx.x), (y + s).min(mx.y));
+                let (lo, _, avg) = cell_stats(x, y, (x1 - x).min(y1 - y));
+                if lo < -0.05 {
+                    // une seule transparence, celle de la mer du jeu : des cases plus claires se voyaient en carrés en
+                    // jeu ; l'eau peu profonde laisse déjà voir le sable (rendu du jeu)
+                    let _ = avg;
+                    grid[r * cols + c] = Some(WATER_ALPHA);
+                }
+            }
+        }
+        for (c0, c1, r0, r1, a) in merge_cells(&grid, cols, rows) {
+            let (x, x1) = (mn.x + c0 as f32 * s, (mn.x + c1 as f32 * s).min(mx.x));
+            let (y, y1) = (mn.y + r0 as f32 * s, (mn.y + r1 as f32 * s).min(mx.y));
+            quads += &format!(
+                "  <Item>\n   <minX value=\"{x:.0}\" />\n   <maxX value=\"{x1:.0}\" />\n   <minY value=\"{y:.0}\" />\n   <maxY value=\"{y1:.0}\" />\n   <Type value=\"0\" />\n   <IsInvisible value=\"false\" />\n   <HasLimitedDepth value=\"false\" />\n   <z value=\"0.0\" />\n   <a1 value=\"{a}\" />\n   <a2 value=\"{a}\" />\n   <a3 value=\"{a}\" />\n   <a4 value=\"{a}\" />\n   <NoStencil value=\"false\" />\n  </Item>\n"
+            );
+            nq += 1;
+        }
+    }
+    let s = 64.0;
+    let mut y = mn.y;
+    while y < mx.y - 0.5 {
+        let mut x = mn.x;
+        while x < mx.x - 0.5 {
+            let (x1, y1) = ((x + s).min(mx.x), (y + s).min(mx.y));
+            let (lo, hi, _) = cell_stats(x, y, s.min(x1 - x).min(y1 - y));
+            if lo < -0.3 && hi > 0.3 {
+                let (cx, cy) = ((x + x1) * 0.5, (y + y1) * 0.5);
+                let gx = h(cx + 12.0, cy).unwrap_or(0.0) - h(cx - 12.0, cy).unwrap_or(0.0);
+                let gy = h(cx, cy + 12.0).unwrap_or(0.0) - h(cx, cy - 12.0).unwrap_or(0.0);
+                let l = (gx * gx + gy * gy).sqrt();
+                if l > 0.05 {
+                    let (dx, dy) = (gx / l, gy / l);
+                    waves += &format!(
+                        "  <Item>\n   <minX value=\"{x:.0}\" />\n   <maxX value=\"{x1:.0}\" />\n   <minY value=\"{y:.0}\" />\n   <maxY value=\"{y1:.0}\" />\n   <Amplitude value=\"{COAST_WAVE}\" />\n   <XDirection value=\"{dx:.6}\" />\n   <YDirection value=\"{dy:.6}\" />\n  </Item>\n"
+                    );
+                    nw += 1;
+                }
+            }
+            x += s;
+        }
+        y += s;
+    }
+    let _ = &mut calm;
+    (quads, calm, waves, nq, nw)
+}
+
+/// Rectangles (colonnes c0..c1, lignes r0..r1, valeur) qui couvrent les cases remplies d'une grille : suites de
+/// cases de même valeur sur chaque ligne, puis suites identiques des lignes suivantes empilées.
+pub fn merge_cells(grid: &[Option<u8>], cols: usize, rows: usize) -> Vec<(usize, usize, usize, usize, u8)> {
+    let mut runs: Vec<Vec<(usize, usize, u8)>> = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut row = Vec::new();
+        let mut c = 0;
+        while c < cols {
+            match grid[r * cols + c] {
+                Some(a) => {
+                    let start = c;
+                    while c < cols && grid[r * cols + c] == Some(a) {
+                        c += 1;
+                    }
+                    row.push((start, c, a));
+                }
+                None => c += 1,
+            }
+        }
+        runs.push(row);
+    }
+    let mut out = Vec::new();
+    let mut used: Vec<Vec<bool>> = runs.iter().map(|r| vec![false; r.len()]).collect();
+    for r in 0..rows {
+        for k in 0..runs[r].len() {
+            if used[r][k] {
+                continue;
+            }
+            let run = runs[r][k];
+            used[r][k] = true;
+            let mut r1 = r + 1;
+            while r1 < rows {
+                match runs[r1].iter().position(|x| *x == run) {
+                    Some(k1) if !used[r1][k1] => {
+                        used[r1][k1] = true;
+                        r1 += 1;
+                    }
+                    _ => break,
+                }
+            }
+            out.push((run.0, run.1, r, r1, run.2));
+        }
+    }
+    out
+}
+
+/// Eau calme (CalmingQuads) sur un rectangle.
+pub fn calm_xml(min: [f32; 2], max: [f32; 2], damp: f32) -> String {
+    format!("  <Item>\n   <minX value=\"{:.0}\" />\n   <maxX value=\"{:.0}\" />\n   <minY value=\"{:.0}\" />\n   <maxY value=\"{:.0}\" />\n   <fDampening value=\"{damp}\" />\n  </Item>\n", min[0], max[0], min[1], max[1])
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,7 +416,7 @@ impl DwApp {
                         }
                     }
                 }
-                t.waters.push(WaterZone { min: [x0, y0], max: [x1, y1], z });
+                t.waters.push(WaterZone { min: [x0, y0], max: [x1, y1], z, clear: self.terrain.water_clear });
             }
             self.terrain.dirty = true;
             self.status = format!("Eau ajoutée : {:.0} × {:.0} m à {:.1} m de haut.", x1 - x0, y1 - y0, z);
@@ -317,15 +481,25 @@ impl DwApp {
 
     pub fn terrain_ui_water(&mut self, ui: &mut egui::Ui) {
         ui.label("Glisser un rectangle dans la vue : l'eau monte à la hauteur du point de départ (+0,2 m).");
+        ui.horizontal(|ui| {
+            ui.label("Nouvelle zone :");
+            ui.selectable_value(&mut self.terrain.water_clear, false, "Eau normale");
+            ui.selectable_value(&mut self.terrain.water_clear, true, "Eau claire (lagon)").on_hover_text("Turquoise, transparente et calme : lagon, crique, piscine naturelle");
+        });
         ui.checkbox(&mut self.terrain.water_dig, "Creuser le bassin sous l'eau");
         if self.terrain.water_dig {
             ui.add(egui::Slider::new(&mut self.terrain.water_depth, 0.5..=10.0).text("profondeur").suffix(" m"));
+        }
+        if let Some(t) = self.proj.terrain.as_mut() {
+            ui.checkbox(&mut t.sea_all, "Mer partout (carte vide, ls-removed)").on_hover_text("L'eau exportée part d'une mer qui couvre toute la carte (comme la ressource ls-removed) au lieu de l'eau du jeu : là où Los Santos est retiré, c'est la mer. Coché tout seul pour les tests en jeu quand ls-removed est actif.");
+            ui.checkbox(&mut t.coast, "Côtes : eau claire et vagues vers les plages").on_hover_text("À l'export : là où le terrain descend sous la mer, de l'eau (si le jeu n'en a pas déjà à cet endroit), plus claire sur les hauts-fonds, et des vagues qui vont vers la plage. Dans la vue : eau turquoise peu profonde et écume sur le sable.");
         }
         let Some(t) = self.proj.terrain.as_ref() else { return };
         if !t.waters.is_empty() {
             ui.separator();
             ui.label(RichText::new("Zones d'eau").strong());
         }
+        let mut clear_set: Option<(usize, bool)> = None;
         let mut del = None;
         let mut changed = false;
         let mut zs: Vec<f32> = t.waters.iter().map(|w| w.z).collect();
@@ -334,6 +508,10 @@ impl DwApp {
                 ui.label(format!("{:.0} × {:.0} m", w.max[0] - w.min[0], w.max[1] - w.min[1]));
                 if ui.add(egui::DragValue::new(&mut zs[i]).speed(0.05).max_decimals(2).suffix(" m")).on_hover_text("Niveau de l'eau").changed() {
                     changed = true;
+                }
+                let mut c = w.clear;
+                if ui.checkbox(&mut c, "claire").on_hover_text("Eau claire (lagon) : turquoise, transparente, calme").changed() {
+                    clear_set = Some((i, c));
                 }
                 if ui.small_button("Supprimer").clicked() {
                     del = Some(i);
@@ -347,6 +525,12 @@ impl DwApp {
                 for (w, z) in t.waters.iter_mut().zip(zs) {
                     w.z = z;
                 }
+            }
+        }
+        if let Some((i, c)) = clear_set {
+            self.push_undo();
+            if let Some(t) = self.proj.terrain.as_mut() {
+                t.waters[i].clear = c;
             }
         }
         if let Some(i) = del {
@@ -410,9 +594,13 @@ impl DwApp {
         let mut archs = Vec::new();
         let mut ents = String::new();
         let mut ext: Option<(V3, V3)> = None;
-        // eau : le water.xml du jeu (océan, lacs) + les zones du projet
-        let base = if t.waters.is_empty() {
+        // eau : le water.xml du jeu (océan, lacs) + les zones du projet + les côtes du terrain
+        let has_coast = t.coast && t.h.iter().any(|z| *z < -0.3) && t.h.iter().any(|z| *z > 0.3);
+        let sea_all = t.sea_all || self.export_sea_all;
+        let base = if t.waters.is_empty() && !has_coast {
             None
+        } else if sea_all {
+            Some(SEA_ALL_XML.as_bytes().to_vec())
         } else {
             self.game.world.as_ref().and_then(|w| {
                 w.vfs.files.iter().find(|f| f.name.eq_ignore_ascii_case("water.xml") && f.path().to_lowercase().contains("levels\\gta5")).and_then(|f| w.vfs.read_binary(f, &w.keys))
@@ -422,20 +610,46 @@ impl DwApp {
         if let Some(base) = base {
             let mut s = String::from_utf8_lossy(&base).to_string();
             let mut items = String::new();
+            let mut calm = String::new();
             for w in &t.waters {
+                let a = if w.clear { CLEAR_ALPHA } else { WATER_ALPHA };
                 items += &format!(
-                    "  <Item>\n   <minX value=\"{:.1}\" />\n   <maxX value=\"{:.1}\" />\n   <minY value=\"{:.1}\" />\n   <maxY value=\"{:.1}\" />\n   <Type value=\"0\" />\n   <IsInvisible value=\"false\" />\n   <HasLimitedDepth value=\"false\" />\n   <z value=\"{:.2}\" />\n   <a1 value=\"26\" />\n   <a2 value=\"26\" />\n   <a3 value=\"26\" />\n   <a4 value=\"26\" />\n   <NoStencil value=\"false\" />\n  </Item>\n",
-                    w.min[0], w.max[0], w.min[1], w.max[1], w.z
+                    "  <Item>\n   <minX value=\"{:.0}\" />\n   <maxX value=\"{:.0}\" />\n   <minY value=\"{:.0}\" />\n   <maxY value=\"{:.0}\" />\n   <Type value=\"0\" />\n   <IsInvisible value=\"false\" />\n   <HasLimitedDepth value=\"false\" />\n   <z value=\"{:.2}\" />\n   <a1 value=\"{a}\" />\n   <a2 value=\"{a}\" />\n   <a3 value=\"{a}\" />\n   <a4 value=\"{a}\" />\n   <NoStencil value=\"false\" />\n  </Item>\n",
+                    snap_rect(w.min, w.max).0[0], snap_rect(w.min, w.max).1[0], snap_rect(w.min, w.max).0[1], snap_rect(w.min, w.max).1[1], w.z
                 );
+                if w.clear {
+                    let (a, b) = snap_rect(w.min, w.max);
+                    calm += &calm_xml(a, b, CLEAR_CALM);
+                }
+            }
+            let mut waves = String::new();
+            if has_coast {
+                let game = crate::gta::world::parse_water(&s);
+                let (q, c, wv, nq, nw) = coast_water(t, &game);
+                items += &q;
+                calm += &c;
+                waves = wv;
+                if std::env::var("DW_TEST_AI").is_ok() || std::env::var("DW_TEST_TERRAIN_EXPORT").is_ok() {
+                    println!("côtes : {nq} zone(s) de mer, {nw} zone(s) de vagues");
+                }
             }
             match s.find("</WaterQuads>") {
                 Some(p) => s.insert_str(p, &items),
                 None => return Err("water.xml du jeu illisible".into()),
             }
+            for (tag, add) in [("</CalmingQuads>", &calm), ("</WaveQuads>", &waves)] {
+                if add.is_empty() {
+                    continue;
+                }
+                match s.find(tag) {
+                    Some(p) => s.insert_str(p, add),
+                    None => return Err("water.xml du jeu illisible".into()),
+                }
+            }
             std::fs::write(root.join("dw_water.xml"), s).map_err(|e| e.to_string())?;
             std::fs::write(
                 root.join("dw_water.lua"),
-                "-- DragoWalker : charge l'eau du terrain (l'eau du jeu + les nouvelles zones)\nCreateThread(function()\n    LoadWaterFromPath(GetCurrentResourceName(), 'dw_water.xml')\nend)\n",
+                "-- DragoWalker : charge l'eau du terrain (l'eau du jeu + les nouvelles zones), une fois le joueur dans la partie\n-- (pas pendant le chargement du jeu)\nCreateThread(function()\n    while not NetworkIsPlayerActive(PlayerId()) do Wait(500) end\n    Wait(2000)\n    LoadWaterFromPath(GetCurrentResourceName(), 'dw_water.xml')\nend)\n",
             )
             .map_err(|e| e.to_string())?;
         }
@@ -485,5 +699,47 @@ impl DwApp {
             }
         }
         Ok((archs, ents, ext, water_skipped))
+    }
+}
+
+#[cfg(test)]
+mod tests_water {
+    use super::*;
+
+    #[test]
+    fn grille_de_l_eau() {
+        let (a, b) = snap_rect([-61.3, 131.0], [195.0, 133.0]);
+        assert_eq!((a, b), ([-64.0, 128.0], [196.0, 136.0]));
+        for v in [a[0], a[1], b[0], b[1]] {
+            assert_eq!(v % 4.0, 0.0);
+        }
+        // terrain dont les bords tombent hors de la grille : toutes les zones exportées sont sur la grille
+        let mut t = crate::terrain::Terrain::new(v3(195.3, -934.7, 0.0), 512.0, 2.0, 0);
+        t.generate_ex(&crate::terrain::GenSpec { preset: 1, island: true, ..Default::default() });
+        let (q, _, w, nq, nw) = coast_water(&t, &[]);
+        assert!(nq > 0 && nw > 0);
+        for v in regex_vals(&q).into_iter().chain(regex_vals(&w)) {
+            assert_eq!(v % 4.0, 0.0, "{v}");
+        }
+    }
+
+    fn regex_vals(s: &str) -> Vec<f32> {
+        let mut out = Vec::new();
+        for tag in ["minX", "maxX", "minY", "maxY"] {
+            for part in s.split(&format!("<{tag} value=\"")).skip(1) {
+                out.push(part.split('"').next().unwrap().parse().unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fusion_des_cases() {
+        // 4 × 3 : un bloc de 2 × 2 (12), une ligne de 26, une case seule
+        let g = [Some(12), Some(12), None, Some(26), Some(12), Some(12), None, None, Some(26), Some(26), Some(26), Some(26)].map(|x: Option<u8>| x);
+        let m = merge_cells(&g, 4, 3);
+        let cover: usize = m.iter().map(|(c0, c1, r0, r1, _)| (c1 - c0) * (r1 - r0)).sum();
+        assert_eq!(cover, g.iter().filter(|x| x.is_some()).count());
+        assert_eq!(m.len(), 3, "{m:?}");
     }
 }

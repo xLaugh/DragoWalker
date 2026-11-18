@@ -384,6 +384,141 @@ pub struct Partition {
     pub door: bool,
 }
 
+/// Quadrillage (m) des étages coupés par des cloisons en biais ou en L, prolongement des cloisons pour fermer contre
+/// les murs (m), et surface minimale d'une pièce (m²) — **estimé**.
+pub const CELL_RES: f32 = 0.1;
+pub const PART_EXTEND: f32 = 0.15;
+pub const ROOM_MIN_AREA: f32 = 1.0;
+
+/// Contour d'une pièce faite de rectangles (emprise exacte, interior_cells) : le bord de la plus grande zone,
+/// suivi sur une grille de CELL_RES, puis simplifié (Douglas-Peucker à 12 cm) pour retrouver les murs en biais.
+/// Sens inverse des aiguilles d'une montre.
+pub fn cells_outline(cells: &[(f32, f32, f32, f32)]) -> Vec<[f32; 2]> {
+    if cells.len() == 1 {
+        let c = cells[0];
+        return vec![[c.0, c.2], [c.1, c.2], [c.1, c.3], [c.0, c.3]];
+    }
+    let g = CELL_RES;
+    let (x0, y0) = cells.iter().fold((f32::MAX, f32::MAX), |r, c| (r.0.min(c.0), r.1.min(c.2)));
+    let (x1, y1) = cells.iter().fold((f32::MIN, f32::MIN), |r, c| (r.0.max(c.1), r.1.max(c.3)));
+    let nx = ((x1 - x0) / g).round() as i32;
+    let ny = ((y1 - y0) / g).round() as i32;
+    if nx <= 0 || ny <= 0 || nx * ny > 4_000_000 {
+        return Vec::new();
+    }
+    let filled = |i: i32, j: i32| -> bool {
+        if i < 0 || j < 0 || i >= nx || j >= ny {
+            return false;
+        }
+        let (x, y) = (x0 + (i as f32 + 0.5) * g, y0 + (j as f32 + 0.5) * g);
+        cells.iter().any(|c| x > c.0 && x < c.1 && y > c.2 && y < c.3)
+    };
+    let grid: Vec<bool> = (0..ny).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| filled(i, j)).collect();
+    let at = |i: i32, j: i32| i >= 0 && j >= 0 && i < nx && j < ny && grid[(j * nx + i) as usize];
+    // bords orientés (case pleine à gauche) : sommet de départ → sommet d'arrivée (coins de la grille)
+    let mut next: std::collections::HashMap<(i32, i32), Vec<(i32, i32)>> = std::collections::HashMap::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            if !at(i, j) {
+                continue;
+            }
+            if !at(i, j - 1) {
+                next.entry((i, j)).or_default().push((i + 1, j));
+            }
+            if !at(i + 1, j) {
+                next.entry((i + 1, j)).or_default().push((i + 1, j + 1));
+            }
+            if !at(i, j + 1) {
+                next.entry((i + 1, j + 1)).or_default().push((i, j + 1));
+            }
+            if !at(i - 1, j) {
+                next.entry((i, j + 1)).or_default().push((i, j));
+            }
+        }
+    }
+    // boucles ; on garde la plus longue (le tour de la pièce)
+    let mut best: Vec<(i32, i32)> = Vec::new();
+    while let Some(&start) = next.keys().next() {
+        let mut lp = vec![start];
+        let mut cur = start;
+        loop {
+            let Some(list) = next.get_mut(&cur) else { break };
+            let n = list.pop().unwrap();
+            if list.is_empty() {
+                next.remove(&cur);
+            }
+            if n == start {
+                break;
+            }
+            lp.push(n);
+            cur = n;
+            if lp.len() > 2_000_000 {
+                break;
+            }
+        }
+        if lp.len() > best.len() {
+            best = lp;
+        }
+    }
+    let pts: Vec<[f32; 2]> = best.iter().map(|&(i, j)| [x0 + i as f32 * g, y0 + j as f32 * g]).collect();
+    simplify_closed(&pts, 0.12)
+}
+
+/// Douglas-Peucker sur un contour fermé.
+fn simplify_closed(pts: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
+    if pts.len() < 4 {
+        return pts.to_vec();
+    }
+    // départ : le point le plus à gauche, et le plus loin de lui (deux moitiés)
+    let a = (0..pts.len()).min_by(|&i, &j| pts[i][0].total_cmp(&pts[j][0]).then(pts[i][1].total_cmp(&pts[j][1]))).unwrap_or(0);
+    let d2 = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
+    let b = (0..pts.len()).max_by(|&i, &j| d2(pts[i], pts[a]).total_cmp(&d2(pts[j], pts[a]))).unwrap_or(0);
+    let ring: Vec<[f32; 2]> = (0..pts.len()).map(|k| pts[(a + k) % pts.len()]).collect();
+    let bi = (b + pts.len() - a) % pts.len();
+    fn dp(p: &[[f32; 2]], eps: f32, out: &mut Vec<[f32; 2]>) {
+        let (s, e) = (p[0], p[p.len() - 1]);
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let (mut k, mut dm) = (0, 0.0f32);
+        for (i, q) in p.iter().enumerate().take(p.len() - 1).skip(1) {
+            let d = ((q[0] - s[0]) * dy - (q[1] - s[1]) * dx).abs() / l;
+            if d > dm {
+                dm = d;
+                k = i;
+            }
+        }
+        if dm > eps && k > 0 {
+            dp(&p[..=k], eps, out);
+            dp(&p[k..], eps, out);
+        } else {
+            out.push(s);
+        }
+    }
+    let mut out = Vec::new();
+    let mut first: Vec<[f32; 2]> = ring[..=bi].to_vec();
+    if first.len() < 2 {
+        first.push(ring[0]);
+    }
+    dp(&first, eps, &mut out);
+    let mut second: Vec<[f32; 2]> = ring[bi..].to_vec();
+    second.push(ring[0]);
+    dp(&second, eps, &mut out);
+    out
+}
+
+/// Point dans un polygone (règle pair-impair).
+pub fn point_in_poly(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 /// Épaisseur des cloisons, passage (largeur, hauteur) (m) — **estimé**.
 pub const PART_T: f32 = 0.12;
 pub const PART_DOOR_W: f32 = 0.9;
@@ -1866,12 +2001,170 @@ impl House {
     /// bouts de cloison laissés ouverts). Chaque étage est coupé par ses cloisons droites (à 3° près) qui traversent au
     /// moins la moitié de la pièce où elles tombent ; les autres cloisons restent dans la pièce.
     pub fn interior_rooms(&self) -> (Vec<(String, V3, V3)>, Vec<[V3; 4]>) {
+        let (rooms, inner, _) = self.interior_layout();
+        (rooms, inner)
+    }
+
+    /// Emprise exacte de chaque pièce de interior_rooms (même ordre) : rectangles (x0, x1, y0, y1) du repère du
+    /// bâtiment. Une pièce coupée par une cloison en biais ou en L n'est pas un rectangle (sa boîte déborde sur la
+    /// pièce voisine) : la collision et le choix de la pièce d'un point suivent ces rectangles.
+    pub fn interior_cells(&self) -> Vec<Vec<(f32, f32, f32, f32)>> {
+        self.interior_layout().2
+    }
+
+    /// Pièce (indice dans interior_rooms, à partir de 0) qui contient un point, d'après l'emprise exacte.
+    pub fn cell_room_at(rooms: &[(String, V3, V3)], cells: &[Vec<(f32, f32, f32, f32)>], p: V3, margin: f32) -> Option<usize> {
+        rooms.iter().enumerate().position(|(i, (_, lo, hi))| {
+            p.z >= lo.z - 0.3 && p.z <= hi.z + 0.3 && cells.get(i).map(|cs| cs.iter().any(|c| p.x >= c.0 - margin && p.x <= c.1 + margin && p.y >= c.2 - margin && p.y <= c.3 + margin)).unwrap_or(p.x >= lo.x - margin && p.x <= hi.x + margin && p.y >= lo.y - margin && p.y <= hi.y + margin)
+        })
+    }
+
+    /// Pièces d'un étage découpées par des cloisons quelconques (en biais, en L, qui ne traversent pas) : l'étage est
+    /// quadrillé (CELL_RES), les cloisons (épaissies, prolongées de PART_EXTEND pour fermer contre les murs) et le
+    /// dehors du bâtiment bouchent des cases, chaque zone de cases reliées d'au moins ROOM_MIN_AREA devient une pièce.
+    /// Rend (rectangles de chaque pièce, portails aux passages des cloisons).
+    fn floor_regions(&self, f: u8) -> (Vec<Vec<(f32, f32, f32, f32)>>, Vec<[V3; 4]>) {
+        let (lo, hi) = self.floor_room(f);
+        let g = CELL_RES;
+        let nx = (((hi.x - lo.x) / g).ceil() as usize).clamp(1, 1200);
+        let ny = (((hi.y - lo.y) / g).ceil() as usize).clamp(1, 1200);
+        let ctr = |i: usize, j: usize| [lo.x + (i as f32 + 0.5) * g, lo.y + (j as f32 + 0.5) * g];
+        let walls: Vec<&Partition> = self.walls.iter().filter(|w| w.floor == f).collect();
+        let seg_d = |p: [f32; 2], w: &Partition| {
+            let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-4);
+            let (ux, uy) = (dx / len, dy / len);
+            let t = ((p[0] - w.a[0]) * ux + (p[1] - w.a[1]) * uy).clamp(-PART_EXTEND, len + PART_EXTEND);
+            let (qx, qy) = (w.a[0] + ux * t, w.a[1] + uy * t);
+            ((p[0] - qx).powi(2) + (p[1] - qy).powi(2)).sqrt()
+        };
+        let thick = PART_T * 0.5 + g * 0.75;
+        let mut lab = vec![-1i32; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let p = ctr(i, j);
+                if !point_in_poly(p, &self.foot) || walls.iter().any(|w| seg_d(p, w) < thick) {
+                    lab[j * nx + i] = -2;
+                }
+            }
+        }
+        // zones reliées (4 voisins)
+        let mut regions: Vec<Vec<usize>> = Vec::new();
+        for s in 0..nx * ny {
+            if lab[s] != -1 {
+                continue;
+            }
+            let id = regions.len() as i32;
+            let mut list = vec![s];
+            lab[s] = id;
+            let mut k = 0;
+            while k < list.len() {
+                let c = list[k];
+                k += 1;
+                let (i, j) = (c % nx, c / nx);
+                let mut nb = Vec::with_capacity(4);
+                if i > 0 {
+                    nb.push(c - 1);
+                }
+                if i + 1 < nx {
+                    nb.push(c + 1);
+                }
+                if j > 0 {
+                    nb.push(c - nx);
+                }
+                if j + 1 < ny {
+                    nb.push(c + nx);
+                }
+                for n in nb {
+                    if lab[n] == -1 {
+                        lab[n] = id;
+                        list.push(n);
+                    }
+                }
+            }
+            regions.push(list);
+        }
+        let min_cells = (ROOM_MIN_AREA / (g * g)) as usize;
+        let keep: Vec<usize> = (0..regions.len()).filter(|&r| regions[r].len() >= min_cells).collect();
+        // rectangles : suites de cases d'une rangée, réunies avec la rangée suivante si elles ont la même étendue
+        let mut cells = Vec::new();
+        for &r in &keep {
+            let id = r as i32;
+            let mut rects: Vec<(usize, usize, usize, usize)> = Vec::new(); // (i0, i1, j0, j1) inclus/exclus
+            let mut open: Vec<(usize, usize, usize)> = Vec::new(); // (i0, i1, j0) des suites de la rangée précédente
+            for j in 0..=ny {
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                if j < ny {
+                    let mut i = 0;
+                    while i < nx {
+                        if lab[j * nx + i] == id {
+                            let s = i;
+                            while i < nx && lab[j * nx + i] == id {
+                                i += 1;
+                            }
+                            runs.push((s, i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                let mut next_open = Vec::new();
+                for o in open.drain(..) {
+                    if let Some(k) = runs.iter().position(|r| *r == (o.0, o.1)) {
+                        runs.remove(k);
+                        next_open.push(o);
+                    } else {
+                        rects.push((o.0, o.1, o.2, j));
+                    }
+                }
+                for r in runs {
+                    next_open.push((r.0, r.1, j));
+                }
+                open = next_open;
+            }
+            cells.push(rects.into_iter().map(|(i0, i1, j0, j1)| (lo.x + i0 as f32 * g, lo.x + i1 as f32 * g, lo.y + j0 as f32 * g, lo.y + j1 as f32 * g)).collect::<Vec<_>>());
+        }
+        let region_at = |p: [f32; 2]| -> Option<usize> {
+            let (i, j) = (((p[0] - lo.x) / g).floor(), ((p[1] - lo.y) / g).floor());
+            if i < 0.0 || j < 0.0 || i as usize >= nx || j as usize >= ny {
+                return None;
+            }
+            let l = lab[j as usize * nx + i as usize];
+            (l >= 0).then(|| keep.iter().position(|&k| k as i32 == l)).flatten()
+        };
+        // passages des cloisons (pas de portail si les deux côtés sont la même pièce : le bout est resté ouvert)
+        let mut inner = Vec::new();
+        for w in &walls {
+            let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
+            let len = (dx * dx + dy * dy).sqrt();
+            if !w.door || len <= PART_DOOR_W + 0.4 {
+                continue;
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            let m = [(w.a[0] + w.b[0]) * 0.5, (w.a[1] + w.b[1]) * 0.5];
+            let off = PART_T * 0.5 + 0.25;
+            let (ra, rb) = (region_at([m[0] - uy * off, m[1] + ux * off]), region_at([m[0] + uy * off, m[1] - ux * off]));
+            if let (Some(ra), Some(rb)) = (ra, rb) {
+                if ra != rb {
+                    let pt = |t: f32, zz: f32| v3(m[0] + ux * t, m[1] + uy * t, zz);
+                    let (h0, z0, z1) = (PART_DOOR_W * 0.5, lo.z, (lo.z + PART_DOOR_H).min(hi.z));
+                    inner.push([pt(-h0, z0), pt(-h0, z1), pt(h0, z1), pt(h0, z0)]);
+                }
+            }
+        }
+        (cells, inner)
+    }
+
+    fn interior_layout(&self) -> (Vec<(String, V3, V3)>, Vec<[V3; 4]>, Vec<Vec<(f32, f32, f32, f32)>>) {
         let mut rooms = Vec::new();
         let mut inner = Vec::new();
+        let mut all_cells = Vec::new();
         for f in 0..self.floors.max(1) {
             let (lo, hi) = self.floor_room(f);
             let (z0, z1) = (lo.z, hi.z);
             let mut rects: Vec<(f32, f32, f32, f32)> = vec![(lo.x, hi.x, lo.y, hi.y)];
+            let mut floor_inner = Vec::new();
+            let mut free_walls = false;
             for w in self.walls.iter().filter(|w| w.floor == f) {
                 let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
                 let len = (dx * dx + dy * dy).sqrt();
@@ -1881,6 +2174,7 @@ impl House {
                 let vertical = dx.abs() < len * 0.05; // x constant
                 let horizontal = dy.abs() < len * 0.05;
                 if !vertical && !horizontal {
+                    free_walls = true;
                     continue;
                 }
                 let m = [(w.a[0] + w.b[0]) * 0.5, (w.a[1] + w.b[1]) * 0.5];
@@ -1889,6 +2183,8 @@ impl House {
                 // (position de la cloison, début et fin le long de la cloison, étendue de la pièce le long de la cloison)
                 let (c, p0, p1, r0, r1) = if vertical { (m[0], w.a[1].min(w.b[1]), w.a[1].max(w.b[1]), r.2, r.3) } else { (m[1], w.a[0].min(w.b[0]), w.a[0].max(w.b[0]), r.0, r.1) };
                 if (p1.min(r1) - p0.max(r0)) < 0.5 * (r1 - r0) {
+                    // cloison droite qui ne traverse pas : peut fermer une pièce avec une autre (en L)
+                    free_walls = true;
                     continue;
                 }
                 let (na, nb) = if vertical { ((r.0, c - PART_T * 0.5, r.2, r.3), (c + PART_T * 0.5, r.1, r.2, r.3)) } else { ((r.0, r.1, r.2, c - PART_T * 0.5), (r.0, r.1, c + PART_T * 0.5, r.3)) };
@@ -1903,7 +2199,7 @@ impl House {
                         return;
                     }
                     let pt = |t: f32, zz: f32| if vertical { v3(c, t, zz) } else { v3(t, c, zz) };
-                    inner.push([pt(a0, za), pt(a0, zb), pt(a1, zb), pt(a1, za)]);
+                    floor_inner.push([pt(a0, za), pt(a0, zb), pt(a1, zb), pt(a1, za)]);
                 };
                 // bouts restés ouverts
                 portal(r0, p0.max(r0), z0, z1);
@@ -1913,13 +2209,32 @@ impl House {
                     portal(mid - PART_DOOR_W * 0.5, mid + PART_DOOR_W * 0.5, z0, (z0 + PART_DOOR_H).min(z1));
                 }
             }
+            // cloisons en biais, en L ou qui ne traversent pas : pièces d'après les zones fermées de l'étage
+            if free_walls {
+                let (cells, fin) = self.floor_regions(f);
+                if cells.len() > 1 {
+                    for (k, cs) in cells.into_iter().enumerate() {
+                        let (mut a, mut b) = ([f32::MAX; 2], [f32::MIN; 2]);
+                        for c in &cs {
+                            a = [a[0].min(c.0), a[1].min(c.2)];
+                            b = [b[0].max(c.1), b[1].max(c.3)];
+                        }
+                        rooms.push((format!("etage{}_piece{}", f + 1, k + 1), v3(a[0], a[1], z0), v3(b[0], b[1], z1)));
+                        all_cells.push(cs);
+                    }
+                    inner.extend(fin);
+                    continue;
+                }
+            }
+            inner.extend(floor_inner);
             let many = rects.len() > 1;
             for (k, r) in rects.iter().enumerate() {
                 let name = if many { format!("etage{}_piece{}", f + 1, k + 1) } else { format!("etage{}", f + 1) };
                 rooms.push((name, v3(r.0, r.2, z0), v3(r.1, r.3, z1)));
+                all_cells.push(vec![*r]);
             }
         }
-        (rooms, inner)
+        (rooms, inner, all_cells)
     }
 
     /// Collision des pièces de l'intérieur de ce bâtiment (pièce, triangle ; repère du bâtiment) : sol et plafond de
@@ -1930,13 +2245,18 @@ impl House {
         let tris = triangulate(&self.foot);
         let st = self.stair();
         let nf = self.floors.max(1);
+        // emprise exacte des pièces (cloisons en biais ou en L), si les pièces sont bien celles de ce bâtiment
+        let cells = self.interior_cells();
+        let exact = cells.len() + 1 == rooms.len();
         for (ri, r) in rooms.iter().enumerate().skip(1) {
             let f = (((r.bb_min.z - self.lift - 0.02) / self.floor_h).round().max(0.0) as u8).min(nf - 1);
             let zf = self.lift + f as f32 * self.floor_h + if f == 0 { FLOOR_LIFT } else { 0.0 };
             let zc = self.lift + if f + 1 >= nf { self.height() - 0.02 } else { (f + 1) as f32 * self.floor_h - SLAB_T };
-            let (x0, x1, y0, y1) = (r.bb_min.x, r.bb_max.x, r.bb_min.y, r.bb_max.y);
             let ceil_hole = f + 1 < nf || (self.roof_access && self.roof == 0);
-            for t in &tris {
+            let rects: Vec<(f32, f32, f32, f32)> = if exact { cells[ri - 1].clone() } else { vec![(r.bb_min.x, r.bb_max.x, r.bb_min.y, r.bb_max.y)] };
+            let (x0, x1, y0, y1) = (r.bb_min.x, r.bb_max.x, r.bb_min.y, r.bb_max.y);
+            for &(x0, x1, y0, y1) in &rects {
+                for t in &tris {
                 let tri: Vec<[f32; 2]> = t.iter().map(|&k| self.foot[k]).collect();
                 let pc = clip_half(&clip_half(&clip_half(&clip_half(&tri, &|p| p[0] - x0), &|p| x1 - p[0]), &|p| p[1] - y0), &|p| y1 - p[1]);
                 if pc.len() < 3 {
@@ -1949,6 +2269,7 @@ impl House {
                             out.push((ri, if down { [a, c, b] } else { [a, b, c] }));
                         }
                     }
+                }
                 }
             }
             // palier du colimaçon dans la trémie
@@ -4024,15 +4345,16 @@ impl DwApp {
         let Some(ent) = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.archetype.to_lowercase() == h.name).cloned() else {
             return "Pose d'abord ce bâtiment dans le projet.".into();
         };
-        let (bmn, bmx) = h.bbox();
-        let rect_area = (bmx.x - bmn.x) * (bmx.y - bmn.y);
+        // emprise seule (la boîte du bâtiment compte aussi auvents, balcons et perrons : un rectangle avec un auvent
+        // passait pour « pas un rectangle »)
+        let (fx0, fx1, fy0, fy1) = h.foot.iter().fold((f32::MAX, f32::MIN, f32::MAX, f32::MIN), |r, p| (r.0.min(p[0]), r.1.max(p[0]), r.2.min(p[1]), r.3.max(p[1])));
+        let rect_area = (fx1 - fx0) * (fy1 - fy0);
         let not_rect = signed_area(&h.foot) < rect_area * 0.95;
         // pièces : une par étage, coupée par les cloisons droites qui la traversent (chaque pièce a son son et sa
         // lumière) ; portails entre elles au passage des cloisons et aux bouts laissés ouverts
         let (rooms, inner) = h.interior_rooms();
-        let room_at = |p: V3| -> u32 {
-            rooms.iter().position(|(_, lo, hi2)| p.x >= lo.x - 0.05 && p.x <= hi2.x + 0.05 && p.y >= lo.y - 0.05 && p.y <= hi2.y + 0.05 && p.z >= lo.z - 0.3 && p.z <= hi2.z + 0.3).map(|i| i as u32 + 1).unwrap_or(0)
-        };
+        let cells = h.interior_cells();
+        let room_at = |p: V3| -> u32 { House::cell_room_at(&rooms, &cells, p, 0.05).map(|i| i as u32 + 1).unwrap_or(0) };
         let mut portals: Vec<(u32, u32, [V3; 4])> = Vec::new();
         for c in &inner {
             let ctr = (c[0] + c[1] + c[2] + c[3]) * 0.25;
@@ -4150,7 +4472,9 @@ impl DwApp {
         let mut n_lights = 0;
         for (ri, (_, lo, hi2)) in rooms.iter().enumerate() {
             let ri = ri + 1;
-            let area = (hi2.x - lo.x) * (hi2.y - lo.y);
+            // surface réelle (pièce en L ou coupée en biais : sa boîte est plus grande)
+            let rcells = cells.get(ri - 1).cloned().unwrap_or_else(|| vec![(lo.x, hi2.x, lo.y, hi2.y)]);
+            let area: f32 = rcells.iter().map(|c| (c.1 - c.0) * (c.3 - c.2)).sum();
             let kind = if h.shop && ri == 1 { "magasin" } else { crate::convert::guess_room_type(area / 2.0) };
             {
                 let r = &mut self.proj.ytyps[ti].mlos[mi].rooms[ri];
@@ -4161,10 +4485,18 @@ impl DwApp {
                 let n = ((area / 25.0).ceil() as usize).max(1);
                 let cols = (n as f32).sqrt().ceil() as usize;
                 let rows = n.div_ceil(cols);
-                for i in 0..n {
+                // dans l'emprise réelle de la pièce (sinon au milieu de son plus grand rectangle)
+                let inside = |x: f32, y: f32| rcells.iter().any(|c| x >= c.0 + 0.3 && x <= c.1 - 0.3 && y >= c.2 + 0.3 && y <= c.3 - 0.3);
+                let mut spots: Vec<(f32, f32)> = (0..n).map(|i| {
                     let (cx, cy) = (i % cols, i / cols);
-                    let x = lo.x + (hi2.x - lo.x) * (cx as f32 + 0.5) / cols as f32;
-                    let y = lo.y + (hi2.y - lo.y) * (cy as f32 + 0.5) / rows as f32;
+                    (lo.x + (hi2.x - lo.x) * (cx as f32 + 0.5) / cols as f32, lo.y + (hi2.y - lo.y) * (cy as f32 + 0.5) / rows as f32)
+                }).filter(|&(x, y)| inside(x, y)).collect();
+                if spots.is_empty() {
+                    if let Some(c) = rcells.iter().max_by(|a, b| ((a.1 - a.0) * (a.3 - a.2)).total_cmp(&((b.1 - b.0) * (b.3 - b.2)))) {
+                        spots.push(((c.0 + c.1) * 0.5, (c.2 + c.3) * 0.5));
+                    }
+                }
+                for (x, y) in spots {
                     let mut e = Entity::new(ln, v3(x, y, hi2.z - lmx.z.max(0.0) - 0.02));
                     e.flags = crate::mech::MLO_ENTITY_FLAGS;
                     e.room = ri;
@@ -4376,6 +4708,63 @@ mod tests {
         assert_eq!(inner.len(), 1, "un passage dans la cloison");
         let c = inner[0];
         assert!(c.iter().all(|p| p.x.abs() < 1e-4) && (c[1].z - c[0].z - PART_DOOR_H).abs() < 0.3);
+    }
+
+    /// Cloisons en biais et en L : de vraies pièces séparées, avec un portail au passage, et une collision qui suit
+    /// leur emprise exacte.
+    #[test]
+    fn cloisons_en_biais_et_en_l() {
+        let mut h = House::new("dw_bat_t", vec![[-6.0, -4.0], [6.0, -4.0], [6.0, 4.0], [-6.0, 4.0]]);
+        h.floors = 1;
+        // en biais : d'un mur à l'autre, avec un passage
+        h.walls.push(Partition { floor: 0, a: [-2.0, -4.0], b: [1.0, 4.0], door: true });
+        let (rooms, inner) = h.interior_rooms();
+        assert_eq!(rooms.len(), 2, "{rooms:?}");
+        assert_eq!(inner.len(), 1, "un passage dans la cloison en biais");
+        let cells = h.interior_cells();
+        let area = |cs: &Vec<(f32, f32, f32, f32)>| cs.iter().map(|c| (c.1 - c.0) * (c.3 - c.2)).sum::<f32>();
+        let tot = area(&cells[0]) + area(&cells[1]);
+        let (flo, fhi) = h.floor_room(0);
+        let full = (fhi.x - flo.x) * (fhi.y - flo.y);
+        assert!(tot > full * 0.93 && tot < full, "surface {tot} sur {full}");
+        // un point de chaque côté tombe dans sa pièce, même si les boîtes se chevauchent
+        let left = House::cell_room_at(&rooms, &cells, v3(-4.0, 0.0, rooms[0].1.z + 1.0), 0.0);
+        let right = House::cell_room_at(&rooms, &cells, v3(4.0, 0.0, rooms[0].1.z + 1.0), 0.0);
+        assert!(left.is_some() && right.is_some() && left != right);
+        // en L : un coin fermé par deux cloisons qui ne traversent pas
+        let mut l = House::new("dw_bat_l", vec![[-6.0, -4.0], [6.0, -4.0], [6.0, 4.0], [-6.0, 4.0]]);
+        l.floors = 1;
+        l.walls.push(Partition { floor: 0, a: [3.0, 4.0], b: [3.0, 1.5], door: true });
+        l.walls.push(Partition { floor: 0, a: [3.0, 1.5], b: [6.0, 1.5], door: false });
+        let (rooms, inner) = l.interior_rooms();
+        assert_eq!(rooms.len(), 2, "{rooms:?}");
+        assert_eq!(inner.len(), 1);
+        let mr: Vec<crate::model::Room> = std::iter::once(crate::model::Room::new("limbo", V3::ZERO, V3::ZERO)).chain(rooms.iter().map(|(n, a, b)| crate::model::Room::new(n, *a, *b))).collect();
+        let col = l.room_collision(&mr);
+        // le sol du coin (4,5 ; 2,8) n'appartient qu'à une pièce
+        let hits: std::collections::HashSet<usize> = col.iter().filter(|(_, t)| {
+            let (a, b, c) = (t[0], t[1], t[2]);
+            let p = v3(4.5, 2.8, 0.0);
+            let s = |u: V3, v: V3| (v.x - u.x) * (p.y - u.y) - (v.y - u.y) * (p.x - u.x);
+            let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
+            (a.z - rooms[0].1.z).abs() < 0.5 && !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+        }).map(|(r, _)| *r).collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+
+    /// Contour d'une pièce en L faite de rectangles, et d'une pièce coupée en biais : peu de sommets, la bonne surface.
+    #[test]
+    fn contour_des_pieces() {
+        let l = cells_outline(&[(0.0, 6.0, 0.0, 3.0), (0.0, 3.0, 3.0, 6.0)]);
+        assert_eq!(l.len(), 6, "{l:?}");
+        assert!((signed_area(&l) - 27.0).abs() < 0.2, "{}", signed_area(&l));
+        let mut h = House::new("dw_bat_t", vec![[-6.0, -4.0], [6.0, -4.0], [6.0, 4.0], [-6.0, 4.0]]);
+        h.walls.push(Partition { floor: 0, a: [-2.0, -4.0], b: [1.0, 4.0], door: true });
+        let cells = h.interior_cells();
+        let o = cells_outline(&cells[0]);
+        assert!(o.len() >= 4 && o.len() <= 8, "{} sommets : {o:?}", o.len());
+        let a: f32 = cells[0].iter().map(|c| (c.1 - c.0) * (c.3 - c.2)).sum();
+        assert!((signed_area(&o) - a).abs() < a * 0.03, "{} / {a}", signed_area(&o));
     }
 
     /// Climatiseurs : jamais sous une porte-fenêtre, toujours les mêmes ; détails et couleurs dans le modèle.

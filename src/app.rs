@@ -94,6 +94,8 @@ pub struct DwApp {
     pub speed_mult: f32,
     /// petit panneau « vitesse et souris » ouvert dans la vue (sous la boussole)
     pub cam_panel: bool,
+    /// serveur de test relancé parce qu'il ne répondait plus (pour le message)
+    pub server_restarted: bool,
     pub drag: Drag,
     pub cat_filter: String,
     pub cat_cat: &'static str,
@@ -145,6 +147,8 @@ pub struct DwApp {
     pub sollumz_sent: u64,
     /// modèles des ressources MLO importées
     pub mlo_state: crate::mlo::MloState,
+    /// fenêtre « Conflits des MLO »
+    pub conflicts: crate::conflicts::ConflictState,
     /// édition d'un bâtiment posé (morceaux retirés à la main)
     pub bedit: Option<crate::bedit::BEdit>,
     pub cut_state: crate::bedit::CutState,
@@ -179,6 +183,8 @@ pub struct DwApp {
     /// parties laissées de côté par l'export en cours (test en jeu) : « traffic », « peds », « water », « veg »,
     /// « mlo:<nom> » (voir server.rs, TEST_PARTS)
     pub export_skip: Vec<String>,
+    /// export pour un test avec ls-removed : l'eau part d'une mer qui couvre toute la carte
+    pub export_sea_all: bool,
     /// export pour le test en jeu : conversion CodeWalker laissée au fil du serveur (dll, stream, dossier)
     pub export_defer_convert: bool,
     pub pending_convert: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
@@ -226,6 +232,8 @@ pub struct DwApp {
     pub dock_phase: u8,
     /// vie de la carte : véhicules garés, PNJ, circulation
     pub life: crate::life::LifeState,
+    /// plan proposé par l'IA (outil show_plan), dessiné dans la vue
+    pub ai_plan: Option<crate::mcp_city::AiPlan>,
     /// sélection vue seule (bouton « Isoler »)
     pub isolate_sel: Option<std::collections::HashSet<u64>>,
     /// aperçus des types de route
@@ -298,7 +306,7 @@ impl DwApp {
     pub fn new(cc: &eframe::CreationContext, shot_path: Option<PathBuf>, open_files: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         crate::update::start();
-        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![] };
+        let mut proj = Project { name: "Nouveau projet".into(), ymaps: vec![sample::generate()], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![], zones: vec![] };
         let first = proj.next_ymap_name();
         proj.ymaps.push(Ymap::new(&first));
         let mut app = DwApp {
@@ -337,6 +345,7 @@ impl DwApp {
             shot_wait: 0,
             speed_mult: load_settings()["cam_speed"].as_f64().map(|v| v as f32).unwrap_or(1.0).clamp(MOVE_SPEED.0, MOVE_SPEED.1),
             cam_panel: std::env::var("DW_CAM_PANEL").is_ok(),
+            server_restarted: false,
             drag: Drag::None,
             cat_filter: String::new(),
             cat_cat: "Tous",
@@ -386,6 +395,7 @@ impl DwApp {
             sollumz: crate::sollumz::SollumzState::new(),
             sollumz_sent: 0,
             mlo_state: Default::default(),
+            conflicts: Default::default(),
             bedit: None,
             cut_state: Default::default(),
             mlo_link_seen: Default::default(),
@@ -401,6 +411,7 @@ impl DwApp {
             shell_sig: 0,
             server: crate::server::ServerState::new(),
             export_skip: Vec::new(),
+            export_sea_all: false,
             export_defer_convert: false,
             pending_convert: None,
             gizmo_mode: crate::gizmo::GizmoMode::Move,
@@ -430,6 +441,7 @@ impl DwApp {
             road_thumbs: std::collections::HashMap::new(),
             isolate_sel: None,
             life: crate::life::LifeState::default(),
+            ai_plan: None,
             snap_cache: std::collections::HashMap::new(),
             shift_since: None,
             shift_tap: false,

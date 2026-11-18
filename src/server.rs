@@ -351,7 +351,6 @@ impl ServerState {
              endpoint_add_udp \"127.0.0.1:{PORT}\"\n\
              sv_hostname \"DragoWalker - test\"\n\
              sv_maxclients 4\n\
-             sv_endpointprivacy true\n\
              sv_scriptHookAllowed 0\n\
              sv_licenseKey \"{}\"\n\
              setr dw_spawn \"{} {} {}\"\n\
@@ -453,6 +452,26 @@ impl Drop for ServerState {
     }
 }
 
+/// Le serveur de test répond-il à FiveM ? (GET /info.json, ce que FiveM demande en premier.) Un serveur resté
+/// coincé accepte la connexion puis la coupe : FiveM affiche alors « Failed to fetch server variables… CURL error 56 ».
+pub fn http_ok() -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], PORT));
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) else { return false };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    if s.write_all(b"GET /info.json HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    match s.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+        }
+        _ => false,
+    }
+}
+
 /// Ouvre FiveM et le connecte au serveur local.
 pub fn connect() -> Result<(), String> {
     // FiveM refuse d'être lancé par un autre programme (« This application should be launched directly from the
@@ -476,12 +495,16 @@ impl DwApp {
         self.server.resource = name;
         // parties décochées dans « Contenu du test » : laissées de côté pour cet export seulement
         self.export_skip = self.server.skip.clone();
+        // ls-removed retire Los Santos et charge une mer sur toute la carte : notre eau part de la même mer (sinon
+        // elle la remplacerait par l'eau du jeu, ou s'y superposerait en carrés)
+        self.export_sea_all = self.server.addons_active().contains(&"ls-removed");
         // la conversion par CodeWalker (la partie longue) est laissée au fil du serveur
         self.export_defer_convert = true;
         self.pending_convert = None;
         let rep = self.export_project(&res_dir, true);
         self.export_defer_convert = false;
         self.export_skip.clear();
+        self.export_sea_all = false;
         Ok(rep)
     }
 
@@ -551,7 +574,8 @@ impl DwApp {
             After::Start => match self.server.start() {
                 Ok(_) => {
                     let c = connect().err().map(|e| format!(" FiveM n'a pas pu être ouvert ({e}) : connecte-toi à 127.0.0.1:{PORT}.")).unwrap_or_default();
-                    self.status = format!("Serveur de test démarré, FiveM se connecte.{c} {rep}");
+                    let why = if std::mem::take(&mut self.server_restarted) { " (il ne répondait plus : relancé)" } else { "" };
+                    self.status = format!("Serveur de test démarré{why}, FiveM se connecte.{c} {rep}");
                 }
                 Err(e) => self.status = e,
             },
@@ -615,6 +639,11 @@ impl DwApp {
         if let Err(e) = self.server.write_config(spawn) {
             self.status = format!("Configuration du serveur impossible : {e}");
             return;
+        }
+        // serveur lancé mais coincé (il coupe les connexions) : arrêté puis relancé
+        if self.server.running() && !http_ok() {
+            self.server.stop();
+            self.server_restarted = true;
         }
         let then = if self.server.running() { After::Reload } else { After::Start };
         self.server_convert_then(then);
@@ -798,6 +827,15 @@ impl DwApp {
                 self.status = format!("Téléportation en jeu vers {:.1} {:.1} {:.1}.", p.x, p.y, p.z);
             }
             Some("connect") => {
+                // serveur coincé : relancé avant de connecter FiveM
+                if self.server.running() && !http_ok() {
+                    self.server.stop();
+                    if let Err(e) = self.server.start() {
+                        self.status = e;
+                        return;
+                    }
+                    self.status = "Le serveur ne répondait plus : il a été relancé, FiveM se connecte.".into();
+                }
                 let _ = connect();
             }
             Some("stop") => {
@@ -1159,11 +1197,12 @@ RegisterCommand('fix', function()
 end, false)
 
 -- T : taper une commande (le serveur de test n'a pas de chat) ; « /car adder » ou « car adder »
-AddTextEntry('DW_CMD', 'Commande DragoWalker (ex. /car adder, /tp 0 0 72, /dw_speed 25)')
+-- (aucune fonction du jeu appelée au chargement du script : le jeu n'est pas encore prêt)
 local typing = false
 RegisterCommand('dw_cmd', function()
   if typing then return end
   typing = true
+  AddTextEntry('DW_CMD', 'Commande DragoWalker (ex. /car adder, /tp 0 0 72, /dw_speed 25)')
   DisplayOnscreenKeyboard(1, 'DW_CMD', '', '/', '', '', '', 80)
   while UpdateOnscreenKeyboard() == 0 do
     DisableAllControlActions(0)
@@ -1208,3 +1247,13 @@ end)
 
 RegisterCommand('dw_refresh', function() TriggerServerEvent('dw:askRefresh') end, false)
 "#;
+
+#[cfg(test)]
+mod tests_http {
+    /// Serveur de test lancé : `cargo test -- --ignored serveur_repond --nocapture`.
+    #[test]
+    #[ignore]
+    fn serveur_repond() {
+        println!("serveur qui répond : {}", super::http_ok());
+    }
+}

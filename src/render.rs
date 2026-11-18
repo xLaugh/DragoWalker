@@ -181,6 +181,10 @@ pub struct GameCtx<'a> {
     pub hidden: &'a std::collections::HashSet<u32>,
     /// dessiner les objets des intérieurs (Renderer.renderinteriors de CodeWalker)
     pub interiors: bool,
+    /// éclairer les intérieurs avec leurs lumières (celles des modèles du jeu et celles du projet)
+    pub lights: bool,
+    /// lumières des intérieurs du projet (posées, ou spots ajoutés à l'export), déjà dans le monde
+    pub room_lights: Vec<crate::gpu::VLight>,
     /// objets du projet cachés à la main (touche H)
     pub hidden_ids: &'a std::collections::HashSet<u64>,
     /// carte vide : rien du jeu n'est dessiné
@@ -194,7 +198,9 @@ pub struct GameCtx<'a> {
     /// terrain de l'éditeur : (modèle, origine, coins)
     pub terrain: Option<(u32, V3, V3, V3)>,
     /// zones d'eau du créateur de terrain (min x, min y, max x, max y, hauteur)
-    pub waters: Vec<[f32; 5]>,
+    pub waters: Vec<[f32; 6]>,
+    /// hauteurs du terrain du projet (eau claire sur les hauts-fonds, écume au bord)
+    pub hmap: Option<std::sync::Arc<crate::gpu::HMap>>,
     /// objets en plus à dessiner : (modèle, position, orientation, échelle xy, échelle z)
     pub extra: Vec<(u32, V3, crate::math::Quat, f32, f32)>,
     /// aperçu de la pose (objet, groupe ou prop glissé qui suit la souris), mêmes champs : dessiné en dernier,
@@ -258,7 +264,8 @@ pub fn arch_hash(name: &str) -> u32 {
 /// Un objet de groupe (variante) n'apparaît que si son groupe est dans `sets` : les fichiers du jeu donnent
 /// le nom (hachage) du groupe, CodeWalker écrit sa position dans la liste (UpdateDefaultEntitySets 0x06003242).
 #[allow(clippy::too_many_arguments)]
-fn push_mlo_children(gl: &mut crate::gpu::Gpu, insts: &mut Vec<crate::gpu::Inst>, w: &GameWorld, def: &crate::gta::world::MloDef, pos: V3, rot: crate::math::Quat, sets: &[u32], eye: V3, lod_scale: f32, budget: &mut usize) {
+fn push_mlo_children(gl: &mut crate::gpu::Gpu, insts: &mut Vec<crate::gpu::Inst>, w: &GameWorld, def: &crate::gta::world::MloDef, pos: V3, rot: crate::math::Quat, sets: &[u32], eye: V3, lod_scale: f32, budget: &mut usize, lights: Option<&mut Vec<crate::gpu::VLight>>) {
+    let mut lights = lights;
     use crate::gpu::{model_matrix, Inst};
     for c in &def.children {
         if *budget == 0 {
@@ -282,6 +289,9 @@ fn push_mlo_children(gl: &mut crate::gpu::Gpu, insts: &mut Vec<crate::gpu::Inst>
             continue;
         }
         let wr = rot.mul(c.rot).normalized();
+        if let Some(l) = lights.as_deref_mut() {
+            push_model_lights(l, c.arch, wp, wr, c.sxy, c.sz, eye);
+        }
         gl.want(c.arch);
         let (mn, mx) = w.arch_box(c.arch);
         let col = w.color_of(c.arch);
@@ -293,6 +303,25 @@ fn push_mlo_children(gl: &mut crate::gpu::Gpu, insts: &mut Vec<crate::gpu::Inst>
             bmax: [mx.x, mx.y, mx.z],
         });
         *budget -= 1;
+    }
+}
+
+/// Distance (m) sous laquelle les lumières des objets d'intérieur éclairent la vue — choix de DragoWalker.
+pub const VIEW_LIGHT_DIST: f32 = 70.0;
+
+/// Ajoute les lumières d'un modèle du jeu posé en `pos` / `rot` (si le modèle est déjà chargé et assez proche).
+fn push_model_lights(out: &mut Vec<crate::gpu::VLight>, arch: u32, pos: V3, rot: crate::math::Quat, sxy: f32, sz: f32, eye: V3) {
+    if (pos - eye).len() > VIEW_LIGHT_DIST {
+        return;
+    }
+    let Some(ls) = crate::gta::loader::model_lights(arch) else { return };
+    for l in ls.iter() {
+        if l.intensity <= 0.0 || l.falloff <= 0.05 {
+            continue;
+        }
+        let p = pos + rot.rotate(v3(l.pos[0] * sxy, l.pos[1] * sxy, l.pos[2] * sz));
+        let d = rot.rotate(v3(l.dir[0], l.dir[1], l.dir[2]));
+        out.push(crate::lights::view_light(p, l.falloff * sxy.max(sz), l.color, l.intensity, if l.kind == 2 { Some((d, l.cone_outer)) } else { None }));
     }
 }
 
@@ -353,6 +382,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
     let mut mlo_boxes = Vec::new();
     let Ok(mut gl) = gpu.lock() else { return mlo_boxes };
     let mut interior_budget = 4000usize;
+    let mut vlights: Vec<crate::gpu::VLight> = if g.lights { g.room_lights.clone() } else { Vec::new() };
     for (_, ei) in cand {
         let e = &w.ents[ei as usize];
         drawn.push(ei);
@@ -367,7 +397,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             match def {
                 Some(def) if near && interior_budget > 0 => {
                     let defaults = w.mlo_inst_sets.get(&ei).map(|v| v.as_slice()).unwrap_or(&[]);
-                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, e.rot(), defaults, eye, g.lod_scale, &mut interior_budget);
+                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, e.rot(), defaults, eye, g.lod_scale, &mut interior_budget, g.lights.then_some(&mut vlights));
                 }
                 Some(_) => {}
                 None => mlo_boxes.push(w.corners(ei)),
@@ -405,7 +435,7 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
                 if (e.pos - eye).len() < MLO_SHOW_DIST * g.lod_scale.max(0.5) {
                     let sets: Vec<u32> = m.default_entity_sets.iter().map(|s| arch_hash(s)).collect();
                     let rot = e.rot;
-                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, rot, &sets, eye, g.lod_scale, &mut interior_budget);
+                    push_mlo_children(&mut gl, &mut insts, w, def, e.pos, rot, &sets, eye, g.lod_scale, &mut interior_budget, g.lights.then_some(&mut vlights));
                 }
             }
             continue;
@@ -415,6 +445,9 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
             continue;
         }
         let h = arch_hash(&e.archetype);
+        if g.lights && matches!(r, ItemRef::MloEnt(..)) {
+            push_model_lights(&mut vlights, h, e.pos, e.rot, e.scale_xy, e.scale_z, eye);
+        }
         gl.want(h);
         let (mn, mx) = e.local_box(proj);
         let col = catalog::color_for(&e.archetype);
@@ -464,8 +497,15 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         });
     }
     drop(gl);
+    // les plus proches de la caméra (en tenant compte de leur portée)
+    if vlights.len() > crate::gpu::MAX_VIEW_LIGHTS {
+        let key = |l: &crate::gpu::VLight| (v3(l.p[0], l.p[1], l.p[2]) - eye).len() - l.range * 0.5;
+        vlights.sort_by(|a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+        vlights.truncate(crate::gpu::MAX_VIEW_LIGHTS);
+    }
     let fd = std::sync::Arc::new(FrameDraw {
         vp: cam.view_proj(),
+        lights: if cam.map_view { Vec::new() } else { vlights },
         eye: [eye.x, eye.y, eye.z],
         insts,
         fog: if cam.map_view { [0.6, 0.7, 0.8, 0.0] } else { [0.70, 0.78, 0.86, 0.00022] },
@@ -476,10 +516,11 @@ fn push_gpu(painter: &Painter, cam: &Camera, proj: &Project, opts: &ViewOpts, g:
         water: if g.isolate.is_some() || g.only.is_some() {
             std::sync::Arc::new(Vec::new())
         } else {
-            let mut v: Vec<[f32; 5]> = if g.empty_map { vec![[-9000.0, -9000.0, 9000.0, 9000.0, 0.0]] } else { w.water.as_ref().clone() };
+            let mut v: Vec<[f32; 6]> = if g.empty_map { vec![[-9000.0, -9000.0, 9000.0, 9000.0, 0.0, 0.0]] } else { w.water.iter().map(|q| [q[0], q[1], q[2], q[3], q[4], 0.0]).collect() };
             v.extend(g.waters.iter().copied());
             std::sync::Arc::new(v)
         },
+        hmap: if g.isolate.is_some() || g.only.is_some() { None } else { g.hmap.clone() },
         time: START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(),
         clip_z: g.cut_z.unwrap_or(1.0e9),
         ghosts,

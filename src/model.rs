@@ -478,6 +478,9 @@ pub struct Project {
     /// props assemblés dans le Studio (formes simples), gardés pour être retouchés
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub props: Vec<crate::propstudio::PropDef>,
+    /// zones de quartier (zones.rs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<crate::zones::Zone>,
 }
 
 impl Project {

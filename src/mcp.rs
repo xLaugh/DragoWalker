@@ -150,7 +150,8 @@ fn handle(m: &Value, tx: &mpsc::Sender<McpCall>, ctx: &egui::Context) -> Option<
 const INSTRUCTIONS: &str = "DragoWalker est un éditeur de cartes GTA V et d'intérieurs MLO pour FiveM. Commence par get_scene, et get_selection \
 quand la personne parle de « ce », « cet », « celui-là » ; pour un intérieur, get_interior. Analyse avant d'agir, termine par check_project. Les noms de modèles viennent de search_props (jamais inventés). Après une modification \
 visible, regarde le résultat avec screenshot. Chaque modification s'annule avec undo. Coordonnées en mètres, Z vers le haut, \
-cap en degrés (0 = face avant vers le sud, -Y ; 90 = vers l'est).";
+cap en degrés (0 = face avant vers le sud, -Y ; 90 = vers l'est). Pour une ville, un quartier ou plusieurs bâtiments : \
+questions, puis plan montré avec show_plan et accord de la personne avant de construire (skill dragowalker-miniville).";
 
 fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
     json!({"name": name, "description": desc, "inputSchema": {"type": "object", "properties": props, "required": required}})
@@ -161,6 +162,7 @@ pub fn tools() -> Vec<Value> {
     let mut v = tools_base();
     v.extend(crate::mcp_plus::tools_plus());
     v.extend(crate::mcp_game::tools_game());
+    v.extend(crate::mcp_city::tools_city());
     v
 }
 
@@ -287,7 +289,8 @@ pub fn plugin_dir() -> std::path::PathBuf {
     crate::safety::data_dir().join("claude-plugin")
 }
 
-const SKILLS: [(&str, &str); 6] = [
+const SKILLS: [(&str, &str); 7] = [
+    ("dragowalker-miniville", include_str!("../skills/dragowalker-miniville.md")),
     ("dragowalker-architecture", include_str!("../skills/dragowalker-architecture.md")),
     ("dragowalker-methode", include_str!("../skills/dragowalker-methode.md")),
     ("dragowalker-interieurs", include_str!("../skills/dragowalker-interieurs.md")),
@@ -333,6 +336,16 @@ enum Out {
 }
 
 impl DwApp {
+    /// Appelle un outil et rend son texte (tests : DW_TEST_MCP ; une capture n'est pas prise).
+    pub(crate) fn mcp_run_text(&mut self, name: &str, args: &Value) -> String {
+        match self.mcp_run(name, args) {
+            Out::Done(Ok(v)) => v.iter().filter_map(|x| x["text"].as_str()).collect::<Vec<_>>().join("
+"),
+            Out::Done(Err(e)) => format!("ERREUR : {e}"),
+            Out::Shot(_) => "(capture)".into(),
+        }
+    }
+
     /// À chaque image : démarre le serveur au besoin, exécute les demandes, prend les captures demandées.
     pub fn mcp_tick(&mut self, ctx: &egui::Context) {
         if self.mcp.is_none() && self.mcp_on && !self.mcp_failed {
@@ -507,6 +520,7 @@ impl DwApp {
             }
             n if crate::mcp_plus::NAMES.contains(&n) => self.mcp_plus(n, a),
             n if crate::mcp_game::NAMES.contains(&n) => self.mcp_game(n, a),
+            n if crate::mcp_city::NAMES.contains(&n) => self.mcp_city(n, a),
             _ => Err(format!("Outil inconnu : {name}")),
         };
         Out::Done(r)
@@ -689,6 +703,15 @@ impl DwApp {
             }
         }
         let warn = if doors.is_empty() { " Attention : elle ne touche aucune pièce (mur commun d'au moins 1,4 m) : pas de passage, on ne peut pas y entrer." } else { "" };
+        // dans un intérieur repris du jeu : coque modelable avec le vrai sol de la pièce du jeu voisine
+        let mut floor_txt = String::new();
+        if let Some((gi, _)) = game_room {
+            if let Some((f, tn)) = self.game_floor_texture(t, m, gi) {
+                self.rooms_to_design(t, m, &[(ri, 99, Some(f))], true);
+                floor_txt = format!(" Sol assorti à la pièce du jeu {gi} (texture « {tn} » reprise du jeu).");
+            }
+        }
+        let warn = format!("{warn}{floor_txt}");
         Ok(txt(format!(
             "Pièce {ri} « {name} » ajoutée : x {x0:.2}..{x1:.2}, y {y0:.2}..{y1:.2}, sol z {z0:.2}, hauteur {h:.2} (murs, sol et plafond générés). Passages vers : {}.{warn}",
             if doors.is_empty() { "aucune".to_string() } else { doors.join(", ") }

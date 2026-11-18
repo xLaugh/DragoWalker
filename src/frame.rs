@@ -184,6 +184,7 @@ impl DwApp {
             self.life_window(ctx);
             self.server_window(ctx);
             self.mlo_pieces_window(ctx);
+            self.conflicts_window(ctx);
             self.bedit_window(ctx);
             self.check_window(ctx);
             self.crash_window(ctx);

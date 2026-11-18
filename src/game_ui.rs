@@ -56,6 +56,8 @@ pub struct GameState {
     pub surface: Option<crate::math::V3>,
     /// objets des intérieurs dessinés (renderinteriors de CodeWalker)
     pub interiors: bool,
+    /// lumières des intérieurs dans la vue
+    pub lights: bool,
     /// carte vide : la carte du jeu n'est pas dessinée (éditeur de terrain)
     pub empty_map: bool,
     /// groupes de LOD cachés : (niveau, distance d'apparition arrondie à 10 m)
@@ -110,6 +112,7 @@ impl GameState {
             hidden: std::collections::HashSet::new(),
             surface: None,
             interiors: s["interiors"].as_bool().unwrap_or(true) && std::env::var("DW_NO_INTERIORS").is_err(),
+            lights: s["view_lights"].as_bool().unwrap_or(true) && std::env::var("DW_NO_VIEW_LIGHTS").is_err(),
             empty_map: std::env::var("DW_EMPTY").is_ok(),
             hidden_lod: std::collections::HashSet::new(),
             isolate: None,
@@ -643,7 +646,7 @@ impl DwApp {
     pub fn cut_z(&self) -> Option<f32> {
         // Studio MLO : coupe juste sous le plafond de l'étage dessiné (on voit dans les pièces)
         if let (true, true, Some(z)) = (self.studio.on, self.studio.cut, self.opts.studio) {
-            return Some(z + crate::studio::CUT_ABOVE_FLOOR);
+            return Some(z + if self.studio.cut_h > 0.3 { self.studio.cut_h } else { crate::studio::CUT_ABOVE_FLOOR });
         }
         if self.game.cut_on {
             Some(self.cam.target.z + self.game.cut_h)
@@ -1011,6 +1014,9 @@ impl DwApp {
         if self.game.real_models {
             if ui.checkbox(&mut self.game.shadows, "Ombres du soleil").changed() {
                 crate::app::save_setting("shadows", serde_json::json!(self.game.shadows));
+            }
+            if ui.checkbox(&mut self.game.lights, "Lumières des intérieurs").on_hover_text("Les plafonniers, lampes et spots des intérieurs (ceux des modèles du jeu et ceux de tes intérieurs) éclairent la vue, à moins de 70 m de la caméra.").changed() {
+                crate::app::save_setting("view_lights", serde_json::json!(self.game.lights));
             }
             if ui.checkbox(&mut self.game.interiors, "Intérieurs des bâtiments (meubles, murs intérieurs)").changed() {
                 crate::app::save_setting("interiors", serde_json::json!(self.game.interiors));

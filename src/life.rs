@@ -107,6 +107,7 @@ pub enum LifeTool {
     Parking,
     Ped,
     Route,
+    Zone,
 }
 
 pub struct LifeState {
@@ -215,6 +216,7 @@ impl DwApp {
                     }
                 }
             }
+            LifeTool::Zone => self.zone_tool(resp),
             LifeTool::Route => {
                 if resp.double_clicked_by(PointerButton::Primary) {
                     self.finish_ped_route();
@@ -288,6 +290,7 @@ impl DwApp {
                 }
             }
         }
+        self.draw_zones_overlay(painter);
         // ronde en cours
         let pts: Vec<Pos2> = self.life.route.iter().filter_map(|q| proj(*q + v3(0.0, 0.0, 0.2))).collect();
         for q in &pts {
@@ -336,6 +339,7 @@ impl DwApp {
                 (LifeTool::Parking, "Parking", "Glisser : une rangée de places (en épi tous les 2,6 m, ou en créneau)"),
                 (LifeTool::Ped, "PNJ", "Clic : un PNJ qui fait l'activité choisie, face à la caméra"),
                 (LifeTool::Route, "PNJ avec ronde", "Clic : points de la ronde · double-clic ou Entrée : créer le PNJ"),
+                (LifeTool::Zone, "Zone de quartier", "Glisser : un rectangle de quartier (nom affiché en jeu, piétons, voitures, ambiance)"),
             ] {
                 if ui.selectable_label(self.life.tool == t && self.tool == crate::app::Tool::Life, RichText::new(n).strong()).on_hover_text(tip).clicked() {
                     self.life.tool = t;
@@ -361,6 +365,9 @@ impl DwApp {
                     });
                 }
                 ui.label(RichText::new("Le jeu fait apparaître une voiture à chaque place quand on approche (flags 3680, comme un nouveau véhicule dans CodeWalker).").small().weak());
+            }
+            LifeTool::Zone => {
+                self.zones_ui(ui);
             }
             LifeTool::Ped | LifeTool::Route => {
                 ui.label(RichText::new("PNJ").strong());

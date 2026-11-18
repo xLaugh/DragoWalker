@@ -24,6 +24,14 @@ pub struct ModelSource {
     pub txd_parents: Arc<HashMap<u32, u32>>,
 }
 
+/// Lumières des modèles du jeu déjà chargés (lues avec le modèle, dans le fil de chargement).
+static MODEL_LIGHTS: std::sync::LazyLock<Mutex<HashMap<u32, Arc<Vec<drawable::GameLight>>>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Lumières d'un modèle du jeu, s'il a déjà été chargé pour la vue (None : pas encore lu).
+pub fn model_lights(arch: u32) -> Option<Arc<Vec<drawable::GameLight>>> {
+    MODEL_LIGHTS.lock().ok()?.get(&arch).cloned()
+}
+
 pub struct Loaded {
     pub arch: u32,
     pub model: Option<RModel>,
@@ -88,6 +96,13 @@ impl ModelSource {
     pub fn load(&self, arch: u32, claimed: &Mutex<HashSet<u64>>, ytd_cache: &mut Vec<(u32, Arc<Resource>)>) -> Loaded {
         let mut out = Loaded { arch, model: None, part_keys: Vec::new(), layer_keys: Vec::new(), textures: Vec::new() };
         let Some((fi, r, pos)) = self.find_model(arch) else { return out };
+        // lumières du modèle (plafonniers, lampes…) : gardées pour éclairer les intérieurs dans la vue
+        if !self.vfs.files[fi].name.ends_with(".yft") {
+            let l = drawable::read_lights(&r, pos);
+            if let Ok(mut m) = MODEL_LIGHTS.lock() {
+                m.insert(arch, Arc::new(l));
+            }
+        }
         let Some(model) = drawable::read_render_drawable(&r, pos, MAX_TRIS) else { return out };
         let txd = self.arch.get(&arch).map(|a| a.0).unwrap_or(0);
         let mut found: HashMap<u32, u64> = HashMap::new();

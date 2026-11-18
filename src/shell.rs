@@ -36,6 +36,77 @@ pub fn shell_name(mlo: &str, ri: usize) -> String {
     format!("{SHELL_PREFIX}{}_{ri}", mlo.to_lowercase())
 }
 
+/// Escalier d'une pièce, sous une trémie de son plafond : le long du grand côté de la trémie (x si `along_x`),
+/// `n` marches de `run` m à partir de `start`, entre `w0` et `w1` en travers, montée totale `rise_total` depuis le
+/// sol de la pièce.
+#[derive(Clone, Copy, Debug)]
+pub struct StairLayout {
+    pub along_x: bool,
+    pub start: f32,
+    pub run: f32,
+    pub n: usize,
+    pub w0: f32,
+    pub w1: f32,
+    pub rise_total: f32,
+}
+
+/// Escaliers fabriqués dans une pièce (un sous chaque trémie de son plafond ; pas dans un bâtiment de l'atelier,
+/// qui a le sien avec sa rampe) : la dernière marche au bord le plus loin de la trémie, marches de STAIR_RISE au plus
+/// et STAIR_RUN de profondeur (raccourcies si la pièce est trop petite).
+pub fn stair_layouts(m: &MloArchetype, ri: usize) -> Vec<StairLayout> {
+    let Some(r) = m.rooms.get(ri) else { return Vec::new() };
+    if r.game || m.name.to_lowercase().starts_with("dw_bat_") {
+        return Vec::new();
+    }
+    let (a, b) = (r.bb_min, r.bb_max);
+    let mut out = Vec::new();
+    for h in m.portals.iter().filter(|p| p.room_from as usize == ri || p.room_to as usize == ri).flat_map(|p| p.holes()) {
+        if !h.iter().all(|c| (c.z - b.z).abs() < STAIR_PLANE) {
+            continue;
+        }
+        let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for c in h {
+            x0 = x0.min(c.x);
+            x1 = x1.max(c.x);
+            y0 = y0.min(c.y);
+            y1 = y1.max(c.y);
+        }
+        let (x0, x1, y0, y1) = (x0.max(a.x), x1.min(b.x), y0.max(a.y), y1.min(b.y));
+        if x1 - x0 <= 0.2 || y1 - y0 <= 0.2 {
+            continue;
+        }
+        let along_x = x1 - x0 >= y1 - y0;
+        let rise_total = b.z - a.z + STAIR_CEIL_GAP;
+        let n = (rise_total / STAIR_RISE).ceil().max(2.0) as usize;
+        let (lo, hi) = if along_x { (a.x, x1) } else { (a.y, y1) };
+        let run = (STAIR_RUN).min(((hi - lo) - 0.1) / n as f32).max(0.12);
+        let start = hi - run * n as f32;
+        let (w0, w1) = if along_x { (y0, y1) } else { (x0, x1) };
+        out.push(StairLayout { along_x, start, run, n, w0, w1, rise_total });
+    }
+    out
+}
+
+/// Collision d'un escalier, comme celles du jeu : une rampe qui passe par le nez des marches (le personnage la
+/// monte sans buter, les pieds se posent sur les marches dessinées), à marquer « escalier » ; plus la place des
+/// marches (x0, x1, y0, y1) pour en retirer les faces dessinées.
+pub fn stair_ramp(m: &MloArchetype, ri: usize, st: &StairLayout) -> ([V3; 4], (f32, f32, f32, f32)) {
+    let a = m.rooms[ri].bb_min;
+    let step = st.rise_total / st.n as f32;
+    let end = st.start + st.run * st.n as f32;
+    let pt = |s: f32, w: f32, zz: f32| if st.along_x { v3(s, w, zz) } else { v3(w, s, zz) };
+    // nez de la première marche (début, une hauteur de marche) jusqu'au palier en haut
+    // pente des nez : une marche de haut pour une marche de long ; elle touche le sol une marche avant la première
+    // contremarche (sans entrer dans le mur), et le haut au nez de la dernière marche
+    let lo = if st.along_x { a.x } else { a.y };
+    let s_bot = (st.start - st.run).max(lo + 0.02);
+    let z_bot = a.z + (s_bot - (st.start - st.run)) * step / st.run;
+    let (s_top, z_top) = (end - st.run, a.z + st.rise_total);
+    let q = [pt(s_bot, st.w0, z_bot), pt(s_top, st.w0, z_top), pt(s_top, st.w1, z_top), pt(s_bot, st.w1, z_bot)];
+    let fp = if st.along_x { (s_bot, end, st.w0, st.w1) } else { (st.w0, st.w1, s_bot, end) };
+    (q, fp)
+}
+
 /// Triangles de la coque d'une pièce (repère de l'intérieur), rangés par partie : 0 sol, 1 murs, 2 plafond.
 /// Chaque triangle : (3 sommets, normale vers l'intérieur de la pièce).
 pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
@@ -96,17 +167,11 @@ pub fn room_quads(m: &MloArchetype, ri: usize) -> Vec<(usize, [V3; 4], V3)> {
     // petite)
     // pas pour un bâtiment de l'atelier : il a son propre escalier (avec sa rampe) ; celui-ci montait parfois dans
     // l'autre sens et bloquait le personnage (retour de la personne, 13 nov. 2026)
-    let own_stairs = !m.name.to_lowercase().starts_with("dw_bat_");
-    for &(x0, x1, y0, y1) in ceil_holes.iter().filter(|_| own_stairs) {
-        let along_x = x1 - x0 >= y1 - y0;
-        let rise_total = b.z - a.z + STAIR_CEIL_GAP;
-        let n = (rise_total / STAIR_RISE).ceil().max(2.0) as usize;
-        let (lo, hi) = if along_x { (a.x, x1) } else { (a.y, y1) };
-        let run = (STAIR_RUN).min(((hi - lo) - 0.1) / n as f32).max(0.12);
-        let start = hi - run * n as f32;
+    let _ = &ceil_holes;
+    for st in stair_layouts(m, ri) {
+        let StairLayout { along_x, start, run, n, w0, w1, rise_total } = st;
         let up = v3(0.0, 0.0, 1.0);
         let pt = |s: f32, w: f32, zz: f32| if along_x { v3(s, w, zz) } else { v3(w, s, zz) };
-        let (w0, w1) = if along_x { (y0, y1) } else { (x0, x1) };
         let fwd = if along_x { v3(1.0, 0.0, 0.0) } else { v3(0.0, 1.0, 0.0) };
         let side = if along_x { v3(0.0, 1.0, 0.0) } else { v3(1.0, 0.0, 0.0) };
         for i in 0..n {
@@ -539,6 +604,35 @@ mod stair_tests {
         // le plafond du bas est percé (plusieurs morceaux), le sol du haut aussi
         assert!(low.iter().filter(|q| q.0 == 2).count() >= 3);
         assert!(room_quads(&m, 2).iter().filter(|q| q.0 == 0).count() >= 3);
+    }
+
+    #[test]
+    fn rampe_de_l_escalier() {
+        let rooms = vec![Room::new("limbo", V3::ZERO, V3::ZERO), Room::new("bas", v3(0.0, 0.0, 0.0), v3(8.0, 6.0, 2.95)), Room::new("haut", v3(0.0, 0.0, 3.2), v3(8.0, 6.0, 6.15))];
+        let z = 2.95;
+        let portals = vec![Portal::new(1, 2, [v3(3.0, 0.0, z), v3(6.0, 0.0, z), v3(6.0, 1.2, z), v3(3.0, 1.2, z)])];
+        let m = MloArchetype { name: "t".into(), lod_dist: 100.0, flags: 0, mlo_flags: 0, entities: vec![], rooms, portals, entity_sets: vec![] };
+        let st = stair_layouts(&m, 1);
+        assert_eq!(st.len(), 1);
+        let (q, fp) = stair_ramp(&m, 1, &st[0]);
+        // la rampe part du sol et arrive à la hauteur de la pièce du dessus
+        let (zmin, zmax) = q.iter().fold((f32::MAX, f32::MIN), |r, p| (r.0.min(p.z), r.1.max(p.z)));
+        assert!(zmin >= 0.0 && zmin < 0.2, "bas {zmin}");
+        assert!((zmax - 3.22).abs() < 0.05, "haut {zmax}");
+        // aucune marche ne dépasse la rampe (on ne bute pas), et aucune n'est plus d'une marche dessous
+        let low = room_quads(&m, 1);
+        let along = |p: V3| if st[0].along_x { p.x } else { p.y };
+        let ramp_z = |s: f32| q[0].z + (s - along(q[0])) * (q[1].z - q[0].z) / (along(q[1]) - along(q[0]));
+        for t in low.iter().filter(|t| t.2.z > 0.5 && t.1[0].z > 0.01) {
+            for p in &t.1 {
+                let s = along(*p);
+                if s <= along(q[1]) + 1e-3 {
+                    assert!(p.z <= ramp_z(s) + 0.01, "marche au-dessus de la rampe : {p:?}");
+                    assert!(p.z >= ramp_z(s) - 0.4, "marche trop loin sous la rampe : {p:?}");
+                }
+            }
+        }
+        assert!(fp.1 > fp.0 && fp.3 > fp.2);
     }
 
     #[test]

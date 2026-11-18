@@ -424,6 +424,28 @@ pub fn probe(game: &str, cw: &str) {
                     }
                     println!("dictionnaires affichés : {shown}");
                 }
+                // DW_TEX_PNG="fichier.ytd,texture,sortie.png" : une texture d'un dictionnaire du jeu enregistrée en image
+                if let Ok(v) = std::env::var("DW_TEX_PNG") {
+                    let p: Vec<&str> = v.split(',').collect();
+                    if p.len() == 3 {
+                        let f = w.vfs.files.iter().filter(|f| f.name.eq_ignore_ascii_case(p[0])).last();
+                        let r = f.and_then(|f| w.vfs.read_resource(f, &w.keys));
+                        match r.and_then(|r| drawable::find_texture(&r, 0, crypto::joaat(p[1]), 4096)).and_then(|t| crate::texdecode::decode_level(&t, 4096).map(|d| (t, d))) {
+                            Some((t, d)) => {
+                                let _ = image::save_buffer(p[2], &d.px, d.w as u32, d.h as u32, image::ExtendedColorType::Rgba8);
+                                println!("texture {} : {}x{} {:?} -> {}", p[1], t.w, t.h, t.fmt, p[2]);
+                            }
+                            None => println!("texture {} introuvable dans {}", p[1], p[0]),
+                        }
+                    }
+                }
+                // DW_FILE_GREP="mot" : chemins des fichiers du jeu dont le nom contient ce mot (et leur taille)
+                if let Ok(word) = std::env::var("DW_FILE_GREP") {
+                    let word = word.to_lowercase();
+                    for f in w.vfs.files.iter().filter(|f| f.name.to_lowercase().contains(&word)) {
+                        println!("   {}", f.path());
+                    }
+                }
                 // DW_TEXT_DUMP="nom" : écrit les fichiers non-ressource (xml, meta, dat…) de ce nom, de toutes les archives,
                 // dans le dossier temporaire dragowalker_text (ex. gameconfig.xml : tailles des pools du jeu)
                 if let Ok(name) = std::env::var("DW_TEXT_DUMP") {

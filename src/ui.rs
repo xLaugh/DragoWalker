@@ -47,6 +47,15 @@ impl DwApp {
                     self.import_mlo_dialog();
                     ui.close_menu();
                 }
+                if item(ui, true, ic::PACKAGE, "Importer un dossier de MLO (plusieurs ressources)…", "") {
+                    self.import_mlo_folder_dialog();
+                    ui.close_menu();
+                }
+                if item(ui, true, ic::WARNING, "Conflits des MLO…", "") {
+                    self.conflicts.open = true;
+                    self.conflicts.checked = false;
+                    ui.close_menu();
+                }
                 ui.separator();
                 if item(ui, true, ic::FILE_CODE, t("Exporter en XML…"), t("Ctrl+E")) {
                     self.export_xml(false);
@@ -418,7 +427,7 @@ impl DwApp {
 
     pub fn new_project(&mut self) {
         self.push_undo();
-        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![] };
+        self.proj = Project { name: crate::i18n::t("Nouveau projet").into(), ymaps: vec![sample::generate(), Ymap::new("map1")], ytyps: vec![], terrain: None, mlo_res: vec![], mlo_rot_fixed: true, building_cuts: vec![], mlo_links: vec![], mlo_link_yaw: vec![], groups: vec![], houses: vec![], designs: vec![], custom_textures: vec![], ambiances: vec![], targets: false, mlo_bounds: vec![], props: vec![], zones: vec![] };
         self.target_ymap = 1;
         self.cur_mlo = None;
         self.set_selection(vec![]);

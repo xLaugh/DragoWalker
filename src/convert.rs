@@ -204,10 +204,30 @@ impl DwApp {
                         too_many += 1;
                         continue;
                     }
-                    // toute la coque de la pièce (shell.rs) : sol un peu enfoncé, murs ouverts aux passages, plafond
+                    // toute la coque de la pièce (shell.rs) : sol un peu enfoncé, murs ouverts aux passages, plafond ;
+                    // l'escalier sous une trémie devient une rampe marquée « escalier » (comme dans le jeu), ses
+                    // marches dessinées ne sont pas dans la collision
+                    let ramps: Vec<([V3; 4], (f32, f32, f32, f32))> = crate::shell::stair_layouts(m, ri).iter().map(|st| crate::shell::stair_ramp(m, ri, st)).collect();
+                    if !ramps.is_empty() {
+                        let ms = mats.len() as u8;
+                        mats.push((concrete | crate::roads::MAT_STAIRS, ri as u32));
+                        for (q, _) in &ramps {
+                            let base = verts.len() as u32;
+                            verts.extend(q.iter().copied());
+                            tris.push((base, base + 1, base + 2, ms));
+                            tris.push((base, base + 2, base + 3, ms));
+                        }
+                    }
+                    let in_stairs = |q: &[V3; 4]| {
+                        let c = (q[0] + q[1] + q[2] + q[3]) * 0.25;
+                        c.z > a.z + 0.02 && ramps.iter().any(|(_, f)| c.x > f.0 - 0.01 && c.x < f.1 + 0.01 && c.y > f.2 - 0.01 && c.y < f.3 + 0.01) && q.iter().all(|p| p.z < b.z - 0.05)
+                    };
                     let mi = mats.len() as u8;
                     mats.push((concrete, ri as u32));
                     for (part, q, _) in crate::shell::room_quads(m, ri) {
+                        if in_stairs(&q) {
+                            continue;
+                        }
                         let base = verts.len() as u32;
                         let sink = if part == 0 { ROOM_FLOOR_SINK } else { 0.0 };
                         verts.extend(q.iter().map(|p| v3(p.x, p.y, p.z - sink)));

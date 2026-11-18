@@ -439,7 +439,24 @@ impl DwApp {
             report.push(format!("{moved} intérieur(s) créé(s) dans DragoWalker étaient rangés dans le fichier de types d'une ressource MLO importée (recopié tel quel, donc jamais exportés) : remis dans un fichier du projet. Enregistre le projet."));
         }
         let ymaps = self.ymaps_for_export(dll.as_deref(), &mut report);
-        let ymaps = self.split_interior_maps(ymaps, &mut report);
+        let mut ymaps = self.split_interior_maps(ymaps, &mut report);
+        // modèles des MLO importés renommés (conflit avec une autre ressource) : les objets de leurs cartes suivent
+        for r in self.proj.mlo_res.iter().filter(|r| !r.renames.is_empty()) {
+            for y in ymaps.iter_mut().filter(|y| r.ymaps.contains(&y.name)) {
+                for e in y.entities.iter_mut() {
+                    if let Some(x) = r.renames.iter().find(|x| x.0.eq_ignore_ascii_case(&e.archetype)) {
+                        e.archetype = x.1.clone();
+                    }
+                }
+            }
+        }
+        // conflits entre MLO restants : signalés
+        if !self.proj.mlo_res.is_empty() {
+            let n = self.find_conflicts().iter().filter(|c| c.level > 0).count();
+            if n > 0 {
+                report.push(format!("{n} conflit(s) entre MLO ou avec la carte du jeu : menu Fichier » Conflits des MLO pour les voir et les régler."));
+            }
+        }
         let mut n = 0;
         // cartes du projet : les bâtiments du jeu copiés emportent leur version lointaine (carte « _lod »)
         let mut lod_ymaps: Vec<crate::model::Ymap> = Vec::new();
@@ -518,6 +535,35 @@ impl DwApp {
         if skip("water") {
             for old in ["dw_water.xml", "dw_water.lua"] {
                 let _ = std::fs::remove_file(out.join(old));
+            }
+        }
+        // lampadaires : lumières de nuit vues de loin (cartes dw_distlights / dw_lodlights, comme celles du jeu)
+        let mut ll = self.lod_lights();
+        match crate::lodlights::write(&stream, &mut ll) {
+            Ok(f) if !f.is_empty() => report.push(format!("Lumières de nuit vues de loin : {} tête(s) de lampadaire (dw_distlights, dw_lodlights).", ll.len())),
+            Ok(_) => {}
+            Err(e) => report.push(format!("Lumières de loin impossibles : {e}")),
+        }
+        // navmesh : chemins des piétons du terrain
+        match self.proj.terrain.as_ref().map(|t| t.navmesh) {
+            Some(true) => match self.export_navmesh(&stream) {
+                Ok((0, _)) => {}
+                Ok((n, p)) => report.push(format!("Chemins des piétons (navmesh) : {n} tuile(s), {p} polygone(s) ; ils remplacent ceux du jeu dans ces tuiles (à vérifier en jeu).")),
+                Err(e) => report.push(format!("Navmesh impossible : {e}")),
+            },
+            _ => {
+                let _ = self.export_navmesh_clear(&stream);
+            }
+        }
+        // minimap et carte de pause : tuiles du jeu repeintes avec le terrain
+        if let Some(t) = self.proj.terrain.as_ref().filter(|t| t.minimap) {
+            match self.game.world.as_deref() {
+                Some(w) => match crate::minimap::export(w, t, &stream, t.sea_all || self.export_sea_all) {
+                    Ok(0) => {}
+                    Ok(k) => report.push(format!("Minimap et carte de pause : {k} tuile(s) de la carte du jeu repeinte(s) avec le terrain.")),
+                    Err(e) => report.push(format!("Minimap impossible : {e}")),
+                },
+                None => report.push("Minimap : charge le jeu avant d'exporter (les tuiles de la carte du jeu sont recopiées puis repeintes).".into()),
             }
         }
         // circulation : points de route générés depuis les routes du terrain (nodesNNN.ynd) ; anciens carrés : retirés
@@ -656,6 +702,17 @@ impl DwApp {
                     Ok(false) => {}
                     Err(e) => report.push(format!("Export des PNJ impossible : {e}")),
                 }
+            }
+            // zones de quartier : script client (nom, piétons, voitures, ambiance)
+            match self.export_zones(&out) {
+                Ok(true) => {
+                    man += "
+client_script 'dw_zones.lua'
+";
+                    report.push(format!("Zones de quartier : {} (dw_zones.lua).", self.proj.zones.len()));
+                }
+                Ok(false) => {}
+                Err(e) => report.push(format!("Export des zones impossible : {e}")),
             }
             // portes des intérieurs : enregistrées dans le système de portes du jeu, ouvertes
             match self.export_doors(&out) {

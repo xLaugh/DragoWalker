@@ -27,6 +27,7 @@ if ($ToBinary) {
         elseif ($name.EndsWith('.ytd.xml')) { $fmt = 'Ytd' }
         elseif ($name.EndsWith('.ybn.xml')) { $fmt = 'Ybn' }
         elseif ($name.EndsWith('.ynd.xml')) { $fmt = 'Ynd' }
+        elseif ($name.EndsWith('.ynv.xml')) { $fmt = 'Ynv' }
         if (-not $fmt) { continue }
         if ($fmt -eq 'PSO') {
             # manifeste de dépendances : comme EditProjectManifestPanel.SaveManifestButton_Click (0x06001196),
@@ -115,13 +116,13 @@ if ($ToXmlList) {
             $fname = [IO.Path]::GetFileName($inp)
             # type de fichier selon l'extension (collisions .ybn : MetaXml.GetXml(YbnFile, out filename) -> YbnXml.GetXml)
             $low = $fname.ToLower()
-            $tname = if ($low.EndsWith('.ytyp')) { 'CodeWalker.GameFiles.YtypFile' } elseif ($low.EndsWith('.ybn')) { 'CodeWalker.GameFiles.YbnFile' } elseif ($low.EndsWith('.ynd')) { 'CodeWalker.GameFiles.YndFile' } elseif ($low.EndsWith('.ydr')) { 'CodeWalker.GameFiles.YdrFile' } else { 'CodeWalker.GameFiles.YmapFile' }
+            $tname = if ($low.EndsWith('.ytyp')) { 'CodeWalker.GameFiles.YtypFile' } elseif ($low.EndsWith('.ybn')) { 'CodeWalker.GameFiles.YbnFile' } elseif ($low.EndsWith('.ynd')) { 'CodeWalker.GameFiles.YndFile' } elseif ($low.EndsWith('.ynv')) { 'CodeWalker.GameFiles.YnvFile' } elseif ($low.EndsWith('.ydr')) { 'CodeWalker.GameFiles.YdrFile' } elseif ($low.EndsWith('.ytd')) { 'CodeWalker.GameFiles.YtdFile' } else { 'CodeWalker.GameFiles.YmapFile' }
             $ftype = $asm.GetType($tname)
             $g = $rpfFile.GetMethod('GetResourceFile').MakeGenericMethod($ftype)
             $p = New-Object 'object[]' 1
             $p[0] = $bytes.psobject.BaseObject
             $file = $g.Invoke($null, $p)
-            if ($low.EndsWith('.ydr')) {
+            if ($low.EndsWith('.ydr') -or $low.EndsWith('.ytd')) {
                 # modèle : MetaXml.GetXml(YdrFile, out filename, dossier) écrit aussi ses textures (.dds) dans le dossier
                 $m3 = $metaXml.GetMethods() | Where-Object { $_.Name -eq 'GetXml' -and $_.GetParameters().Count -eq 3 -and $_.GetParameters()[0].ParameterType -eq $ftype } | Select-Object -First 1
                 $dir = [IO.Path]::Combine([IO.Path]::GetDirectoryName($out), [IO.Path]::GetFileName($out).Split('.')[0])

@@ -46,7 +46,13 @@ pub struct PlanState {
     pub light_color: [u8; 3],
     pub light_int: f32,
     pub light_range: f32,
+    /// outil « Sommets » : sommet pris (coin de pièce libre ou bout de mur)
+    pub vgrab: Option<[f32; 2]>,
 }
+
+/// Deux sommets à moins de cette distance sont le même (m), et distance pour prendre un sommet à la souris (m).
+const VERTEX_SAME: f32 = 0.03;
+const VERTEX_PICK: f32 = 0.6;
 
 fn snap(v: f32) -> f32 {
     (v / PLAN_GRID).round() * PLAN_GRID
@@ -99,6 +105,10 @@ impl DwApp {
             self.design_input(resp, ptr, ctx);
             return;
         }
+        if self.plan.mode == 12 {
+            self.plan_vertex_input(resp, ptr, ctx);
+            return;
+        }
         let Some(mouse) = ptr else { return };
         match self.plan.mode {
             1 => {
@@ -124,6 +134,128 @@ impl DwApp {
             }
             _ => {}
         }
+    }
+
+    /// Sommets de la coque modelable de l'étage : coins des pièces libres et bouts des murs (sans doublons).
+    pub(crate) fn plan_vertices(&self) -> Vec<[f32; 2]> {
+        let mut out: Vec<[f32; 2]> = Vec::new();
+        let Some(d) = self.cur_design() else { return out };
+        let z = self.plan_z();
+        let mut add = |p: [f32; 2]| {
+            if !out.iter().any(|q| (q[0] - p[0]).abs() < VERTEX_SAME && (q[1] - p[1]).abs() < VERTEX_SAME) {
+                out.push(p);
+            }
+        };
+        for r in d.rooms.iter().filter(|r| (r.z0 - z).abs() < 0.3) {
+            for p in &r.pts {
+                add(*p);
+            }
+        }
+        for w in d.walls.iter().filter(|w| (w.z0 - z).abs() < 0.3) {
+            add(w.a);
+            add(w.b);
+        }
+        out
+    }
+
+    /// Outil « Sommets » : glisser un coin de pièce ou un bout de mur (tout ce qui est au même endroit suit).
+    fn plan_vertex_input(&mut self, resp: &egui::Response, ptr: Option<Pos2>, ctx: &egui::Context) {
+        let Some(mouse) = ptr else { return };
+        if resp.drag_started_by(PointerButton::Primary) {
+            let start = ctx.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
+            if let Some(p) = self.plan_point_free(start) {
+                self.plan.vgrab = self.plan_vertices().into_iter().filter(|v| ((v[0] - p.x).powi(2) + (v[1] - p.y).powi(2)).sqrt() < VERTEX_PICK).min_by(|a, b| {
+                    let da = (a[0] - p.x).powi(2) + (a[1] - p.y).powi(2);
+                    let db = (b[0] - p.x).powi(2) + (b[1] - p.y).powi(2);
+                    da.total_cmp(&db)
+                });
+            }
+        }
+        if resp.drag_stopped_by(PointerButton::Primary) {
+            if let (Some(v), Some(p)) = (self.plan.vgrab.take(), self.plan_point(mouse)) {
+                self.status = self.design_move_vertex(v, [p.x, p.y]);
+            }
+        }
+        if resp.clicked_by(PointerButton::Primary) {
+            self.status = "Glisse un point vert (coin de pièce ou bout de mur) : tout ce qui est au même endroit le suit.".into();
+        }
+    }
+
+    /// Point de la souris sur le sol de l'étage, sans la grille.
+    fn plan_point_free(&self, mouse: Pos2) -> Option<V3> {
+        let (_, _, pos, rot) = self.plan_target()?;
+        let g = self.cam.ground_point(mouse, pos.z + self.plan_z())?;
+        let l = rot.inverse().rotate(g - pos);
+        Some(v3(l.x, l.y, self.plan_z()))
+    }
+
+    /// Déplace un sommet de la coque modelable de l'étage : coins des pièces libres et bouts de murs au même
+    /// endroit ; les passages des ouvertures des murs touchés sont refaits, la boîte des pièces suit leur contour.
+    pub fn design_move_vertex(&mut self, from: [f32; 2], to: [f32; 2]) -> String {
+        let Some((ti, mi, _, _)) = self.plan_target() else { return "Aucun intérieur.".into() };
+        if (from[0] - to[0]).abs() < 1e-3 && (from[1] - to[1]).abs() < 1e-3 {
+            return "Sommet laissé en place.".into();
+        }
+        let z = self.plan_z();
+        let mname = self.proj.ytyps[ti].mlos[mi].name.clone();
+        let same = |p: [f32; 2]| (p[0] - from[0]).abs() < VERTEX_SAME && (p[1] - from[1]).abs() < VERTEX_SAME;
+        let Some(d) = self.cur_design().cloned() else { return "Pas de coque modelable ici.".into() };
+        self.push_undo();
+        // murs touchés : passages retirés avant, refaits après
+        let touched: Vec<usize> = d.walls.iter().enumerate().filter(|(_, w)| (w.z0 - z).abs() < 0.3 && (same(w.a) || same(w.b))).map(|(i, _)| i).collect();
+        for &wi in &touched {
+            let w = d.walls[wi].clone();
+            for h in &w.holes {
+                self.design_remove_hole_portal(ti, mi, &w, h);
+            }
+        }
+        let mut rooms_changed: Vec<String> = Vec::new();
+        {
+            let dm = self.design_mut(&mname);
+            for &wi in &touched {
+                let w = &mut dm.walls[wi];
+                if same(w.a) {
+                    w.a = to;
+                }
+                if same(w.b) {
+                    w.b = to;
+                }
+                let len = ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt();
+                for h in w.holes.iter_mut() {
+                    h.s = h.s.clamp(h.w * 0.5, (len - h.w * 0.5).max(h.w * 0.5));
+                }
+            }
+            for r in dm.rooms.iter_mut().filter(|r| (r.z0 - z).abs() < 0.3) {
+                let mut hit = false;
+                for p in r.pts.iter_mut() {
+                    if same(*p) {
+                        *p = to;
+                        hit = true;
+                    }
+                }
+                if hit {
+                    rooms_changed.push(r.room.clone());
+                }
+            }
+        }
+        for &wi in &touched {
+            let n = self.cur_design().map(|d| d.walls[wi].holes.len()).unwrap_or(0);
+            for hi in 0..n {
+                let _ = self.design_hole_portal(ti, mi, wi, hi);
+            }
+        }
+        // boîte des pièces libres changées : celle de leur contour
+        let pts: Vec<(String, Vec<[f32; 2]>)> = self.cur_design().map(|d| d.rooms.iter().filter(|r| rooms_changed.contains(&r.room)).map(|r| (r.room.clone(), r.pts.clone())).collect()).unwrap_or_default();
+        for (name, ps) in pts {
+            if let Some(r) = self.proj.ytyps[ti].mlos[mi].rooms.iter_mut().find(|r| r.name == name) {
+                let (x0, x1, y0, y1) = ps.iter().fold((f32::MAX, f32::MIN, f32::MAX, f32::MIN), |a, p| (a.0.min(p[0]), a.1.max(p[0]), a.2.min(p[1]), a.3.max(p[1])));
+                r.bb_min.x = x0;
+                r.bb_max.x = x1;
+                r.bb_min.y = y0;
+                r.bb_max.y = y1;
+            }
+        }
+        format!("Sommet déplacé : {} mur(s), {} pièce(s) suivent ; leurs passages sont refaits (Ctrl+Z pour annuler).", touched.len(), rooms_changed.len())
     }
 
     /// Ajoute une pièce (rectangle a-b de l'étage) et une porte avec chaque pièce voisine du même étage.
@@ -670,6 +802,21 @@ impl DwApp {
                 painter.text(c, egui::Align2::CENTER_CENTER, format!("{i} · {}", r.name), egui::FontId::proportional(12.0), Color32::WHITE);
             }
         }
+        // outil « Sommets » : points verts, celui pris en orange jusqu'à la souris
+        if self.plan.mode == 12 {
+            let z = self.plan_z();
+            for v in self.plan_vertices() {
+                if let Some(s) = w(v3(v[0], v[1], z + 0.05)) {
+                    painter.circle_filled(s, 5.0, Color32::from_rgb(110, 240, 140));
+                }
+            }
+            if let (Some(g), Some(h)) = (self.plan.vgrab, hover) {
+                if let (Some(a), Some(b)) = (w(v3(g[0], g[1], z + 0.05)), self.plan_point(h).and_then(|p| w(v3(p.x, p.y, z + 0.05)))) {
+                    painter.line_segment([a, b], egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 170, 40)));
+                    painter.circle_filled(b, 6.0, Color32::from_rgb(255, 170, 40));
+                }
+            }
+        }
         // coque modelable de l'étage : murs (deux traits), ouvertures, pièces libres, blocs ; tracé en cours
         if let Some(d) = self.cur_design() {
             let z = self.plan_z();
@@ -992,6 +1139,17 @@ impl DwApp {
             for (id, locked) in ids {
                 if let Some(e) = self.proj.ymaps.iter().flat_map(|y| y.entities.iter()).find(|e| e.id == id) {
                     doors.push(DoorOut { model: e.archetype.clone(), pos: e.pos, heading: e.rot.heading_deg(), locked });
+                }
+            }
+        }
+        // portes posées dans les ouvertures percées des bâtiments du jeu (« Poser dans l'ouverture »)
+        for c in &self.proj.building_cuts {
+            for o in &c.openings {
+                let Some(id) = o.prop_id else { continue };
+                if let Some(e) = self.proj.ymaps.iter().filter(|y| !y.sample).flat_map(|y| y.entities.iter()).find(|e| e.id == id && model::is_door_model(&e.archetype)) {
+                    if !doors.iter().any(|d| (d.pos - e.pos).len() < 0.05 && d.model.eq_ignore_ascii_case(&e.archetype)) {
+                        doors.push(DoorOut { model: e.archetype.clone(), pos: e.pos, heading: e.rot.heading_deg(), locked: o.locked });
+                    }
                 }
             }
         }

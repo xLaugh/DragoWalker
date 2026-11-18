@@ -2264,8 +2264,14 @@ impl DwApp {
         let mlo = &self.proj.ytyps[t].mlos[m];
         let r = &mlo.rooms[ri];
         let droom = if r.free { self.proj.designs.iter().find(|d| d.mlo.eq_ignore_ascii_case(&mlo.name)).and_then(|d| d.rooms.iter().find(|dr| dr.room == r.name)) } else { None };
-        let (poly, z0, h) = match droom {
-            Some(dr) if dr.pts.len() >= 3 => (dr.pts.clone(), dr.z0, (dr.h - dr.drop).max(2.0)),
+        // pièce d'un bâtiment de l'atelier coupée par des cloisons en biais ou en L : son emprise exacte
+        let house_poly = self.proj.houses.iter().find(|ho| ho.interior.as_deref().map(|n| n.eq_ignore_ascii_case(&mlo.name)).unwrap_or(false)).and_then(|ho| {
+            let cells = ho.interior_cells();
+            (cells.len() + 1 == mlo.rooms.len()).then(|| cells.get(ri - 1).cloned()).flatten()
+        }).filter(|c| c.len() > 1).map(|c| crate::atelier::cells_outline(&c)).filter(|p| p.len() >= 3);
+        let (poly, z0, h) = match (droom, house_poly) {
+            (Some(dr), _) if dr.pts.len() >= 3 => (dr.pts.clone(), dr.z0, (dr.h - dr.drop).max(2.0)),
+            (_, Some(p)) => (p, r.bb_min.z, (r.bb_max.z - r.bb_min.z).max(2.0)),
             _ => (vec![[r.bb_min.x, r.bb_min.y], [r.bb_max.x, r.bb_min.y], [r.bb_max.x, r.bb_max.y], [r.bb_min.x, r.bb_max.y]], r.bb_min.z, (r.bb_max.z - r.bb_min.z).max(2.0)),
         };
         let mut doors = Vec::new();
@@ -2352,7 +2358,10 @@ impl DwApp {
                 let poly = room.poly.clone();
                 let d = self.design_mut(&mname);
                 if let Some(dr) = d.rooms.iter_mut().find(|dr| dr.room == rname) {
-                    dr.floor = plan.floor;
+                    // un sol repris du jeu ou importé (texture du projet) est gardé
+                    if dr.floor < crate::design::CUSTOM_BASE {
+                        dr.floor = plan.floor;
+                    }
                 }
                 let has = d.lights.iter().any(|l| in_poly(&poly, l.p[0], l.p[1]) && l.p[2] > room.z0 - 0.5 && l.p[2] < room.z0 + room.h + 0.5);
                 if !has {

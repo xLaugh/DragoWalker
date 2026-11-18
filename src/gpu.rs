@@ -22,8 +22,24 @@ pub struct Inst {
     pub bmax: [f32; 3],
 }
 
+/// Lumière d'intérieur dessinée dans la vue (repère du monde) : position, portée, couleur (déjà multipliée par
+/// l'intensité), direction du spot et cosinus de son demi-angle extérieur (−2 = lumière ronde).
+#[derive(Clone, Copy, Debug)]
+pub struct VLight {
+    pub p: [f32; 3],
+    pub range: f32,
+    pub col: [f32; 3],
+    pub dir: [f32; 3],
+    pub cone: f32,
+}
+
+/// Lumières d'intérieur envoyées au shader à chaque image (les plus proches de la caméra) — choix de DragoWalker.
+pub const MAX_VIEW_LIGHTS: usize = 24;
+
 pub struct FrameDraw {
     pub vp: [f32; 16],
+    /// lumières des intérieurs proches (au plus MAX_VIEW_LIGHTS)
+    pub lights: Vec<VLight>,
     pub eye: [f32; 3],
     pub insts: Vec<Inst>,
     pub fog: [f32; 4],
@@ -32,8 +48,11 @@ pub struct FrameDraw {
     pub probe: Option<[f32; 2]>,
     /// ombres du soleil : matrice de la vue du soleil (None = pas d'ombres)
     pub light_vp: Option<[f32; 16]>,
-    /// zones d'eau du jeu (water.xml) : min x, min y, max x, max y, hauteur
-    pub water: Arc<Vec<[f32; 5]>>,
+    /// zones d'eau du jeu (water.xml) : min x, min y, max x, max y, hauteur, eau claire (0 / 1)
+    pub water: Arc<Vec<[f32; 6]>>,
+    /// hauteurs du terrain du projet : l'eau devient claire et turquoise là où le fond est proche, avec de l'écume
+    /// qui monte sur le sable
+    pub hmap: Option<Arc<HMap>>,
     /// temps (secondes) pour animer l'eau
     pub time: f32,
     /// tout ce qui dépasse cette hauteur n'est pas dessiné (coupe pour voir dans les bâtiments)
@@ -42,6 +61,18 @@ pub struct FrameDraw {
     pub ghosts: Vec<Inst>,
     /// teinte (rgb) et opacité (a) de cet aperçu
     pub ghost_tint: [f32; 4],
+}
+
+/// Hauteurs du terrain pour l'eau (une valeur par sommet, nx × ny, coin bas-gauche x0, y0, côtés sx, sy).
+pub struct HMap {
+    pub gen: u64,
+    pub x0: f32,
+    pub y0: f32,
+    pub sx: f32,
+    pub sy: f32,
+    pub nx: usize,
+    pub ny: usize,
+    pub data: Arc<Vec<f32>>,
 }
 
 struct GpuMesh {
@@ -94,6 +125,14 @@ struct Prog {
     u_has_l: Option<glow::UniformLocation>,
     u_has_mask: Option<glow::UniformLocation>,
     u_ghost: Option<glow::UniformLocation>,
+    u_hmap: Option<glow::UniformLocation>,
+    u_hmap_geo: Option<glow::UniformLocation>,
+    u_has_hmap: Option<glow::UniformLocation>,
+    u_clear: Option<glow::UniformLocation>,
+    u_pl: Option<glow::UniformLocation>,
+    u_plc: Option<glow::UniformLocation>,
+    u_pld: Option<glow::UniformLocation>,
+    u_npl: Option<glow::UniformLocation>,
     u_layers: [Option<glow::UniformLocation>; 5],
 }
 
@@ -118,6 +157,8 @@ pub struct Gpu {
     pub probe: Option<([f32; 2], f32)>,
     shadow_fbo: Option<glow::Framebuffer>,
     shadow_tex: Option<glow::Texture>,
+    /// hauteurs du terrain envoyées (texture, génération)
+    hmap_tex: Option<(glow::Texture, u64)>,
     /// modèles fabriqués par DragoWalker (terrain, MLO importés, Blender) : copie gardée en mémoire, renvoyée à la
     /// carte graphique s'ils ont été libérés (on ne peut pas les relire dans les fichiers du jeu ; sans elle, ils
     /// devenaient des boîtes beiges) — comme CodeWalker, qui garde la source de chaque élément libéré et le recharge
@@ -211,6 +252,7 @@ impl Gpu {
             probe: None,
             shadow_fbo: None,
             shadow_tex: None,
+            hmap_tex: None,
             custom_src: HashMap::new(),
             pinned_tex: HashSet::new(),
             vram_mb: None,
@@ -324,6 +366,7 @@ void main() {{
   gl_Position = uVP * w;
 }}"
         );
+        let nl = MAX_VIEW_LIGHTS;
         let fs = format!(
             "{head}in vec3 vN; in vec2 vUv; in vec3 vW; in vec4 vCol; in vec2 vUv1;
 uniform sampler2D uL0; uniform sampler2D uL1; uniform sampler2D uL2; uniform sampler2D uL3; uniform sampler2D uMask;
@@ -331,6 +374,8 @@ uniform vec4 uHasL; uniform float uHasMask; uniform float uTerrain;
 uniform sampler2D uTex; uniform float uHasTex; uniform float uCutout; uniform float uBlend; uniform vec3 uColor; uniform vec3 uEye; uniform vec4 uFog; uniform float uAlpha;
 uniform mat4 uLightVP; uniform sampler2D uShadow; uniform float uShadowOn; uniform float uWater; uniform float uTime; uniform float uClipZ;
 uniform vec4 uGhost;
+uniform sampler2D uHmap; uniform vec4 uHmapGeo; uniform float uHasHmap; uniform float uClear;
+uniform vec4 uPL[{nl}]; uniform vec4 uPLc[{nl}]; uniform vec4 uPLd[{nl}]; uniform int uNPL;
 out vec4 oCol;
 float shadowAt(vec3 w, vec3 n, vec3 sun) {{
   vec4 lp = uLightVP * vec4(w + n * 0.08, 1.0);
@@ -384,19 +429,55 @@ void main() {{
       1.0));
     vec3 v = normalize(uEye - vW);
     float fres = pow(1.0 - max(dot(wn, v), 0.0), 3.0);
-    vec3 deep = vec3(0.05, 0.20, 0.30);
+    // profondeur sous l'eau d'après le terrain du projet (sinon : eau profonde)
+    float depth = 1000.0;
+    if (uHasHmap > 0.5) {{
+      vec2 tc = (vW.xy - uHmapGeo.xy) / uHmapGeo.zw;
+      if (tc.x > 0.0 && tc.y > 0.0 && tc.x < 1.0 && tc.y < 1.0) depth = vW.z - texture(uHmap, tc).r;
+    }}
+    if (depth < -0.05) discard;
+    // eau claire : turquoise et transparente sur les hauts-fonds (et partout dans une zone d'eau claire)
+    float shallow = 1.0 - smoothstep(0.0, 9.0, depth);
+    float clr = max(uClear, shallow);
+    vec3 deep = mix(vec3(0.05, 0.20, 0.30), vec3(0.06, 0.48, 0.55), clr);
     vec3 sky = vec3(0.62, 0.74, 0.86);
-    vec3 col = mix(deep, sky, clamp(0.15 + fres, 0.0, 1.0));
+    vec3 col = mix(deep, sky, clamp(0.15 + fres * (1.0 - 0.5 * clr), 0.0, 1.0));
+    col = mix(col, vec3(0.30, 0.78, 0.74), shallow * shallow * 0.55);
     float spec = pow(max(dot(reflect(-sun, wn), v), 0.0), 80.0);
     col += vec3(1.0, 0.95, 0.85) * spec * 1.2;
-    oCol = vec4(mix(col, uFog.rgb, f), 0.82);
+    float alpha = mix(0.82, 0.38, clr);
+    // écume : vagues qui montent vers le sable (bandes qui avancent vers le bord) et liseré au bord de l'eau
+    if (depth < 2.5) {{
+      float edge = 1.0 - smoothstep(0.0, 0.35, depth);
+      float band = smoothstep(0.82, 0.98, sin(depth * 4.2 - t * 1.7 + 0.6 * sin(p.x * 0.05 + p.y * 0.04)));
+      float foam = max(edge, band * (1.0 - smoothstep(0.4, 2.5, depth)));
+      foam *= 0.55 + 0.45 * sin(p.x * 0.9 + p.y * 1.3 + t * 2.0) * sin(p.x * 1.7 - p.y * 0.8);
+      col = mix(col, vec3(0.95, 0.97, 0.98), clamp(foam, 0.0, 1.0) * 0.85);
+      alpha = max(alpha, clamp(foam, 0.0, 1.0) * 0.9);
+    }}
+    oCol = vec4(mix(col, uFog.rgb, f), alpha);
     return;
   }}
   vec3 n = normalize(vN);
   if (!gl_FrontFacing) n = -n;
   float sh = uShadowOn > 0.5 ? shadowAt(vW, n, sun) : 1.0;
   float l = 0.5 + 0.62 * max(dot(n, sun), 0.0) * sh - 0.08 * (1.0 - sh);
-  vec3 c = base * l;
+  // lumières des intérieurs : atténuation douce jusqu'à la portée, cône des spots
+  vec3 add = vec3(0.0);
+  for (int i = 0; i < uNPL; i++) {{
+    vec3 L = uPL[i].xyz - vW;
+    float dl = length(L);
+    if (dl >= uPL[i].w) continue;
+    vec3 ld = L / max(dl, 0.001);
+    float att = 1.0 - dl / uPL[i].w;
+    att *= att;
+    float lam = 0.2 + 0.8 * max(dot(n, ld), 0.0);
+    float spot = uPLc[i].w < -1.5 ? 1.0 : smoothstep(uPLc[i].w, uPLc[i].w + 0.15, dot(-ld, uPLd[i].xyz));
+    add += uPLc[i].rgb * att * lam * spot;
+  }}
+  // plusieurs lumières qui se recouvrent : le total reste doux (pas de taches blanches sur le sol)
+  add = add / (1.0 + 0.6 * add);
+  vec3 c = base * (l + add);
   vec3 o = mix(c, uFog.rgb, f);
   if (uGhost.a > 0.0) {{
     // aperçu de la pose : le modèle texturé, teinté et à moitié transparent
@@ -453,6 +534,14 @@ void main() {{
             u_clip: u("uClipZ"),
             u_terrain: u("uTerrain"),
             u_ghost: u("uGhost"),
+            u_pl: u("uPL"),
+            u_plc: u("uPLc"),
+            u_pld: u("uPLd"),
+            u_npl: u("uNPL"),
+            u_hmap: u("uHmap"),
+            u_hmap_geo: u("uHmapGeo"),
+            u_has_hmap: u("uHasHmap"),
+            u_clear: u("uClear"),
             u_has_l: u("uHasL"),
             u_has_mask: u("uHasMask"),
             u_layers: [u("uL0"), u("uL1"), u("uL2"), u("uL3"), u("uMask")],
@@ -828,6 +917,22 @@ void main() {{
         gl.uniform_1_f32(u_time.as_ref(), fd.time);
         let u_clip = self.prog.as_ref().unwrap().u_clip.clone();
         gl.uniform_1_f32(u_clip.as_ref(), fd.clip_z);
+        {
+            let p = self.prog.as_ref().unwrap();
+            let n = fd.lights.len().min(MAX_VIEW_LIGHTS);
+            let (mut a, mut b, mut c) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4), Vec::with_capacity(n * 4));
+            for l in &fd.lights[..n] {
+                a.extend_from_slice(&[l.p[0], l.p[1], l.p[2], l.range]);
+                b.extend_from_slice(&[l.col[0], l.col[1], l.col[2], l.cone]);
+                c.extend_from_slice(&[l.dir[0], l.dir[1], l.dir[2], 0.0]);
+            }
+            if n > 0 {
+                gl.uniform_4_f32_slice(p.u_pl.as_ref(), &a);
+                gl.uniform_4_f32_slice(p.u_plc.as_ref(), &b);
+                gl.uniform_4_f32_slice(p.u_pld.as_ref(), &c);
+            }
+            gl.uniform_1_i32(p.u_npl.as_ref(), n as i32);
+        }
         // 1. passe d'ombres : la scène vue du soleil, dans la carte de profondeur
         let shadows = match (fd.light_vp, self.shadow_fbo) {
             (Some(lvp), Some(fb)) => {
@@ -891,6 +996,36 @@ void main() {{
                 gl.uniform_1_f32(p.u_has_tex.as_ref(), 0.0);
                 gl.uniform_1_f32(u_water.as_ref(), 1.0);
                 gl.bind_vertex_array(Some(c.vao));
+                // hauteurs du terrain (unité 7) : envoyées quand le terrain a changé
+                let mut has_h = 0.0f32;
+                if let Some(h) = &fd.hmap {
+                    if self.hmap_tex.map(|x| x.1) != Some(h.gen) {
+                        if let Some((old, _)) = self.hmap_tex.take() {
+                            gl.delete_texture(old);
+                        }
+                        if let Ok(tex) = gl.create_texture() {
+                            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                            let bytes = std::slice::from_raw_parts(h.data.as_ptr() as *const u8, h.data.len() * 4);
+                            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R32F as i32, h.nx as i32, h.ny as i32, 0, glow::RED, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes)));
+                            for (k, v) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                                gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+                            }
+                            self.hmap_tex = Some((tex, h.gen));
+                        }
+                    }
+                    if let Some((tex, _)) = self.hmap_tex {
+                        gl.active_texture(glow::TEXTURE7);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.active_texture(glow::TEXTURE0);
+                        // centres des texels sur les sommets du terrain
+                        let (dx, dy) = (h.sx / (h.nx - 1).max(1) as f32, h.sy / (h.ny - 1).max(1) as f32);
+                        gl.uniform_4_f32(p.u_hmap_geo.as_ref(), h.x0 - dx * 0.5, h.y0 - dy * 0.5, h.sx + dx, h.sy + dy);
+                        has_h = 1.0;
+                    }
+                }
+                gl.uniform_1_i32(p.u_hmap.as_ref(), 7);
+                gl.uniform_1_f32(p.u_has_hmap.as_ref(), has_h);
                 // comme CodeWalker (ShaderManager::RenderQueued 0x060009d4, RenderWaterQuads) : seulement les zones
                 // d'eau des fichiers water*.xml du jeu, mer comprise — pas de mer infinie à z = 0, qui apparaissait
                 // sous les intérieurs souterrains (station de métro) et sous les trous du sol
@@ -901,11 +1036,14 @@ void main() {{
                     if cx * cx + cy * cy > 5000.0 * 5000.0 {
                         continue;
                     }
+                    gl.uniform_1_f32(p.u_clear.as_ref(), q[5]);
                     gl.uniform_3_f32(p.u_bmin.as_ref(), q[0], q[1], q[4] - 0.02);
                     gl.uniform_3_f32(p.u_bmax.as_ref(), q[2], q[3], q[4]);
                     gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_INT, 0);
                 }
                 gl.uniform_1_f32(u_water.as_ref(), 0.0);
+                gl.uniform_1_f32(p.u_has_hmap.as_ref(), 0.0);
+                gl.uniform_1_f32(p.u_clear.as_ref(), 0.0);
                 gl.depth_mask(true);
             }
         }

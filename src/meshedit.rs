@@ -7,7 +7,8 @@
 //! - Une extrusion est gardée comme la liste des centres d'origine des triangles de la face (comme les triangles
 //!   retirés), la normale de la face et une distance (négative : la face s'enfonce). La face avance le long de sa
 //!   normale ; chaque bord libre de la face reçoit une face latérale (même partie, donc même texture, UV étirées
-//!   le long du bord) qui ferme le volume. Seul le niveau de détail le plus fin est extrudé.
+//!   le long du bord) qui ferme le volume. Les niveaux de détail lointains sont extrudés aussi : leurs triangles
+//!   dans le plan et l'emprise de la face (à `LOD_MATCH` près).
 //! - Ordre d'application, dans la vue comme à l'export : triangles retirés (d'après leur centre d'origine),
 //!   sommets déplacés, extrusions (triangles reconnus par leur centre d'origine, avant déplacement), ouvertures.
 //!
@@ -399,6 +400,9 @@ pub fn apply_edits(meshes: &mut [GMesh], primary: &[usize], moves: &[VertexMove]
     let mut origin: Vec<Vec<V3>> = meshes.iter().enumerate().map(|(i, m)| if primary.contains(&i) && !extrusions.is_empty() { m.verts.iter().map(|v| pos_of(&m.layout, v)).collect() } else { Vec::new() }).collect();
     let mut moved = apply_moves(meshes, moves);
     let mut extruded = 0;
+    // centres « d'origine » de chaque triangle : ceux du modèle, puis ceux des faces latérales au moment où une
+    // extrusion les crée (une extrusion suivante peut les reprendre : côté d'une extrusion extrudé à son tour)
+    let mut centers = centers;
     for (ei, e) in extrusions.iter().enumerate() {
         if e.dist.abs() < 1e-4 || e.tris.is_empty() {
             continue;
@@ -406,16 +410,35 @@ pub fn apply_edits(meshes: &mut [GMesh], primary: &[usize], moves: &[VertexMove]
         let set = RemovedSet::new(&e.tris);
         let n = v3a(e.nrm).norm();
         let lm = MoveSet::layer(moves, ei as u32 + 1);
+        // emprise de la face (dans son plan) d'après les triangles du niveau fin, pour la retrouver dans les niveaux
+        // de détail lointains (maillages différents)
+        let (mut fa, mut fb, mut plane) = ([f32::MAX; 2], [f32::MIN; 2], None::<V3>);
+        let (bu, bv) = plane_axes(n);
         for &mi in primary {
             let Some(m) = meshes.get_mut(mi) else { continue };
             let sel: Vec<usize> = centers[mi].iter().enumerate().filter(|(_, c)| set.contains(**c)).map(|(i, _)| i).collect();
             if sel.is_empty() {
                 continue;
             }
+            for &t in &sel {
+                for j in 0..3 {
+                    if let Some(v) = m.idx.get(t * 3 + j).and_then(|&k| m.verts.get(k as usize)) {
+                        let p = pos_of(&m.layout, v);
+                        plane.get_or_insert(p);
+                        fa = [fa[0].min(p.dot(bu)), fa[1].min(p.dot(bv))];
+                        fb = [fb[0].max(p.dot(bu)), fb[1].max(p.dot(bv))];
+                    }
+                }
+            }
             extruded += sel.len();
             let start = m.verts.len();
+            let t0 = m.idx.len() / 3;
             let (_, created) = extrude_tris_ex(m, &sel, n, e.dist);
             let l = m.layout.clone();
+            for t in t0..m.idx.len() / 3 {
+                let c = (0..3).fold(V3::ZERO, |acc, j| acc + pos_of(&l, &m.verts[m.idx[t * 3 + j] as usize])) * (1.0 / 3.0);
+                centers[mi].push(c);
+            }
             for (j, (src, is_top)) in created.into_iter().enumerate() {
                 let o = origin[mi].get(src as usize).copied().unwrap_or(V3::ZERO);
                 origin[mi].push(o);
@@ -429,8 +452,48 @@ pub fn apply_edits(meshes: &mut [GMesh], primary: &[usize], moves: &[VertexMove]
                 }
             }
         }
+        // niveaux de détail lointains : leurs triangles dans le plan de la face, tournés comme elle et tout entiers
+        // dans son emprise (à LOD_MATCH près), sont extrudés de la même distance
+        if let Some(p0) = plane {
+            let inside = |p: V3| (p - p0).dot(n).abs() < LOD_MATCH && p.dot(bu) > fa[0] - LOD_MATCH && p.dot(bu) < fb[0] + LOD_MATCH && p.dot(bv) > fa[1] - LOD_MATCH && p.dot(bv) < fb[1] + LOD_MATCH;
+            for mi in (0..meshes.len()).filter(|i| !primary.contains(i)) {
+                let m = &mut meshes[mi];
+                let nv = m.verts.len();
+                let sel: Vec<usize> = (0..m.idx.len() / 3)
+                    .filter(|&t| {
+                        let k = [m.idx[t * 3], m.idx[t * 3 + 1], m.idx[t * 3 + 2]];
+                        if k.iter().any(|&x| x as usize >= nv) {
+                            return false;
+                        }
+                        let p = k.map(|x| pos_of(&m.layout, &m.verts[x as usize]));
+                        let g = (p[1] - p[0]).cross(p[2] - p[0]);
+                        g.len() > 1e-8 && g.norm().dot(n) > PLANAR_COS && p.iter().all(|q| inside(*q))
+                    })
+                    .collect();
+                if !sel.is_empty() {
+                    extruded += sel.len();
+                    extrude_tris_ex(m, &sel, n, e.dist);
+                }
+            }
+        }
     }
     (moved, extruded)
+}
+
+/// Centres de création des deux triangles de la face latérale qu'une extrusion de `off` met sur le bord `pa`–`pb`
+/// (triangles (a, b, b') et (a, b', a'), comme extrude_tris_ex).
+pub fn side_centers(pa: V3, pb: V3, off: V3) -> [V3; 2] {
+    [(pa + pb + pb + off) * (1.0 / 3.0), (pa + pb + off + pa + off) * (1.0 / 3.0)]
+}
+
+/// Tolérance (m) pour retrouver une face extrudée dans les niveaux de détail lointains — **estimé**.
+pub const LOD_MATCH: f32 = 0.08;
+
+/// Deux axes du plan de normale `n`.
+fn plane_axes(n: V3) -> (V3, V3) {
+    let a = if n.z.abs() < 0.9 { v3(0.0, 0.0, 1.0) } else { v3(1.0, 0.0, 0.0) };
+    let u = n.cross(a).norm();
+    (u, n.cross(u).norm())
 }
 
 /// Applique déplacements et extrusions à un modèle de la vue (toutes ses parties : un seul niveau de détail).
@@ -635,6 +698,40 @@ mod tests {
 
     fn top_face(m: &GMesh) -> Vec<usize> {
         tri_centers(m).iter().enumerate().filter(|(_, c)| (c.z - 1.0).abs() < 1e-4).map(|(i, _)| i).collect()
+    }
+
+    /// Un côté d'une extrusion, repris par ses centres de création, s'extrude à son tour (volume toujours fermé).
+    #[test]
+    fn extruder_le_cote_d_une_extrusion() {
+        let mut meshes = vec![cube()];
+        let centers: Vec<[f32; 3]> = top_face(&meshes[0]).iter().map(|&t| a3(tri_centers(&meshes[0])[t])).collect();
+        let first = Extrusion { tris: centers, nrm: [0.0, 0.0, 1.0], dist: 0.5 };
+        // le côté +x de l'extrusion : bord (1, 0, 1) → (1, 1, 1) du dessus, avancé de 0,5 en z ; centres des deux
+        // triangles dans les deux sens possibles du bord
+        let off = v3(0.0, 0.0, 0.5);
+        let mut side: Vec<[f32; 3]> = Vec::new();
+        for (a, b) in [(v3(1.0, 0.0, 1.0), v3(1.0, 1.0, 1.0)), (v3(1.0, 1.0, 1.0), v3(1.0, 0.0, 1.0))] {
+            side.extend(side_centers(a, b, off).map(a3));
+        }
+        let second = Extrusion { tris: side, nrm: [1.0, 0.0, 0.0], dist: 0.25 };
+        let (_, n) = apply_edits(&mut meshes, &[0], &[], &[first, second]);
+        assert_eq!(n, 4, "2 triangles du dessus + 2 du côté");
+        assert!(closed(&meshes[0]));
+        assert!((volume(&meshes[0]) - (1.5 + 0.25 * 0.5)).abs() < 1e-4, "volume {}", volume(&meshes[0]));
+    }
+
+    /// Le dessus extrudé du cube fin l'est aussi dans le cube « de loin » (même forme, autre maillage).
+    #[test]
+    fn extrusion_aussi_de_loin() {
+        let mut meshes = vec![cube(), cube()];
+        let centers: Vec<[f32; 3]> = top_face(&meshes[0]).iter().map(|&t| a3(tri_centers(&meshes[0])[t])).collect();
+        let e = Extrusion { tris: centers, nrm: [0.0, 0.0, 1.0], dist: 0.5 };
+        let (_, n) = apply_edits(&mut meshes, &[0], &[], &[e]);
+        assert_eq!(n, 4, "2 triangles du niveau fin + 2 du niveau lointain");
+        for m in &meshes {
+            assert!(closed(m));
+            assert!((volume(m) - 1.5).abs() < 1e-4, "volume {}", volume(m));
+        }
     }
 
     #[test]

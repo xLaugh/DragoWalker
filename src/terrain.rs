@@ -134,6 +134,19 @@ pub struct Terrain {
     /// textures importées (cases de matériau CUSTOM_MAT + rang)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub textures: Vec<TerrainTex>,
+    /// côtes du terrain à l'export : vagues qui vont vers la plage, mer claire sur les hauts-fonds
+    #[serde(default = "crate::signals::yes")]
+    pub coast: bool,
+    /// mer partout (carte vide, ressource ls-removed) : l'eau exportée part d'une mer qui couvre toute la carte au
+    /// lieu de l'eau du jeu
+    #[serde(default)]
+    pub sea_all: bool,
+    /// le terrain peint dans les tuiles de la carte du jeu (radar, carte de pause) à l'export
+    #[serde(default = "crate::signals::yes")]
+    pub minimap: bool,
+    /// maillage de déplacement des piétons (navmesh) écrit à l'export
+    #[serde(default)]
+    pub navmesh: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -196,6 +209,10 @@ pub struct TerrainState {
     pub sea_bg: bool,
     pub link: bool,
     pub preview: Option<(String, egui::TextureHandle)>,
+    /// hauteurs du terrain données à l'eau de la vue (eau claire, écume), avec la génération du terrain
+    pub hmap: Option<std::sync::Arc<crate::gpu::HMap>>,
+    /// prochaine zone d'eau : eau claire (lagon)
+    pub water_clear: bool,
     /// type de route et points déjà cliqués de la route en cours
     pub road_kind: u8,
     pub road_pts: Vec<V3>,
@@ -262,6 +279,8 @@ impl Default for TerrainState {
             sea_bg: true,
             link: true,
             preview: None,
+            hmap: None,
+            water_clear: true,
             road_kind: 0,
             road_pts: Vec::new(),
             road_bridge: false,
@@ -413,6 +432,23 @@ pub fn gen_preview(spec: &GenSpec, c: V3, real: f32, n: usize) -> egui::ColorIma
 const SEA_FLOOR: f32 = -10.0;
 
 /// Réglages de la partie Créer.
+/// Taille maximale d'un terrain neuf (m), et nombre maximal de sommets par côté de la grille (terrain agrandi par
+/// « Ajouter » compris) — choix de DragoWalker (au-delà, la vue met trop longtemps à refaire le terrain quand on
+/// sculpte).
+pub const MAX_SIZE: f32 = 4000.0;
+pub const MAX_SIDE: usize = 1201;
+
+/// Côté d'une case selon la taille du terrain : 2 m jusqu'à 600 m, 4 m jusqu'à 3 200 m, 5 m au-delà.
+pub fn cell_for(size: f32) -> f32 {
+    if size <= 600.0 {
+        2.0
+    } else if size <= 3200.0 {
+        4.0
+    } else {
+        5.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenSpec {
     pub preset: u8,
@@ -572,10 +608,10 @@ impl Terrain {
     }
 
     pub fn new(center: V3, size: f32, base_h: f32, mat: u8) -> Terrain {
-        let cell = if size > 600.0 { 4.0 } else { 2.0 };
-        let n = ((size / cell).round() as usize + 1).clamp(16, 400);
+        let cell = cell_for(size);
+        let n = ((size / cell).round() as usize + 1).clamp(16, MAX_SIDE);
         let half = (n - 1) as f32 * cell * 0.5;
-        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: Vec::new() }
+        Terrain { origin: v3(center.x - half, center.y - half, 0.0), cell, nx: n, ny: n, h: std::sync::Arc::new(vec![base_h; n * n]), mat: std::sync::Arc::new(vec![mat; (n - 1) * (n - 1)]), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: Vec::new(), coast: true, sea_all: false, minimap: true, navmesh: false }
     }
 
     /// Remplace le relief par un modèle de départ (voir PRESETS), puis peint selon le relief.
@@ -633,6 +669,110 @@ impl Terrain {
 
     pub fn auto_paint(&mut self, style: u8) {
         self.auto_paint_by(&|_, _| style);
+    }
+
+    /// Ajoute un modèle (spec) dans un carré de `size` m centré sur `c`, sans toucher au reste : la grille s'agrandit
+    /// pour l'englober (sol, herbe, trous et peinture des routes gardés à leur place ; nouveau sol à la hauteur
+    /// moyenne du bord du terrain d'avant, souvent le fond de la mer autour d'une île), le nouveau relief se raccorde
+    /// en douceur sur le dernier quart de son carré ; une île garde la terre déjà là (le plus haut des deux). Peint
+    /// selon le relief seulement dans le nouveau carré.
+    pub fn add_region(&mut self, spec: &GenSpec, c: V3, size: f32) -> Result<(), String> {
+        let cell = self.cell;
+        let half = size * 0.5;
+        let (ox, oy) = (self.origin.x, self.origin.y);
+        let (ex, ey) = (ox + (self.nx - 1) as f32 * cell, oy + (self.ny - 1) as f32 * cell);
+        // nouvelle grille, alignée sur l'ancienne
+        let k0x = ((c.x - half - ox) / cell).floor().min(0.0) as i64;
+        let k0y = ((c.y - half - oy) / cell).floor().min(0.0) as i64;
+        let k1x = ((c.x + half - ox) / cell).ceil().max((self.nx - 1) as f32) as i64;
+        let k1y = ((c.y + half - oy) / cell).ceil().max((self.ny - 1) as f32) as i64;
+        let (nx, ny) = ((k1x - k0x + 1) as usize, (k1y - k0y + 1) as usize);
+        if nx > MAX_SIDE || ny > MAX_SIDE {
+            return Err(format!("Le terrain ferait {:.0} × {:.0} m : {:.0} m au plus de côté avec des cases de {cell} m. Rapproche la nouvelle zone ou fais-la plus petite.", (nx - 1) as f32 * cell, (ny - 1) as f32 * cell, (MAX_SIDE - 1) as f32 * cell));
+        }
+        let (dx, dy) = ((-k0x) as usize, (-k0y) as usize);
+        // hauteur du nouveau sol : moyenne du bord de l'ancien terrain
+        let mut edge = 0.0f32;
+        let mut ne = 0;
+        for i in 0..self.nx {
+            for j in [0, self.ny - 1] {
+                edge += self.h[j * self.nx + i];
+                ne += 1;
+            }
+        }
+        for j in 0..self.ny {
+            for i in [0, self.nx - 1] {
+                edge += self.h[j * self.nx + i];
+                ne += 1;
+            }
+        }
+        let fill = edge / ne.max(1) as f32;
+        let mut h = vec![fill; nx * ny];
+        let mut mat = vec![0u8; (nx - 1) * (ny - 1)];
+        let mut grass = vec![0u8; (nx - 1) * (ny - 1)];
+        let mut old_cell = vec![false; (nx - 1) * (ny - 1)];
+        for j in 0..self.ny {
+            h[(j + dy) * nx + dx..(j + dy) * nx + dx + self.nx].copy_from_slice(&self.h[j * self.nx..(j + 1) * self.nx]);
+        }
+        for j in 0..self.ny - 1 {
+            for i in 0..self.nx - 1 {
+                let (a, b) = ((j + dy) * (nx - 1) + i + dx, j * (self.nx - 1) + i);
+                mat[a] = self.mat[b];
+                grass[a] = self.grass_at(i, j);
+                old_cell[a] = true;
+            }
+        }
+        let remap = |k: u32, onx: usize| -> u32 {
+            let (i, j) = (k as usize % (onx - 1), k as usize / (onx - 1));
+            ((j + dy) * (nx - 1) + i + dx) as u32
+        };
+        let onx = self.nx;
+        let holes: Vec<u32> = self.holes.iter().map(|&k| remap(k, onx)).collect();
+        let road_paint: Vec<[u32; 2]> = self.road_paint.iter().map(|p| [remap(p[0], onx), p[1]]).collect();
+        self.origin = v3(ox + k0x as f32 * cell, oy + k0y as f32 * cell, self.origin.z);
+        self.nx = nx;
+        self.ny = ny;
+        self.holes = holes;
+        self.road_paint = road_paint;
+        let _ = (ex, ey);
+        // nouveau relief dans le carré, raccordé sur son dernier quart
+        let field = GenField::new(spec, c, size);
+        let mut desert = vec![0.0f32; nx * ny];
+        let mut inside = vec![false; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let p = v3(self.origin.x + i as f32 * cell, self.origin.y + j as f32 * cell, 0.0);
+                let d = ((p.x - c.x).abs()).max((p.y - c.y).abs());
+                if d > half {
+                    continue;
+                }
+                let t = ((half - d) / (half * 0.25)).clamp(0.0, 1.0);
+                let wgt = t * t * (3.0 - 2.0 * t);
+                let (hn, des) = field.at(p.x, p.y);
+                let k = j * nx + i;
+                let blended = h[k] + (hn - h[k]) * wgt;
+                h[k] = if spec.island || spec.sea_bg && spec.compose { h[k].max(blended) } else { blended };
+                desert[k] = des;
+                inside[k] = wgt > 0.0;
+            }
+        }
+        self.h = h.into();
+        self.mat = mat.into();
+        self.grass = grass.into();
+        // peinture selon le relief : nouvelles cases, et anciennes cases touchées par le nouveau carré
+        let n = nx;
+        self.auto_paint_where(&|i, j| if desert[j * n + i] > 0.5 { 1 } else { 0 }, &|i, j| inside[j * n + i] || !old_cell[j * (n - 1) + i]);
+        Ok(())
+    }
+
+    /// Comme auto_paint_by, seulement sur les cases où `only` est vrai.
+    pub fn auto_paint_where(&mut self, style_at: &dyn Fn(usize, usize) -> u8, only: &dyn Fn(usize, usize) -> bool) {
+        let keep: Vec<(usize, u8)> = (0..self.mat.len()).filter(|&k| !only(k % (self.nx - 1), k / (self.nx - 1))).map(|k| (k, self.mat[k])).collect();
+        self.auto_paint_by(style_at);
+        let m = std::sync::Arc::make_mut(&mut self.mat);
+        for (k, v) in keep {
+            m[k] = v;
+        }
     }
 
     /// Comme auto_paint, avec un style par case (coin bas-gauche i, j).
@@ -1003,7 +1143,7 @@ impl Terrain {
                 }
             }
         }
-        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into(), road_paint: Vec::new(), holes, textures: self.textures.clone() }
+        Terrain { origin: v3(self.origin.x + i0 as f32 * self.cell, self.origin.y + j0 as f32 * self.cell, self.origin.z), cell: self.cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: grass.into(), road_paint: Vec::new(), holes, textures: self.textures.clone(), coast: self.coast, sea_all: self.sea_all, minimap: self.minimap, navmesh: self.navmesh }
     }
 
     /// Version simplifiée pour la vue de loin : un sommet sur `f` dans chaque direction (cases `f` fois plus
@@ -1027,7 +1167,7 @@ impl Terrain {
                 mat.push(self.mat[gj(j).min(self.ny - 2) * (self.nx - 1) + gi(i).min(self.nx - 2)]);
             }
         }
-        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: self.textures.clone() }
+        Terrain { origin: self.origin, cell, nx, ny, h: h.into(), mat: mat.into(), roads: Vec::new(), junctions: Vec::new(), waters: Vec::new(), emitters: Vec::new(), npc_traffic: Default::default(), auto_signals: true, grass: Default::default(), road_paint: Vec::new(), holes: Vec::new(), textures: self.textures.clone(), coast: self.coast, sea_all: self.sea_all, minimap: self.minimap, navmesh: self.navmesh }
     }
 
     /// Herbe du jeu d'une case (0 = aucune).
@@ -1261,15 +1401,71 @@ impl Terrain {
         }
         let mut per: Vec<Vec<u32>> = vec![Vec::new(); self.slots()];
         let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
+        // bords entre deux sols en biais plutôt qu'en marches de la taille d'une case : chaque sommet prend le sol
+        // de la majorité des cases qui le touchent (égalité : aucun) ; une case dont un coin est d'un autre sol est
+        // recoupée par les milieux de ses côtés — le coin (triangle) prend le sol du sommet, le losange central garde
+        // celui de la case. Une bordure droite reste droite, un escalier devient une diagonale.
+        let cell_slot = |i: usize, j: usize| -> Option<usize> {
+            let k = j * (nx - 1) + i;
+            if holes.contains(&(k as u32)) {
+                None
+            } else {
+                Some(self.slot(self.mat[k]))
+            }
+        };
+        let mut vm: Vec<Option<usize>> = vec![None; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let mut cnt: [(usize, u8); 4] = [(usize::MAX, 0); 4];
+                for (ci, cj) in [(i.wrapping_sub(1), j.wrapping_sub(1)), (i, j.wrapping_sub(1)), (i.wrapping_sub(1), j), (i, j)] {
+                    if ci >= nx - 1 || cj >= ny - 1 {
+                        continue;
+                    }
+                    if let Some(m) = cell_slot(ci, cj) {
+                        match cnt.iter_mut().find(|c| c.0 == m) {
+                            Some(c) => c.1 += 1,
+                            None => {
+                                if let Some(c) = cnt.iter_mut().find(|c| c.1 == 0) {
+                                    *c = (m, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                let best = cnt.iter().map(|c| c.1).max().unwrap_or(0);
+                if best > 0 && cnt.iter().filter(|c| c.1 == best).count() == 1 {
+                    vm[j * nx + i] = cnt.iter().find(|c| c.1 == best).map(|c| c.0);
+                }
+            }
+        }
+        let mut mids: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        let mut mid = |verts: &mut Vec<RVert>, p: u32, q: u32| -> u32 {
+            *mids.entry((p.min(q), p.max(q))).or_insert_with(|| {
+                let (vp, vq) = (verts[p as usize], verts[q as usize]);
+                let avg = |x: [f32; 3], y: [f32; 3]| [(x[0] + y[0]) * 0.5, (x[1] + y[1]) * 0.5, (x[2] + y[2]) * 0.5];
+                let n = avg(vp.nrm, vq.nrm);
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+                verts.push(RVert { pos: avg(vp.pos, vq.pos), nrm: [n[0] / l, n[1] / l, n[2] / l], uv: [(vp.uv[0] + vq.uv[0]) * 0.5, (vp.uv[1] + vq.uv[1]) * 0.5], col: [255; 4], uv1: [0.0, 0.0] });
+                verts.len() as u32 - 1
+            })
+        };
         for j in 0..ny - 1 {
             for i in 0..nx - 1 {
-                if holes.contains(&((j * (nx - 1) + i) as u32)) {
-                    continue; // entrée de tunnel
-                }
-                let m = self.slot(self.mat[j * (nx - 1) + i]);
+                let Some(m) = cell_slot(i, j) else { continue }; // entrée de tunnel
                 let a = (j * nx + i) as u32;
                 let (b, c, d) = (a + 1, a + nx as u32, a + nx as u32 + 1);
-                per[m].extend_from_slice(&[a, b, d, a, d, c]);
+                let corner = |v: u32| vm[v as usize].unwrap_or(m);
+                let (ma, mb, mc, md) = (corner(a), corner(b), corner(c), corner(d));
+                if ma == m && mb == m && mc == m && md == m {
+                    per[m].extend_from_slice(&[a, b, d, a, d, c]);
+                    continue;
+                }
+                let (m_ab, m_bd, m_dc, m_ca) = (mid(&mut verts, a, b), mid(&mut verts, b, d), mid(&mut verts, d, c), mid(&mut verts, c, a));
+                per[ma].extend_from_slice(&[a, m_ab, m_ca]);
+                per[mb].extend_from_slice(&[b, m_bd, m_ab]);
+                per[md].extend_from_slice(&[d, m_dc, m_bd]);
+                per[mc].extend_from_slice(&[c, m_ca, m_dc]);
+                per[m].extend_from_slice(&[m_ab, m_bd, m_dc, m_ab, m_dc, m_ca]);
             }
         }
         let mut idx = Vec::new();
@@ -2315,7 +2511,7 @@ impl DwApp {
         ui.checkbox(&mut self.terrain.island, "En île : les bords descendent dans la mer").on_hover_text("Montagnes, dunes, canyon… en île : la côte (irrégulière) plonge dans l'eau tout autour au lieu de finir en falaise au-dessus du vide.");
         egui::Grid::new("newterr").num_columns(2).show(ui, |ui| {
             ui.label("Taille");
-            ui.add(egui::Slider::new(&mut self.terrain.new_size, 128.0..=1600.0).suffix(" m"));
+            ui.add(egui::Slider::new(&mut self.terrain.new_size, 128.0..=MAX_SIZE).suffix(" m")).on_hover_text("Cases de 2 m jusqu'à 600 m, 4 m jusqu'à 3 200 m, 5 m au-delà. Un très grand terrain est plus long à refaire quand on sculpte.");
             ui.end_row();
             ui.label("Hauteur de base");
             ui.add(egui::Slider::new(&mut self.terrain.new_height, -20.0..=60.0).suffix(" m"));
@@ -2339,6 +2535,25 @@ impl DwApp {
             }
         });
         self.terrain_ui_preview(ui);
+        if self.proj.terrain.is_some() {
+            if ui.button(RichText::new("Ajouter ce modèle au centre de la vue").strong()).on_hover_text("Sans toucher au reste : le terrain s'agrandit pour englober ce carré (Taille), le nouveau relief s'y raccorde en douceur. Pour faire plusieurs îles : déplace la vue, puis ajoute « Île » encore et encore.").clicked() {
+                let spec = self.gen_spec();
+                let c = self.cam.target;
+                let size = self.terrain.new_size;
+                self.push_undo();
+                let r = self.proj.terrain.as_mut().map(|t| t.add_region(&spec, c, size));
+                match r {
+                    Some(Ok(())) => {
+                        self.terrain.dirty = true;
+                        let (mn, mx) = self.proj.terrain.as_ref().map(|t| t.bounds()).unwrap_or((V3::ZERO, V3::ZERO));
+                        let what = if spec.compose { "par zones".to_string() } else { format!("« {} »", PRESETS[self.terrain.preset as usize].0) };
+                        self.status = format!("Modèle {what} ajouté au terrain (le reste est gardé) : il fait maintenant {:.0} × {:.0} m. Ctrl+Z pour annuler.", mx.x - mn.x, mx.y - mn.y);
+                    }
+                    Some(Err(e)) => self.status = e,
+                    None => {}
+                }
+            }
+        }
         let label = if self.proj.terrain.is_none() { "Créer le terrain au centre de la vue" } else { "Remplacer le terrain par ce modèle" };
         if ui.button(RichText::new(label).strong()).clicked() {
             self.push_undo();
@@ -3000,12 +3215,17 @@ impl DwApp {
                 self.status = format!("{n} objet(s) de végétation retiré(s).");
             }
         });
-        // « Herbe du jeu » et « Biomes » (grass.rs) : retirés de l'interface le 11 nov. 2026 à la demande de la
-        // personne (pas encore vus fonctionner en jeu) — à reprendre plus tard, voir A_FAIRE.md
+        // « Herbe du jeu » et « Biomes » (grass.rs) : remis le 18 nov. 2026 (à vérifier en jeu)
+        ui.separator();
+        self.grass_ui(ui);
     }
 
     fn terrain_ui_export(&mut self, ui: &mut egui::Ui) {
         ui.label("Pour FiveM : menu Fichier » Exporter une ressource FiveM. Le terrain part en tuiles (modèle + collision), les routes avec leurs marquages et leur collision, la végétation dans la carte de destination.");
+        if let Some(t) = self.proj.terrain.as_mut() {
+            ui.checkbox(&mut t.navmesh, "Chemins des piétons (navmesh, à vérifier en jeu)").on_hover_text("À l'export : le maillage de déplacement des piétons du terrain (fichiers navmesh[X][Y].ynv du jeu, tuiles de 150 m) : sol, trottoirs et routes marqués comme dans le jeu, sans l'eau, les pentes trop raides ni les bâtiments. Il remplace celui du jeu dans les tuiles touchées. Pas encore essayé en jeu.");
+            ui.checkbox(&mut t.minimap, "Terrain sur la minimap et la carte de pause").on_hover_text("À l'export (jeu chargé) : les tuiles de la carte du jeu touchées par le terrain sont recopiées et repeintes dans le style du jeu (terre, mer plus claire près des côtes, routes) ; FiveM les charge à la place des originales. Avec « Mer partout », toute la carte devient la mer autour de ton terrain. Le GPS suit tes routes (points de route de la circulation).");
+        }
         ui.add_space(4.0);
         if ui.button("Exporter pour Sollumz / Blender").on_hover_text("Écrit le terrain et les routes comme modèle (.ydr.xml + textures) dans le dossier d'échange Sollumz").clicked() {
             if let Some(t) = self.proj.terrain.as_ref() {
@@ -3633,6 +3853,32 @@ fn furn_override(mut f: crate::roads::Furniture, o: [Option<bool>; 3]) -> crate:
 #[cfg(test)]
 mod tests_gen {
     use super::*;
+
+    #[test]
+    fn deux_iles_sans_remplacer() {
+        let spec = GenSpec { preset: 4, seed: 3, base: 0.0, island: true, ..GenSpec::default() };
+        let mut t = Terrain::new(v3(0.0, 0.0, 0.0), 400.0, 0.0, 0);
+        t.generate_ex(&spec);
+        let before = t.height_at(0.0, 0.0).unwrap();
+        let corner = t.height_at(-150.0, -150.0).unwrap();
+        // une route peinte et une case retirée : gardées à leur place
+        let k = (10 * (t.nx - 1) + 10) as u32;
+        t.holes.push(k);
+        let hole_pos = (t.origin.x + 10.0 * t.cell, t.origin.y + 10.0 * t.cell);
+        t.add_region(&spec, v3(700.0, 100.0, 0.0), 400.0).unwrap();
+        let (mn, mx) = t.bounds();
+        assert!(mx.x - mn.x > 1000.0 && (mx.y - mn.y - 500.0).abs() < 3.0, "{mn:?} {mx:?}");
+        assert!((t.height_at(0.0, 0.0).unwrap() - before).abs() < 1e-3, "l'île d'avant n'a pas bougé");
+        assert!((t.height_at(-150.0, -150.0).unwrap() - corner).abs() < 1e-3);
+        assert!(t.height_at(700.0, 100.0).unwrap() > 0.5, "nouvelle île hors de l'eau");
+        assert!(t.height_at(350.0, 100.0).unwrap() < 0.0, "mer entre les deux îles");
+        let k2 = t.holes[0] as usize;
+        let (i, j) = (k2 % (t.nx - 1), k2 / (t.nx - 1));
+        assert!(((t.origin.x + i as f32 * t.cell) - hole_pos.0).abs() < 1e-3 && ((t.origin.y + j as f32 * t.cell) - hole_pos.1).abs() < 1e-3);
+        assert_eq!(t.mat.len(), (t.nx - 1) * (t.ny - 1));
+        // trop grand : refusé
+        assert!(t.add_region(&spec, v3(9000.0, 0.0, 0.0), 400.0).is_err());
+    }
 
     #[test]
     fn ile_et_zones() {

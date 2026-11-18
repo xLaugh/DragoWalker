@@ -313,6 +313,26 @@ pub struct BEdit {
     pub sel: Option<usize>,
     /// ouverture proposée sous la souris (mode 1)
     pub proposal: Option<crate::openings::Opening>,
+    /// fenêtres percées : vitre et cadre posés tout de suite
+    pub auto_glass: bool,
+    /// sommets choisis ensemble (Ctrl + clic) : (position affichée, position d'origine, couche) ; glisser l'un les
+    /// déplace tous (deux sommets : une arête)
+    pub vsel: Vec<(V3, V3, u32)>,
+    /// faces latérales des extrusions, ajoutées après les triangles du modèle dans `cur` (par paires, une paire par
+    /// face) : leur centre de création, qui sert à les reprendre dans une autre extrusion
+    side_c: Vec<V3>,
+    /// pour chaque face latérale, les centres qu'elle aurait si son bord était pris dans l'autre sens
+    side_alt: Vec<[V3; 2]>,
+}
+
+impl BEdit {
+    /// Centre d'origine d'un triangle de `cur` (du modèle, ou face latérale d'une extrusion).
+    fn center_of(&self, ti: usize) -> Option<V3> {
+        match self.tris.get(ti) {
+            Some(t) => Some(t.2),
+            None => self.side_c.get(ti - self.tris.len()).copied(),
+        }
+    }
 }
 
 /// Distance d'extrusion glissée dans la liste : appliquée au projet au plus tous les `EX_EDIT_EVERY` secondes et
@@ -345,6 +365,8 @@ struct VDrag {
     anchor: V3,
     /// position affichée actuelle
     now: V3,
+    /// autres sommets choisis qui suivent : (origine, couche, position déplacée au début du glisser)
+    group: Vec<(V3, u32, V3)>,
 }
 
 /// Face en cours d'extrusion.
@@ -480,7 +502,7 @@ impl DwApp {
         let n = tris.len();
         self.cut_state.src.insert(source.clone(), loaded);
         self.cut_state.sent.remove(&cut_name);
-        self.bedit = Some(BEdit { entity: id, cut: cut_name.clone(), source: source.clone(), tris, verts, groups, removed: vec![false; n], removed_sig: u64::MAX, drag: None, hover: Vec::new(), mode: 0, cur: Vec::new(), tlayer: Vec::new(), edit_sig: u64::MAX, vcands: Vec::new(), ex_edit: None, vdrag: None, fdrag: None, preset: 0, sel: None, proposal: None });
+        self.bedit = Some(BEdit { entity: id, cut: cut_name.clone(), source: source.clone(), tris, verts, groups, removed: vec![false; n], removed_sig: u64::MAX, drag: None, hover: Vec::new(), mode: 0, cur: Vec::new(), tlayer: Vec::new(), edit_sig: u64::MAX, vcands: Vec::new(), ex_edit: None, vdrag: None, fdrag: None, preset: 0, sel: None, proposal: None, auto_glass: true, vsel: Vec::new(), side_c: Vec::new(), side_alt: Vec::new() });
         self.isolate_sel = Some([id].into_iter().collect());
         let (mn, mx) = e.local_box(&self.proj);
         self.goto(e.pos, (mx - mn).len().max(20.0) * 1.3);
@@ -591,6 +613,10 @@ impl DwApp {
         let g = |i: u32| vm.get(i as usize).copied().unwrap_or(V3::ZERO);
         let mut cur: Vec<[V3; 3]> = be.tris.iter().map(|(t, _, _)| [g(t[0]), g(t[1]), g(t[2])]).collect();
         let mut tlayer = vec![0u32; be.tris.len()];
+        let nt = be.tris.len();
+        let mut side_c: Vec<V3> = Vec::new();
+        let mut side_alt: Vec<[V3; 2]> = Vec::new();
+        be.removed.truncate(nt);
         for (ei, e) in cut.extrusions.iter().enumerate() {
             if e.dist.abs() < 1e-4 || e.tris.is_empty() {
                 continue;
@@ -598,15 +624,51 @@ impl DwApp {
             let set = RemovedSet::new(&e.tris);
             let o = crate::meshedit::v3a(e.nrm).norm() * e.dist;
             let lm = crate::meshedit::MoveSet::layer(&cut.moves, ei as u32 + 1);
-            for (ti, t) in be.tris.iter().enumerate() {
-                if set.contains(t.2) {
-                    for k in 0..3 {
-                        cur[ti][k] = cur[ti][k] + o + lm.delta(orig(t.0[k])).unwrap_or(V3::ZERO);
+            // triangles de la face (du modèle, ou faces latérales d'une extrusion d'avant)
+            let sel: Vec<usize> = (0..cur.len()).filter(|&ti| !be.removed.get(ti).copied().unwrap_or(false) && (if ti < nt { set.contains(be.tris[ti].2) } else { set.contains(side_c[ti - nt]) })).collect();
+            // bords libres de la face, d'après les positions avant l'extrusion (comme extrude_tris_ex)
+            let mut count: HashMap<((i32, i32, i32), (i32, i32, i32)), u32> = HashMap::new();
+            let mut edges: Vec<(V3, V3, (i32, i32, i32), (i32, i32, i32))> = Vec::new();
+            for &ti in &sel {
+                for k in 0..3 {
+                    let (a, b) = (cur[ti][k], cur[ti][(k + 1) % 3]);
+                    let (ka, kb) = (vkey(a), vkey(b));
+                    if ka == kb {
+                        continue;
                     }
+                    *count.entry(if ka < kb { (ka, kb) } else { (kb, ka) }).or_default() += 1;
+                    edges.push((a, b, ka, kb));
+                }
+            }
+            let mut top: HashMap<(i32, i32, i32), V3> = HashMap::new();
+            for &ti in &sel {
+                for k in 0..3 {
+                    let before = cur[ti][k];
+                    let d = if ti < nt { lm.delta(orig(be.tris[ti].0[k])).unwrap_or(V3::ZERO) } else { V3::ZERO };
+                    cur[ti][k] = before + o + d;
+                    top.insert(vkey(before), cur[ti][k]);
+                }
+                if ti < nt {
                     tlayer[ti] = ei as u32 + 1;
                 }
             }
+            for (a, b, ka, kb) in edges {
+                if count.get(&if ka < kb { (ka, kb) } else { (kb, ka) }).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let (ta, tb) = (top.get(&ka).copied().unwrap_or(a + o), top.get(&kb).copied().unwrap_or(b + o));
+                let c = crate::meshedit::side_centers(a, b, o);
+                cur.push([a, b, tb]);
+                cur.push([a, tb, ta]);
+                side_c.extend(c);
+                side_alt.push(crate::meshedit::side_centers(b, a, o));
+                tlayer.push(0);
+                tlayer.push(0);
+            }
         }
+        be.removed.resize(cur.len(), false);
+        be.side_c = side_c;
+        be.side_alt = side_alt;
         be.cur = cur;
         be.tlayer = tlayer;
         let mut seen = std::collections::HashSet::new();
@@ -773,6 +835,9 @@ impl DwApp {
     fn bedit_pick(&self, s: Pos2) -> Vec<u32> {
         let Some(be) = self.bedit.as_ref() else { return Vec::new() };
         let Some((_, start, _, _)) = self.bedit_hit_local(s) else { return Vec::new() };
+        if start >= be.tris.len() {
+            return Vec::new(); // face latérale d'une extrusion : pas un morceau du modèle
+        }
         let mut seen = vec![false; be.tris.len()];
         let mut stack = vec![start as u32];
         seen[start] = true;
@@ -1014,7 +1079,7 @@ impl DwApp {
             let (mut cropped, mut mn, mut mx) = (cropped, mn, mx);
             if let Some((x, nm, ne)) = crate::meshedit::apply_to_ydr_xml(&cropped, &c.moves, &c.extrusions) {
                 cropped = x;
-                report.push(format!("« {} » : {nm} sommet(s) déplacé(s), {} face(s) extrudée(s) ({ne} triangle(s), niveau de détail fin seulement).", c.name, c.extrusions.len()));
+                report.push(format!("« {} » : {nm} sommet(s) déplacé(s), {} face(s) extrudée(s) ({ne} triangle(s), versions lointaines comprises quand elles ont la même face).", c.name, c.extrusions.len()));
                 // boîte du type : agrandie par ce qui dépasse
                 if let Some(xx) = crate::openings::read_ydr_xml(&cropped) {
                     for g in &xx.geoms {
@@ -1129,7 +1194,7 @@ impl DwApp {
         let (name, w, h, sill, bottom) = crate::openings::PRESETS[be.preset.min(crate::openings::PRESETS.len() - 1)];
         let min_z = be.cur.iter().flatten().fold(f32::MAX, |m, v| m.min(v.z));
         let floor = self.bedit_floor(hit - dir * 0.5).or_else(|| self.bedit_floor(hit + dir * 0.5)).unwrap_or(min_z);
-        Some(crate::openings::Opening { pos: [hit.x, hit.y, floor + bottom + h * 0.5], dir: [dir.x, dir.y], w, h, depth: 0.8, kind: name.to_string(), sill, prop: String::new() })
+        Some(crate::openings::Opening { pos: [hit.x, hit.y, floor + bottom + h * 0.5], dir: [dir.x, dir.y], w, h, depth: 0.8, kind: name.to_string(), sill, prop: String::new(), prop_id: None, locked: false })
     }
 
     /// Panneau « Percer des ouvertures » : types, liste, réglages.
@@ -1144,6 +1209,9 @@ impl DwApp {
             }
         });
         ui.label(RichText::new("Une ouverture coupe vraiment le mur (triangles découpés) ; si le mur a une épaisseur, elle reçoit des embrasures. La collision est percée aussi : on passe par la porte.").small().weak());
+        if let Some(b) = self.bedit.as_mut() {
+            ui.checkbox(&mut b.auto_glass, "Vitre et cadre automatiques sur les fenêtres").on_hover_text("Une fenêtre ou une baie vitrée percée reçoit tout de suite une vitre et un cadre à sa taille, au milieu du mur.");
+        }
         let list: Vec<crate::openings::Opening> = self.proj.building_cuts.iter().find(|c| c.name == cut).map(|c| c.openings.clone()).unwrap_or_default();
         ui.separator();
         ui.label(RichText::new(format!("Ouvertures de ce bâtiment : {}", list.len())).strong());
@@ -1155,6 +1223,7 @@ impl DwApp {
         let mut edited: Option<(usize, crate::openings::Opening, bool)> = None;
         let mut delete: Option<usize> = None;
         let mut place: Option<usize> = None;
+        let mut glaze_i: Option<usize> = None;
         let mut find_door = false;
         if let Some(i) = sel.filter(|i| *i < list.len()) {
             let mut o = list[i].clone();
@@ -1211,9 +1280,16 @@ impl DwApp {
                     find_door = true;
                 }
             });
+            if crate::model::is_door_model(&o.prop) && ui.checkbox(&mut o.locked, "Porte fermée à clé en jeu").on_hover_text("La porte posée est enregistrée dans le système de portes du jeu (dw_doors.lua) : ouverte, ou fermée à clé.").changed() {
+                started = true;
+                changed = true;
+            }
             ui.horizontal(|ui| {
-                if ui.add_enabled(!o.prop.trim().is_empty(), egui::Button::new("Poser dans l'ouverture")).on_hover_text("Pose ce modèle, charnière à gauche, tourné comme le mur ; ajuste-le ensuite avec les poignées. Il ne suit pas l'ouverture si tu la déplaces ensuite.").clicked() {
+                if ui.add_enabled(!o.prop.trim().is_empty(), egui::Button::new("Poser dans l'ouverture")).on_hover_text("Pose ce modèle au milieu du mur, charnière à gauche, tourné comme le mur ; une porte devient une vraie porte en jeu. Il ne suit pas l'ouverture si tu la déplaces ensuite : pose-le de nouveau (l'ancien est remplacé).").clicked() {
                     place = Some(i);
+                }
+                if ui.button("Vitre et cadre").on_hover_text("Fabrique une vitre et un cadre à la taille de l'ouverture (prop « dw_vitre_LxH » de « Mes modèles ») et la pose au milieu du mur.").clicked() {
+                    glaze_i = Some(i);
                 }
                 if ui.button("Supprimer cette ouverture").clicked() {
                     delete = Some(i);
@@ -1250,6 +1326,9 @@ impl DwApp {
         }
         if let Some(i) = place {
             self.bedit_place_prop(&cut, i);
+        }
+        if let Some(i) = glaze_i {
+            self.bedit_glaze(&cut, i);
         }
         if let Some(i) = delete {
             self.push_undo();
@@ -1310,7 +1389,10 @@ impl DwApp {
         // charnière sur le bord gauche ; le bas du modèle sur le bas de l'ouverture (l'origine d'un modèle n'est pas
         // toujours à ses pieds : celle de v_ilev_ra_door3 est à mi-hauteur)
         let sz = (o.h / dh).clamp(0.7, 1.3);
-        let hinge = ob.c - ob.r * ob.hw - ob.u * ob.hh - ob.r * mn.x.min(0.0) - ob.u * (mn.z * sz);
+        // au milieu de l'épaisseur du mur (le centre de l'ouverture est sur sa face extérieure), le modèle centré sur
+        // son épaisseur
+        let mid = self.bedit_wall_mid(&o);
+        let hinge = ob.c - ob.r * ob.hw - ob.u * ob.hh - ob.r * mn.x.min(0.0) - ob.u * (mn.z * sz) - ob.n * (mid + (mn.y + mx.y) * 0.5);
         let world = e.pos + e.rot.rotate(hinge.mulv(e.scale()));
         let rw = e.rot.rotate(ob.r);
         let heading = rw.y.atan2(rw.x);
@@ -1320,12 +1402,78 @@ impl DwApp {
         pe.rot = crate::math::Quat::from_z(heading);
         pe.scale_xy = (o.w / dw).clamp(0.6, 1.6);
         pe.scale_z = sz;
+        // vu d'aussi loin que le bâtiment
+        pe.lod_dist = pe.lod_dist.max(e.lod_dist.min(300.0));
         let id = pe.id;
+        // l'objet posé avant dans cette ouverture est remplacé
+        let old = o.prop_id;
+        if let Some(old) = old {
+            for y in self.proj.ymaps.iter_mut() {
+                y.entities.retain(|x| x.id != old);
+            }
+        }
         self.proj.ymaps[yi].entities.push(pe);
+        if let Some(op) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut).and_then(|c| c.openings.get_mut(i)) {
+            op.prop_id = Some(id);
+        }
         if let Some(s) = self.isolate_sel.as_mut() {
             s.insert(id);
         }
-        self.status = format!("« {name} » posé dans l'ouverture {} : ajuste-le avec les poignées si besoin (orientation et charnière à vérifier en jeu).", i + 1);
+        self.status = if crate::model::is_door_model(&name) {
+            format!("« {name} » posé dans l'ouverture {} : c'est une vraie porte en jeu (dw_doors.lua), qui s'ouvre ; orientation et charnière à vérifier en jeu.", i + 1)
+        } else {
+            format!("« {name} » posé dans l'ouverture {} : ajuste-le avec les poignées si besoin.", i + 1)
+        };
+    }
+
+    /// Milieu de l'épaisseur du mur d'une ouverture, en m vers l'intérieur depuis son centre (mesuré à côté de
+    /// l'ouverture, là où le mur n'est pas percé ; 0 si le mur n'a qu'une face).
+    pub(crate) fn bedit_wall_mid(&self, o: &crate::openings::Opening) -> f32 {
+        let Some(be) = self.bedit.as_ref() else { return 0.0 };
+        let b = o.obox();
+        let mut best = 0.0f32;
+        for side in [-1.0f32, 1.0] {
+            let start = b.c + b.r * (side * (b.hw + 0.2)) + b.n * 0.3;
+            let mut hits: Vec<f32> = Vec::new();
+            for t in &be.cur {
+                if let Some(tt) = crate::openings::ray_t(start, -b.n, t[0], t[1], t[2]) {
+                    if tt < 1.3 {
+                        hits.push(tt - 0.3);
+                    }
+                }
+            }
+            if hits.len() >= 2 {
+                hits.sort_by(|a, b| a.total_cmp(b));
+                let m = (hits[0] + hits[hits.len() - 1]) * 0.5;
+                if m > best {
+                    best = m;
+                }
+            }
+        }
+        best.clamp(0.0, 0.6)
+    }
+
+    /// Vitre et cadre automatiques dans l'ouverture n° `i` : un prop « dw_vitre_LxH » (écrit dans « Mes modèles » à
+    /// la première fois), posé au milieu du mur.
+    pub(crate) fn bedit_glaze(&mut self, cut: &str, i: usize) {
+        let Some(o) = self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.openings.get(i)).cloned() else { return };
+        let name = crate::openings::window_prop_name(o.w, o.h);
+        let known = self.sollumz.boxes().contains_key(&name);
+        if !known {
+            let (shapes, texs) = crate::openings::window_shapes(o.w, o.h);
+            let m = crate::propstudio::shapes_mesh(&shapes, &texs);
+            let last = self.props.last.clone();
+            if let Err(e) = self.studio_write_prop(&name, &m, 1) {
+                self.status = format!("Vitre : {e}");
+                return;
+            }
+            self.props.last = last;
+        }
+        if let Some(op) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut).and_then(|c| c.openings.get_mut(i)) {
+            op.prop = name.clone();
+        }
+        self.bedit_place_prop(cut, i);
+        self.status = format!("Vitre et cadre « {name} » posés dans l'ouverture {} (prop de « Mes modèles », exporté avec la ressource).", i + 1);
     }
 
     /// Clic en mode « ouvertures » : perce l'ouverture proposée.
@@ -1346,6 +1494,11 @@ impl DwApp {
             b.sel = n.checked_sub(1);
         }
         self.status = format!("Ouverture « {kind} » percée (n° {n}) : ajuste-la dans le panneau, Ctrl+Z pour annuler.");
+        let glaze = self.bedit.as_ref().map(|b| b.auto_glass).unwrap_or(true);
+        if glaze && n > 0 && self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.openings.get(n - 1)).map(|o| o.is_window()).unwrap_or(false) {
+            self.bedit_glaze(&cut, n - 1);
+            self.status = format!("Fenêtre « {kind} » percée (n° {n}) avec sa vitre et son cadre : ajuste-la dans le panneau, Ctrl+Z pour annuler.");
+        }
     }
 }
 
@@ -1448,6 +1601,11 @@ impl DwApp {
         if start >= be.cur.len() {
             return Vec::new();
         }
+        // face latérale d'une extrusion : ses deux triangles
+        if start >= be.tris.len() {
+            let k = (start - be.tris.len()) / 2 * 2 + be.tris.len();
+            return vec![k as u32, k as u32 + 1];
+        }
         let pos = |t: usize| be.cur[t];
         let nb = |t: usize, out: &mut Vec<usize>| {
             let (tr, g, _) = &be.tris[t];
@@ -1469,7 +1627,7 @@ impl DwApp {
         let (t, ti, ol, dl) = self.bedit_hit_local(s)?;
         let hit = ol + dl * t;
         let cut = self.proj.building_cuts.iter().find(|c| c.name == be.cut)?;
-        let c0 = be.tris[ti].2;
+        let c0 = be.center_of(ti)?;
         if let Some(i) = cut.extrusions.iter().position(|e| RemovedSet::new(&e.tris).contains(c0)) {
             let set = RemovedSet::new(&cut.extrusions[i].tris);
             let face: Vec<u32> = be.tris.iter().enumerate().filter(|(k, t)| !be.removed[*k] && set.contains(t.2)).map(|(k, _)| k as u32).collect();
@@ -1487,11 +1645,18 @@ impl DwApp {
     /// position déplacée `base_to` (couche n > 0 : `to − from` est le décalage du dessus de l'extrusion n). Avec
     /// point d'annulation. Rend faux si rien ne change.
     fn bedit_commit_move(&mut self, orig: V3, layer: u32, base_to: V3, delta: V3) -> bool {
+        self.bedit_commit_move_ex(orig, layer, base_to, delta, true)
+    }
+
+    /// `bedit_commit_move`, avec ou sans point d'annulation (les sommets d'un groupe partagent celui du premier).
+    fn bedit_commit_move_ex(&mut self, orig: V3, layer: u32, base_to: V3, delta: V3, undo: bool) -> bool {
         let Some(cut) = self.bedit.as_ref().map(|b| b.cut.clone()) else { return false };
         if delta.len() < 1e-4 || !self.proj.building_cuts.iter().any(|c| c.name == cut) {
             return false;
         }
-        self.push_undo();
+        if undo {
+            self.push_undo();
+        }
         let Some(c) = self.proj.building_cuts.iter_mut().find(|c| c.name == cut) else { return false };
         let to = base_to + delta;
         match move_index(&c.moves, orig, layer) {
@@ -1510,7 +1675,19 @@ impl DwApp {
     fn bedit_commit_extrude(&mut self, tris: &[u32], nrm: V3, dist: f32, ex: Option<usize>) -> bool {
         let Some(be) = self.bedit.as_ref() else { return false };
         let cut = be.cut.clone();
-        let centers: Vec<[f32; 3]> = tris.iter().filter_map(|&t| be.tris.get(t as usize)).map(|t| crate::meshedit::a3(t.2)).collect();
+        // centres d'origine ; une face latérale garde aussi ceux de l'autre sens de son bord (le côté voisin peut
+        // être pris dans l'autre sens à l'application)
+        let mut centers: Vec<[f32; 3]> = tris.iter().filter_map(|&t| be.center_of(t as usize)).map(crate::meshedit::a3).collect();
+        for &t in tris {
+            if let Some(alt) = (t as usize).checked_sub(be.tris.len()).and_then(|k| be.side_alt.get(k / 2)) {
+                for c in alt {
+                    let c = crate::meshedit::a3(*c);
+                    if !centers.contains(&c) {
+                        centers.push(c);
+                    }
+                }
+            }
+        }
         let tiny = dist.abs() < 0.005;
         let old = ex.and_then(|i| self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| c.extrusions.get(i)).map(|e| e.dist));
         match (ex, old) {
@@ -1555,9 +1732,14 @@ impl DwApp {
                 let sc = self.proj.building_cuts.iter().find(|c| c.name == cut).map(sig_cut).unwrap_or(0);
                 if mode == 2 {
                     if let Some((cur, orig, layer)) = self.bedit_pick_vertex(at) {
-                        let base_to = self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| move_index(&c.moves, orig, layer).map(|i| crate::meshedit::v3a(c.moves[i].to))).unwrap_or(orig);
+                        let to_of = |o: V3, l: u32| self.proj.building_cuts.iter().find(|c| c.name == cut).and_then(|c| move_index(&c.moves, o, l).map(|i| crate::meshedit::v3a(c.moves[i].to))).unwrap_or(o);
+                        let base_to = to_of(orig, layer);
+                        // sommet d'un groupe choisi (Ctrl + clic) : tout le groupe suit
+                        let vsel = self.bedit.as_ref().map(|b| b.vsel.clone()).unwrap_or_default();
+                        let same = |s: &(V3, V3, u32)| s.2 == layer && (s.1 - orig).len() <= crate::meshedit::MOVE_MATCH;
+                        let group: Vec<(V3, u32, V3)> = if vsel.iter().any(same) { vsel.iter().filter(|s| !same(s)).map(|s| (s.1, s.2, to_of(s.1, s.2))).collect() } else { Vec::new() };
                         if let Some(b) = self.bedit.as_mut() {
-                            b.vdrag = Some(VDrag { orig, layer, sig: sc, start: cur, base_to, anchor: tw(cur), now: cur });
+                            b.vdrag = Some(VDrag { orig, layer, sig: sc, start: cur, base_to, anchor: tw(cur), now: cur, group });
                         }
                     }
                 } else if let Some((tris, nrm, hit, ex)) = self.bedit_pick_face(at) {
@@ -1601,7 +1783,15 @@ impl DwApp {
             if let Some(vd) = vd {
                 let delta = vd.now - vd.start;
                 if self.bedit_commit_move(vd.orig, vd.layer, vd.base_to, delta) {
-                    self.status = format!("Sommet déplacé de {:.2} m (Ctrl+Z pour annuler).", delta.len());
+                    for (o, l, bt) in &vd.group {
+                        self.bedit_commit_move_ex(*o, *l, *bt, delta, false);
+                    }
+                    if let Some(b) = self.bedit.as_mut() {
+                        for s in b.vsel.iter_mut() {
+                            s.0 = s.0 + delta;
+                        }
+                    }
+                    self.status = if vd.group.is_empty() { format!("Sommet déplacé de {:.2} m (Ctrl+Z pour annuler).", delta.len()) } else { format!("{} sommets déplacés ensemble de {:.2} m (Ctrl+Z pour annuler).", vd.group.len() + 1, delta.len()) };
                 }
             }
             if let Some(fd) = fd {
@@ -1611,7 +1801,30 @@ impl DwApp {
             }
         }
         if resp.clicked_by(egui::PointerButton::Primary) {
-            self.status = if mode == 2 { "Maintiens le clic sur un sommet (point jaune) et glisse ; Maj : à la verticale.".into() } else { "Maintiens le clic sur une face (en bleu) et glisse pour la faire avancer ou reculer.".into() };
+            if mode == 2 && (mods.ctrl || mods.command) {
+                // Ctrl + clic : ajoute ou retire le sommet du groupe (deux sommets : une arête)
+                if let Some(at) = ptr {
+                    if let Some((cur, orig, layer)) = self.bedit_pick_vertex(at) {
+                        if let Some(b) = self.bedit.as_mut() {
+                            match b.vsel.iter().position(|s| s.2 == layer && (s.1 - orig).len() <= crate::meshedit::MOVE_MATCH) {
+                                Some(i) => {
+                                    b.vsel.remove(i);
+                                }
+                                None => b.vsel.push((cur, orig, layer)),
+                            }
+                            let n = b.vsel.len();
+                            self.status = match n {
+                                0 => "Groupe vide.".into(),
+                                1 => "1 sommet choisi : Ctrl + clic sur d'autres (deux : une arête), puis glisse l'un d'eux.".into(),
+                                2 => "2 sommets choisis (une arête) : glisse l'un d'eux pour déplacer l'arête ; Ctrl + clic sur un sommet choisi le retire.".into(),
+                                _ => format!("{n} sommets choisis : glisse l'un d'eux pour les déplacer ensemble ; Ctrl + clic sur un sommet choisi le retire."),
+                            };
+                        }
+                    }
+                }
+                return;
+            }
+            self.status = if mode == 2 { "Maintiens le clic sur un sommet (point jaune) et glisse ; Maj : à la verticale ; Ctrl + clic : choisir plusieurs sommets (ou une arête).".into() } else { "Maintiens le clic sur une face (en bleu) et glisse pour la faire avancer ou reculer.".into() };
         }
     }
 
@@ -1667,8 +1880,23 @@ impl DwApp {
                 if let Some(s) = pr(vd.now) {
                     painter.circle_filled(s, 5.0, Color32::from_rgb(255, 170, 40));
                 }
+                for (o, l, _) in &vd.group {
+                    if let Some(c) = be.vsel.iter().find(|s| s.2 == *l && (s.1 - *o).len() <= crate::meshedit::MOVE_MATCH).map(|s| s.0) {
+                        if let Some(s) = pr(c + delta) {
+                            painter.circle_filled(s, 5.0, Color32::from_rgb(255, 170, 40));
+                        }
+                    }
+                }
                 label(hover_pos, format!("déplacement : {:+.2} {:+.2} {:+.2} m", delta.x, delta.y, delta.z));
                 return;
+            }
+            // groupe choisi (Ctrl + clic) : points orange reliés
+            let pts: Vec<Pos2> = be.vsel.iter().filter_map(|s| pr(s.0)).collect();
+            for (i, s) in pts.iter().enumerate() {
+                painter.circle_filled(*s, 5.0, Color32::from_rgb(255, 150, 30));
+                if i > 0 {
+                    painter.line_segment([pts[i - 1], *s], egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 150, 30)));
+                }
             }
             let Some(hp) = hover_pos.filter(|_| !over_ui) else { return };
             // sommets proches de la souris en gris, celui qui serait pris en jaune
@@ -1835,6 +2063,28 @@ impl DwApp {
                 }
                 let ok = self.bedit_commit_extrude(&face, n, v[3], None);
                 println!("face de {} triangle(s) autour de {:?}, normale {n:?}, extrudée de {} m : {ok}", face.len(), fc, v[3]);
+                // DW_TEST_BEDIT_EXTRUDE2="distance" : extrude ensuite le premier côté de cette extrusion
+                if let Some(d2) = std::env::var("DW_TEST_BEDIT_EXTRUDE2").ok().and_then(|x| x.trim().parse::<f32>().ok()) {
+                    self.bedit_refresh();
+                    if let Some(be) = self.bedit.as_ref() {
+                        let nt = be.tris.len();
+                        println!("faces latérales choisissables : {}", (be.cur.len() - nt) / 2);
+                        if be.cur.len() > nt {
+                            let side = self.bedit_face_from(nt);
+                            let Some(be) = self.bedit.as_ref() else { return true };
+                            let st: Vec<[V3; 3]> = side.iter().map(|&k| be.cur[k as usize]).collect();
+                            let sc = st.iter().fold(V3::ZERO, |a, t| a + ctr(t)) * (1.0 / st.len().max(1) as f32);
+                            let mut sn = crate::meshedit::face_normal(&st);
+                            if sn.dot(sc - (fc + n * v[3])) < 0.0 {
+                                sn = -sn;
+                            }
+                            let ok2 = self.bedit_commit_extrude(&side, sn, d2, None);
+                            self.bedit_refresh();
+                            let ns = self.bedit.as_ref().map(|b| (b.cur.len() - b.tris.len()) / 2).unwrap_or(0);
+                            println!("côté extrudé de {d2} m (normale {sn:?}) : {ok2} ; faces latérales maintenant : {ns}");
+                        }
+                    }
+                }
                 if let Some((p, q, sc)) = self.bedit_xf() {
                     self.goto(p + q.rotate(fc.mulv(sc)), 25.0);
                 }

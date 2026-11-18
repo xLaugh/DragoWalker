@@ -43,6 +43,8 @@ pub struct StudioState {
     pub tab: u8,
     /// coupe au-dessus de l'étage : on voit dans les pièces, sans plafond
     pub cut: bool,
+    /// hauteur de la coupe au-dessus du sol de l'étage (m ; 0 : CUT_ABOVE_FLOOR)
+    pub cut_h: f32,
     saved: Option<Saved>,
 }
 
@@ -50,7 +52,8 @@ pub struct StudioState {
 pub const CUT_ABOVE_FLOOR: f32 = 2.4;
 
 /// Outils du plan dans la barre du studio : (mode de plan.rs, icône, nom, aide).
-const PLAN_TOOLS: [(u8, &str, &str, &str); 11] = [
+const PLAN_TOOLS: [(u8, &str, &str, &str); 12] = [
+    (12, ic::DOTS_NINE, "Sommets", "Glisse un coin de pièce ou un bout de mur (points verts) : les murs et les pièces qui s'y touchent suivent, leurs passages sont refaits."),
     (6, ic::POLYGON, "Pièce", "Pièce de n'importe quelle forme : clique ses coins, double-clic ou Entrée pour finir. Sol, plafond et murs autour faits tout seuls."),
     (1, ic::SQUARE, "Rectangle", "Pièce rectangulaire : glisse sur le sol de l'étage ; une porte se fait avec chaque pièce voisine."),
     (4, ic::WALL, "Mur", "Clique les points du mur (aimantés à la grille et aux autres murs) ; double-clic ou Entrée : fini."),
@@ -147,6 +150,32 @@ impl DwApp {
     }
 
     /// Sort du studio ; `place` : garde la vue sur l'intérieur, choisi, avec les poignées de déplacement.
+    /// « Voir en jeu » depuis le studio : le test en jeu, apparition juste à l'intérieur de l'entrée (premier passage
+    /// vers l'extérieur, 1 m vers la pièce), sans quitter le studio.
+    pub fn studio_play(&mut self) {
+        let spawn = self.studio_index(&self.studio.mlo.clone()).and_then(|(ti, mi)| {
+            let m = &self.proj.ytyps[ti].mlos[mi];
+            let (p, q) = self.proj.mlo_placement(&m.name)?;
+            let pt = m.portals.iter().find(|pt| pt.room_from == 0 || pt.room_to == 0)?;
+            let ri = if pt.room_from == 0 { pt.room_to } else { pt.room_from } as usize;
+            let r = m.rooms.get(ri)?;
+            let c = (pt.corners[0] + pt.corners[1] + pt.corners[2] + pt.corners[3]) * 0.25;
+            let rc = (r.bb_min + r.bb_max) * 0.5;
+            let mut d = crate::math::v3(rc.x - c.x, rc.y - c.y, 0.0);
+            if d.len() > 1e-3 {
+                d = d.norm();
+            }
+            let floor = r.floor_z.unwrap_or(r.bb_min.z);
+            Some(p + q.rotate(crate::math::v3(c.x + d.x, c.y + d.y, floor + 0.2)))
+        });
+        let old = self.cam.target;
+        if let Some(s) = spawn {
+            self.cam.target = s;
+        }
+        self.server_test();
+        self.cam.target = old;
+    }
+
     pub fn studio_exit(&mut self, place: bool) {
         if !self.studio.on {
             return;
@@ -425,6 +454,12 @@ impl DwApp {
                 if look::tool(ui, self.studio.cut, ic::KNIFE, "", "Coupe : enlever ce qui est au-dessus de l'étage (plafonds) pour voir dans les pièces").clicked() {
                     self.studio.cut = !self.studio.cut;
                 }
+                if self.studio.cut {
+                    if self.studio.cut_h <= 0.3 {
+                        self.studio.cut_h = CUT_ABOVE_FLOOR;
+                    }
+                    ui.add(egui::DragValue::new(&mut self.studio.cut_h).range(0.4..=12.0).speed(0.05).suffix(" m")).on_hover_text("Hauteur de la coupe au-dessus du sol de l'étage : plus bas pour voir le sol et les meubles de haut, plus haut pour voir les murs entiers (glisser ou taper une valeur)");
+                }
                 if look::tool(ui, self.opts.show_rooms, ic::BOUNDING_BOX, "", "Montrer les boîtes des pièces et les portails").clicked() {
                     self.opts.show_rooms = !self.opts.show_rooms;
                 }
@@ -450,6 +485,9 @@ impl DwApp {
                 }
                 if ui.button(look::label(ic::EXPORT, "Exporter")).on_hover_text("Exporter le projet en ressource FiveM (Ctrl+Maj+E)").clicked() {
                     self.export_xml(true);
+                }
+                if ui.button(look::label(ic::PLAY, "Voir en jeu")).on_hover_text("Exporte et lance le test dans FiveM (serveur de test), apparition à l'entrée de cet intérieur ; le studio reste ouvert. Le serveur déjà lancé est rechargé : refais-le après chaque retouche.").clicked() {
+                    self.studio_play();
                 }
             });
         });

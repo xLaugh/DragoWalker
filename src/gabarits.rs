@@ -5,7 +5,7 @@
 use crate::app::DwApp;
 use crate::decor::*;
 use crate::look::ic;
-use crate::math::v3;
+use crate::math::{v3, V3};
 
 /// Un intérieur tout prêt : nom, icône, pièces (nom, type d'aménagement, rectangle x0 y0 x1 y1 en m), passages
 /// (pièces reliées, indices dans la liste) ; l'entrée est au milieu du mur sud de la première pièce.
@@ -174,6 +174,9 @@ impl DwApp {
             let (hw, h) = (crate::plan::DOOR_W * 0.6, crate::plan::DOOR_H);
             m.portals.push(crate::model::Portal::new(1, 0, [v3(cx - hw, y, 0.0), v3(cx - hw, y, h), v3(cx + hw, y, h), v3(cx + hw, y, 0.0)]));
         }
+        // coque modelable : sol, murs et couleurs de chaque pièce, plinthes, éclairage cuit dans les coins
+        let kinds: Vec<usize> = g.rooms.iter().map(|r| r.1).collect();
+        self.gabarit_shell(ti, mi, &kinds);
         let mname = self.proj.ytyps[ti].mlos[mi].name.clone();
         for y in &mut self.proj.ymaps {
             for e in &mut y.entities {
@@ -195,6 +198,137 @@ impl DwApp {
             n += self.decorate_room(ti, mi, i + 1, *kind, theme, seed ^ (i as u64 * 7919), false, true).0;
         }
         self.status = format!("« {} » créé : {} pièce(s), {n} objet(s) posés, style {}. {doors}", g.name, g.rooms.len(), THEMES[theme]);
+    }
+}
+
+/// Murs d'une pièce selon son type : (texture WALL_TEX, couleur), comme les intérieurs du jeu (enduits beiges et
+/// grèges dans les logements, carrelage dans les pièces d'eau, béton dans les garages, brique sombre dans les bars,
+/// boiseries dans les restaurants) — **estimé** d'après les intérieurs du jeu (v_michael, v_franklins, v_31_tun,
+/// v_recycle, v_ilev_ra…).
+pub fn wall_look(kind: usize) -> (u8, Option<[u8; 3]>) {
+    use crate::decor::*;
+    match kind {
+        K_SALON => (0, Some([214, 200, 178])),
+        K_SAM => (0, Some([222, 206, 180])),
+        K_CHAMBRE => (0, Some([196, 204, 192])),
+        K_ENFANT => (0, Some([196, 214, 228])),
+        K_CUISINE | K_SDB | K_WC | K_BUANDERIE | K_VESTIAIRE => (4, Some([232, 234, 232])),
+        K_BUREAU | K_OPEN | K_REUNION | K_ACCUEIL => (0, Some([216, 218, 214])),
+        K_BAR | K_CLUB => (1, Some([118, 72, 62])),
+        K_RESTO => (3, Some([168, 124, 92])),
+        K_SHOP | K_HOPITAL => (0, Some([236, 238, 236])),
+        K_COIFFEUR => (0, Some([232, 220, 212])),
+        K_GARAGE | K_ENTREPOT | K_LABO | K_GYM | K_ARMURERIE | K_CELLULE => (2, None),
+        _ => (0, Some([220, 212, 196])),
+    }
+}
+
+/// Faux plafond (m sous le plafond) des pièces de bureau — **estimé**.
+const OFFICE_DROP: f32 = 0.3;
+/// Épaisseur des cloisons et des murs extérieurs des intérieurs tout prêts (m).
+const PART_T: f32 = 0.12;
+const OUTER_T: f32 = 0.2;
+/// Face extérieure des murs du tour (vue de dehors à travers la porte d'entrée).
+const OUTSIDE: (u8, Option<[u8; 3]>) = (0, Some([200, 196, 188]));
+
+impl DwApp {
+    /// Les pièces rectangulaires d'un intérieur tout prêt deviennent une coque modelable (design.rs) : un sol par
+    /// pièce, un mur par limite (une seule cloison entre deux pièces, chaque face à la couleur de sa pièce), les
+    /// passages percés dans les murs, plinthes et éclairage cuit. L'aménagement qui suit choisit le sol (decor::look).
+    pub fn gabarit_shell(&mut self, ti: usize, mi: usize, kinds: &[usize]) {
+        let n = self.proj.ytyps[ti].mlos[mi].rooms.len();
+        let sel: Vec<(usize, usize, Option<u8>)> = (1..n).map(|ri| (ri, kinds.get(ri - 1).copied().unwrap_or(0), None)).collect();
+        self.rooms_to_design(ti, mi, &sel, false);
+    }
+
+    /// Pièces rectangulaires choisies (pièce, type de pièce pour les murs, sol imposé) → coque modelable ; `append` :
+    /// ajoutées à la coque déjà là (sinon elle est refaite).
+    pub fn rooms_to_design(&mut self, ti: usize, mi: usize, sel: &[(usize, usize, Option<u8>)], append: bool) {
+        let m = &mut self.proj.ytyps[ti].mlos[mi];
+        let rects: Vec<(String, [f32; 4], f32, f32)> = sel.iter().filter_map(|s| m.rooms.get(s.0)).map(|r| (r.name.clone(), [r.bb_min.x, r.bb_min.y, r.bb_max.x, r.bb_max.y], r.bb_min.z, r.bb_max.z - r.bb_min.z)).collect();
+        for s in sel {
+            if let Some(r) = m.rooms.get_mut(s.0) {
+                r.free = true;
+            }
+        }
+        let holes: Vec<[V3; 4]> = m.portals.iter().flat_map(|p| p.holes()).collect();
+        let mname = m.name.clone();
+        let kind_of = |i: usize| sel.get(i).map(|s| s.1).unwrap_or(0);
+        // limites : (axe 0 : x constant / 1 : y constant, valeur au cm) → (début, fin, pièce, côté + ?)
+        let mut lines: std::collections::BTreeMap<(u8, i32), Vec<(f32, f32, usize, bool)>> = std::collections::BTreeMap::new();
+        for (i, (_, r, _, _)) in rects.iter().enumerate() {
+            let k = |v: f32| (v * 100.0).round() as i32;
+            // pièce du côté + de la limite : x1 → côté −, x0 → côté +
+            lines.entry((0, k(r[0]))).or_default().push((r[1], r[3], i, true));
+            lines.entry((0, k(r[2]))).or_default().push((r[1], r[3], i, false));
+            lines.entry((1, k(r[1]))).or_default().push((r[0], r[2], i, true));
+            lines.entry((1, k(r[3]))).or_default().push((r[0], r[2], i, false));
+        }
+        let (z0, h) = rects.first().map(|r| (r.2, r.3)).unwrap_or((0.0, ROOM_H));
+        let mut walls: Vec<crate::design::DWall> = Vec::new();
+        for ((axis, kv), ivs) in &lines {
+            let c = *kv as f32 / 100.0;
+            let mut cuts: Vec<f32> = ivs.iter().flat_map(|v| [v.0, v.1]).collect();
+            cuts.sort_by(|a, b| a.total_cmp(b));
+            cuts.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+            // morceaux élémentaires : (début, fin, pièce côté +, pièce côté −)
+            let mut pieces: Vec<(f32, f32, Option<usize>, Option<usize>)> = Vec::new();
+            for w in cuts.windows(2) {
+                let mid = (w[0] + w[1]) * 0.5;
+                let side = |plus: bool| ivs.iter().find(|v| v.3 == plus && v.0 <= mid && v.1 >= mid).map(|v| v.2);
+                let (p, n) = (side(true), side(false));
+                if p.is_none() && n.is_none() {
+                    continue;
+                }
+                match pieces.last_mut() {
+                    Some(last) if (last.1 - w[0]).abs() < 0.005 && last.2 == p && last.3 == n => last.1 = w[1],
+                    _ => pieces.push((w[0], w[1], p, n)),
+                }
+            }
+            for (u0, u1, plus, minus) in pieces {
+                // le mur va dans le sens croissant ; sa face avant (normale à gauche) regarde vers −x (axe 0) ou +y
+                // (axe 1) : la pièce de ce côté-là
+                let (a, b, front, back) = if *axis == 0 { ([c, u0], [c, u1], minus, plus) } else { ([u0, c], [u1, c], plus, minus) };
+                let look = |r: Option<usize>| r.map(|i| wall_look(kind_of(i))).unwrap_or(OUTSIDE);
+                let (f, bk) = (look(front), look(back));
+                let tiled = |r: Option<usize>| r.map(|i| wall_look(kind_of(i)).0 == 4).unwrap_or(true);
+                let outer = front.is_none() || back.is_none();
+                let mut dholes = Vec::new();
+                for hc in &holes {
+                    let ctr = (hc[0] + hc[1] + hc[2] + hc[3]) * 0.25;
+                    let (along, across) = if *axis == 0 { (ctr.y, ctr.x) } else { (ctr.x, ctr.y) };
+                    if (across - c).abs() > 0.05 || along < u0 || along > u1 {
+                        continue;
+                    }
+                    let (mut lo, mut hi, mut zl, mut zh) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                    for q in hc {
+                        let s = if *axis == 0 { q.y } else { q.x };
+                        lo = lo.min(s);
+                        hi = hi.max(s);
+                        zl = zl.min(q.z);
+                        zh = zh.max(q.z);
+                    }
+                    if hi - lo < 0.3 || zh - zl < 0.3 {
+                        continue; // passage horizontal (trémie) : pas dans un mur
+                    }
+                    dholes.push(crate::design::DHole { s: (lo + hi) * 0.5 - u0, w: hi - lo, sill: (zl - z0).max(0.0), h: zh - zl, kind: 0 });
+                }
+                walls.push(crate::design::DWall { a, b, z0, h, t: if outer { OUTER_T } else { PART_T }, tex: f.0, color: f.1, base: !(tiled(front) && tiled(back)), holes: dholes, back: Some(bk) });
+            }
+        }
+        let d = self.design_mut(&mname);
+        if !append {
+            d.rooms.clear();
+            d.walls.clear();
+            d.lights.clear();
+            d.baked = true;
+        }
+        d.walls.extend(walls);
+        for (i, (name, r, rz, rh)) in rects.iter().enumerate() {
+            let office = matches!(kind_of(i), crate::decor::K_BUREAU | crate::decor::K_OPEN | crate::decor::K_REUNION | crate::decor::K_ACCUEIL | crate::decor::K_HOPITAL);
+            d.rooms.retain(|x| x.room != *name);
+            d.rooms.push(crate::design::DRoom { room: name.clone(), pts: vec![[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]], z0: *rz, h: *rh, floor: sel.get(i).and_then(|s| s.2).unwrap_or(0), ceil_color: None, drop: if office { OFFICE_DROP } else { 0.0 } });
+        }
     }
 }
 
